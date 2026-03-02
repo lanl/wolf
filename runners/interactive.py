@@ -1,4 +1,4 @@
-user_name = "dead6047"
+user_name = "user"
 memory_db_persist_sub_dir = "memory_vector_stores"
 banner_image_file = "config/preferences/banner/WOLF.png"
 banner_image_width  = 100
