@@ -86,7 +86,7 @@ class ContextManager:
         if recent_entries:
             segments.append("--- Recent Chat History ---")
             segments.extend(recent_entries)
-
+        """   W.I.P
         # -------------------------------------------------------------
         # 2. Structured memory (facts, preferences, task state, summaries)
         # -------------------------------------------------------------
@@ -139,7 +139,7 @@ class ContextManager:
                     diagnostics["trace_tokens"] = trace_tokens_used
             except Exception as exc:
                 console.print(f"[CONTEXT] Trace retrieval failed: {exc}")
-
+        """
         # -------------------------------------------------------------
         # Ensure all segments are strings before joining (fix for TypeError)
         # -------------------------------------------------------------
