@@ -14,7 +14,7 @@ Follow these steps to use WOLF
 ```
 
 # 2. Set up the environment
-
+## 2.1 Set up your conda env:
 Setup the correct conda environement.
 
 ```sh
@@ -23,10 +23,20 @@ conda activate new_env
 bash install_env.sh
 ```
 
+## 2.2 Set up your .env
 
-# 3. Ru WOLF interactively
+A sample of .env file, sample.env,is provided to help you get started: 
+### 2.2.1 Make a copy
+```sh
+cp sample.env .env
+```
+### 2.2.1 Insert you inference API Key
+Obtain an API key from eithet  [LANL AI Portal](https://aiportal-api.aws.lanl.gov/ui/) or Venadao,
+and place the in the corresponding variable inside the .env file.
 
+# 3. Run WOLF interactively
 
+## 3.1 CLI interactive:
 ```sh
 ./wolf
 ```
