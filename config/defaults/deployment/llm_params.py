@@ -1,7 +1,7 @@
 import copy
 
 LocalInferenceEngine = {"host":"http://localhost", "port":4444, "api_version":"v1","api_key_var":"LOCAL_API_KEY", "verbose": 2, "capabilities":[]}
-AvailableLocalModels = ["gpt-oss:20b-128k","gpt-oss:120b-128k","qwen3-coder-next","nemotron-3-nano:30b-256k","nemotron-3-nano-Instruct","nemotron-3-nano-tool","glm-4.7-flash-tool"]
+AvailableLocalModels = ["gpt-oss:20b-128k","gpt-oss:120b-128k","nemotron-3-nano:30b-256k","nemotron-3-nano-Instruct","nemotron-3-nano-tool"]
 
 
 AvailableLLMs = {}
@@ -30,7 +30,6 @@ LocalLLMs = {"llm0": {"host":"http://localhost",
                   "port":4444,
                   "model":"gpt-oss:20b-128k",
                   #"model":"gpt-oss:120b-128k",
-                  #"model":"qwen3-coder-next",
                   "api_version":"v1",
                   "api_key_var":"LOCAL_API_KEY",
                   "verbose": 2,
