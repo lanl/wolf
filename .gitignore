@@ -1,0 +1,105 @@
+# -------------------------
+# Python bytecode / cache
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# -------------------------
+# Packaging / build artifacts
+# -------------------------
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+*.egg
+sdist/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# -------------------------
+# Test / coverage
+# -------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# -------------------------
+# Type checkers / linters
+# -------------------------
+.mypy_cache/
+.pytype/
+.pyre/
+
+# -------------------------
+# IDE / editor settings
+# -------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# -------------------------
+# Logs / temp
+# -------------------------
+*.log
+*.tmp
+*.temp
+tmp/
+
+# -------------------------
+# Environment files / secrets
+# -------------------------
+.env
+.env.*
+*.env
+!sample.env
+!.env.example
+
+# -------------------------
+# Data / local artifacts
+# -------------------------
+*.sqlite3
+*.bak*
+*.zip
+*.bin
+data/
+test_data/
+
+# -------------------------
+# Project-specific ignores
+# (add trailing / for directories)
+# -------------------------
+update_env.sh
+.HOLD
+HOLD/
+TOOLBOX/
+ACTIONBOXES/
+SIMs/
+PLAYBOOKs/
+RAG/
+VSTORE/
+backups/
+images/
+mada_mvp/
+solvers/
+standar_wf/
+.chainlit/   # prefer directory form over *.chainlit
+
+# If `service/` contains source you want tracked, do NOT ignore it.
+# service/
+
