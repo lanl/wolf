@@ -14,7 +14,7 @@ LANL_AIPORTAL_LLMs = {"llm0": {"host":"https://aiportal-api.aws.lanl.gov",
                                "api_version":"v1",
                                "api_key_var":"LANL_AIPORTAL_API_KEY",
                                "verbose": 2,
-                               "capabilities":[]
+                               "capabilities":[] #""capabilities":['structured_output']
                                },
                       "llm1": {"host":"https://aiportal-api.aws.lanl.gov",
                                "port":None,
@@ -22,7 +22,7 @@ LANL_AIPORTAL_LLMs = {"llm0": {"host":"https://aiportal-api.aws.lanl.gov",
                                "api_version":"v1",
                                "api_key_var":"LANL_AIPORTAL_API_KEY",
                                "verbose": 2,
-                               "capabilities":[]
+                               "capabilities":[] #"capabilities":['structured_output']
                                },
                       }
 
