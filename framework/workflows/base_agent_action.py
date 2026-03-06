@@ -1,4 +1,4 @@
-"""All action definitions for Cerberus.
+"""All action definitions for WOLF.
 Each action inherits from ``AgentAction`` which now provides a no‑op
 ``execute`` method that accepts a ``BaseInfrastructure`` instance. Concrete
 actions override ``execute`` to perform their side‑effects using the

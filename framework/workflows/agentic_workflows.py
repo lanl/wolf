@@ -56,7 +56,6 @@ class BaseWorkflow:
 
         # workflow‑specific state
         self.WORKFLOW_TURN = "user"  # primary turn tracker
-        self.WORFLOW_TURN = self.WORKFLOW_TURN  # backward‑compatibility alias
         self.WF_USER = "user"
         self.CONSOLE_HEAD = 0
         self.HEADER = copy.deepcopy(self.CTX)  # retained for possible external use
@@ -181,14 +180,6 @@ class BaseWorkflow:
         self.show_updated_history()
         # Build context and diagnostics
         context_str, diagnostics = self.get_compated_context_and_diagnostics()
-        #AGENT_PROMPT = (
-        #    "Below is the context window built for this turn:\n"
-        #    f"{context_str}\n\n"
-        #    "Diagnostics: "
-        #    f"{diagnostics}\n\n"
-        #    "Current conversation context (self.CTX):\n"
-        #    f"{self.CTX}"
-        #)
         AGENT_PROMPT = (
             f"{self.agent_role_prompt}\n\n"
             "Below is the context formed from the current chat history:\n"
@@ -199,30 +190,26 @@ class BaseWorkflow:
             "*** List of allowed Actions Start *** \n"
             f"{self.schema_to_use}\n"
             "*** List of allowed Actions End *** \n\n"
-            #f"Current conversation context (self.CTX):\n"
-            #f"{self.CTX}"
         )
-        #print(f"[!!!] AGENT PROMPT = {AGENT_PROMPT}")
         # Obtain a response (structured or free‑form)
         if "structured_output" in getattr(actor, "capabilities", []):
             response = actor.get_structured_output(user_prompt=AGENT_PROMPT, output_format=self.Actions)
         else:
-            #bad, response, raw, result = self.format_agent_response(AGENT_PROMPT, self.schema_to_use, actor)
-            bad, response, raw, result = actor.format_agent_response(AGENT_PROMPT, self.schema_to_use)
-            if bad:
+            bad_format, response, raw_response, result = actor.format_agent_response(AGENT_PROMPT, self.schema_to_use)
+            if bad_format:
                 # fallback to user turn on failure
                 self.WORKFLOW_TURN = "user"
                 self.update_history(
                     actor="system",
-                    content=f"{actor.name} could not produce a valid response: {raw}",
+                    content=f"{actor.name} could not produce a valid response:\n {raw_response}",
                     action={"action": "system_info"},
                     log_console=True,
                 )
                 return
         # Validate payload
         if isinstance(response, dict) and "action" in response:
-            bad, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(response)
-            if bad:
+            bad_format, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(response)
+            if bad_format:
                 self.WORKFLOW_TURN = name
                 self.update_history(
                     actor="system",
@@ -299,7 +286,6 @@ class BaseWorkflow:
         self.WF_USER = user_name
         self.infra.ROLEs[user_name] = "user"
         self.WORKFLOW_TURN = wf_first_turn
-        self.WORFLOW_TURN = self.WORKFLOW_TURN  # keep alias in sync
         self.CONSOLE_HEAD = 0
 
         while True:
@@ -336,7 +322,6 @@ class BaseWorkflow:
                         #self.memory_manager.remember("last_user_input", user_prompt, category="facts")
                         self.WORKFLOW_TURN = INTERLOCUTOR
                 # keep alias up‑to‑date
-                self.WORFLOW_TURN = self.WORKFLOW_TURN
                 continue
 
             # ---------------------------------------------------------
@@ -344,7 +329,6 @@ class BaseWorkflow:
             # ---------------------------------------------------------
             if turn in ["system", "assistant", "agent", self.agent.name.strip().lower()]:
                 self._handle_actor_turn(self.agent, self.agent.name)
-                self.WORFLOW_TURN = self.WORKFLOW_TURN
                 continue
 
             # ---------------------------------------------------------
@@ -353,14 +337,12 @@ class BaseWorkflow:
             if turn in worker_names:
                 worker = self.workers[self.WORKFLOW_TURN]
                 self._handle_actor_turn(worker, worker.name)
-                self.WORFLOW_TURN = self.WORKFLOW_TURN
                 continue
 
             # ---------------------------------------------------------
             # FALLBACK – unknown turn, reset to user
             # ---------------------------------------------------------
             self.WORKFLOW_TURN = "user"
-            self.WORFLOW_TURN = "user"
 
         # end while loop
 

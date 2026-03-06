@@ -13,7 +13,7 @@ DEFAULT_TIMEOUT = 30
 # Base Universe Interaction
 # ===========================
 class KnownUniversesQueryArgs(BaseModel):
-    system: str = Field(description="Name of the system to which the universes are connected to which is typically the local system")
+    system: str = Field(description="Name of the system to which the universes are connected to (typically the local system)")
 
 class UniverseDiscoveryArgs(BaseModel):
     universe_url: str = Field(description="Base URL of the universe (e.g., http://localhost:8000)")
@@ -24,8 +24,8 @@ class FindKnownUniversesAction(AgentAction):
     action: Literal["get_list_known_universes"] = "get_list_known_universes"
     description: Literal["Action to query the list of universes known to a system"] = "Action to query the list of universes known to a system"
     payload: KnownUniversesQueryArgs
-    payload_schema: str = '{"system": <string>: "local"} # local is the local system'
-    yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
+    payload_schema: str = '{"system": <string>: "name of system i.e "local" for the local system"}'
+    #yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
         result = []
