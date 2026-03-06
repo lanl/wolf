@@ -29,14 +29,23 @@ class FindKnownUniversesAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         result = []
-        print(f"[+][UNIVERSES][QURY]: infra = {infra}")
         try:
             for univ in infra.UNIVs:
                 result.append(univ.info)
-            print(f"[+][UNIVERSES][QURY]: {result}")
-            return {"system":"local", "universes": result}
+            result = {"system":"local", "universes": result}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][AVAILABILITY][QURY][RESULT] for system = {self.payload.system}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 class UniverseInfoAction(AgentAction):
     """Get universe discovery information (KBs, TBs, allowed actions)."""
@@ -52,14 +61,24 @@ class UniverseInfoAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, dict):
-                return {"error": "Invalid response format", "action": self.action}
-            return result
+                result = {"error": "Invalid response format", "action": self.action}
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][INFOR][QURY][RESULT]:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class UniverseHealthAction(AgentAction):
@@ -76,14 +95,24 @@ class UniverseHealthAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, dict):
-                return {"error": "Invalid response format", "action": self.action}
-            return result
+                result = {"error": "Invalid response format", "action": self.action}
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][HEALTH-STAT][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class UniverseStatsAction(AgentAction):
@@ -100,14 +129,25 @@ class UniverseStatsAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, dict):
-                return {"error": "Invalid response format", "action": self.action}
-            return result
+                result = {"error": "Invalid response format", "action": self.action}
+            result = result
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][STAT][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class UniverseListToolsAction(AgentAction):
@@ -124,14 +164,25 @@ class UniverseListToolsAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, list):
-                return {"error": "Invalid response format, expected list", "action": self.action}
-            return {"tools": result, "count": len(result)}
+                result = {"error": "Invalid response format, expected list", "action": self.action}
+            result = {"tools": result, "count": len(result)}
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][TOOL-LIST][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 # ===========================
@@ -163,14 +214,25 @@ class UniverseKBSearchAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, list):
-                return {"error": "Invalid response format, expected list", "action": self.action}
-            return {"results": result, "count": len(result)}
+                result = {"error": "Invalid response format, expected list", "action": self.action}
+            result = {"results": result, "count": len(result)}
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-SEARCH][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class KBAppendTextsArgs(BaseModel):
@@ -196,13 +258,24 @@ class UniverseKBAppendTextsAction(AgentAction):
                 timeout=DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-APPEND][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class KBAddURLArgs(BaseModel):
@@ -227,13 +300,24 @@ class UniverseKBAddURLAction(AgentAction):
                 timeout=DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-ADD-URL][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class KBAddURLsArgs(BaseModel):
@@ -258,13 +342,24 @@ class UniverseKBAddURLsAction(AgentAction):
                 timeout=DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-ADD-URLS][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class KBStatsArgs(BaseModel):
@@ -284,13 +379,24 @@ class UniverseKBStatsAction(AgentAction):
         try:
             response = requests.get(f"{self.payload.universe_url}/kbs/{self.payload.kb_name}/stats", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-STATS][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class UniverseKBSourcesAction(AgentAction):
@@ -305,13 +411,24 @@ class UniverseKBSourcesAction(AgentAction):
         try:
             response = requests.get(f"{self.payload.universe_url}/kbs/{self.payload.kb_name}/sources", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-SOURCES][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class UniverseKBPurgeAction(AgentAction):
@@ -326,13 +443,24 @@ class UniverseKBPurgeAction(AgentAction):
         try:
             response = requests.post(f"{self.payload.universe_url}/kbs/{self.payload.kb_name}/purge", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-PURGE][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 class KBGetDocumentArgs(BaseModel):
@@ -356,13 +484,24 @@ class UniverseKBGetDocumentAction(AgentAction):
                 timeout=DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[UNIVERSES][KB-GET-DOC][QURY][RESULT] for universe = {self.payload.universe_url}:\n"
+                   f"{result}"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 
 # ===========================
@@ -393,14 +532,14 @@ class UniverseTBSearchToolsAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, list):
-                return {"error": "Invalid response format, expected list", "action": self.action}
-            return {"results": result, "count": len(result)}
+                result = {"error": "Invalid response format, expected list", "action": self.action}
+            result = {"results": result, "count": len(result)}
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
 
 
 class TBExecuteArgs(BaseModel):
@@ -439,13 +578,13 @@ class UniverseTBExecuteAction(AgentAction):
                 timeout=self.payload.timeout or DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
 
 
 class TBToolInfoArgs(BaseModel):
@@ -469,13 +608,13 @@ class UniverseTBToolInfoAction(AgentAction):
                 timeout=DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
 
 
 class TBListToolsArgs(BaseModel):
@@ -500,14 +639,14 @@ class UniverseTBListToolsAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, list):
-                return {"error": "Invalid response format, expected list", "action": self.action}
-            return {"tools": result, "count": len(result)}
+                result = {"error": "Invalid response format, expected list", "action": self.action}
+            result = {"tools": result, "count": len(result)}
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
 
 
 class TBSearchDocsArgs(BaseModel):
@@ -537,14 +676,14 @@ class UniverseTBSearchDocsAction(AgentAction):
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, list):
-                return {"error": "Invalid response format, expected list", "action": self.action}
-            return {"results": result, "count": len(result)}
+                result = {"error": "Invalid response format, expected list", "action": self.action}
+            result = {"results": result, "count": len(result)}
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
 
 
 class UniverseTBStatsAction(AgentAction):
@@ -562,13 +701,13 @@ class UniverseTBStatsAction(AgentAction):
                 timeout=DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}
 
 
 # ===========================
@@ -598,10 +737,10 @@ class UniverseTBAppendDocsAction(AgentAction):
                 timeout=DEFAULT_TIMEOUT
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
         except requests.exceptions.Timeout:
-            return {"error": "Request timed out", "action": self.action}
+            result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
-            return {"error": f"Request failed: {str(e)}", "action": self.action}
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
-            return {"error": str(e), "action": self.action}
+            result = {"error": str(e), "action": self.action}

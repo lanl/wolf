@@ -28,7 +28,7 @@ class ReadFileAction(AgentAction):
         ctx_msg = (f"File content:"
                    f"** [BEGIN] {self.payload.file_path} content:**\n"
                    f"{result}\n"
-                   f"** [END] {self.payload.file_path} content:**\n"
+                   f"** [END] {self.payload.file_path} content:**"
                    )
         infra.append_chat_history(
             actor="system",
@@ -65,7 +65,7 @@ class WriteFileAction(AgentAction):
             result = f"""[WriteFileAction][error]: problem writing '{self.payload.file_path}':\n
                                        error message: {action_err}"""
         ## Show results 
-        ctx_msg = f"{result}\n"
+        ctx_msg = f"{result}"
         infra.append_chat_history(
             actor="system",
             content=ctx_msg,
