@@ -154,8 +154,9 @@ class BaseWorkflow:
             return True, f"[Normalized payload validation error] {exc}", None, normalized
         return False, None, action_obj, normalized
 
-    def format_agent_response(self, prompt, schema, agent):
-        while True:
+    def format_agent_response(self, prompt, schema, agent, max_trial=5):
+        ntrial = 0
+        while ntrial < max_trial:
             raw = agent.get_chat_response(user_prompt=prompt + f"\n{schema}")
             result = robust_jsonfy(raw)
             if "parsed" in result:
@@ -167,6 +168,7 @@ class BaseWorkflow:
             if "parsed" in result:
                 return False, result["parsed"], raw, result
             return True, None, raw, result
+            ntrial += 1
 
     # -----------------------------------------------------------------
     # Unified actor‑turn handling (used for both the main agent and workers)
@@ -177,7 +179,8 @@ class BaseWorkflow:
         *actor* – the agent/worker instance.
         *name*  – string identifier used for routing the next turn.
         """
-        self.show_updated_history()
+        #self.show_updated_history() [IDB1]
+        self.infra.show_updated_history()
         # Build context and diagnostics
         context_str, diagnostics = self.get_compated_context_and_diagnostics()
         AGENT_PROMPT = (
@@ -218,31 +221,17 @@ class BaseWorkflow:
                     log_console=True,
                 )
                 return
-            # Execute the concrete action
-            result = action_obj.execute(infra=self.infra)
+            # Remember facts
+            self.memory_manager.generate_memory_fragments(context_str,  self.agent)
+            # Show Actor's action
             self.update_history(
                 actor=actor.name,
                 content=normalized,
                 action=normalized["action"],
                 log_console=True,
             )
-            # Remember facts
-            self.memory_manager.generate_memory_fragments(context_str,  self.agent)
-            #self.memory_manager.remember(f"last_{actor.name}_action", normalized, category="facts")
-            # Immediate output handling for read_file / run_syscall
-            if action_obj.action in ["read_file", "run_syscall"]:
-                ctx_msg = (
-                    f"** {'File' if action_obj.action == 'read_file' else 'Sys_Call'} Results **\n"
-                    f"{result}\n"
-                )
-                self.update_history(
-                    actor="system",
-                    content=ctx_msg,
-                    action={"action": "system_info"},
-                    log_console=True,
-                )
-                self.WORKFLOW_TURN = actor.name
-                return
+            # Execute the concrete action
+            result = action_obj.execute(infra=self.infra)
             # Determine next turn
             if getattr(action_obj, "yield_motion_to", None):
                 self.WORKFLOW_TURN = action_obj.yield_motion_to
@@ -296,7 +285,8 @@ class BaseWorkflow:
             # USER TURN
             # ---------------------------------------------------------
             if turn in ["user", self.WF_USER.lower()]:
-                self.show_updated_history()
+                #self.show_updated_history() [IDB1]
+                self.infra.show_updated_history()
                 raw_input = interactive_input_line_wrapped(prompt_text=f"[{self.WF_USER}]> ")
                 if raw_input is None:
                     break

@@ -24,7 +24,19 @@ class ReadFileAction(AgentAction):
         except Exception as action_err:
             result = f"""[system][ReadFileAction][error]: problem reading '{self.payload.file_path}':\n 
                                        error message: {action_err}"""
-        return result
+        ## Show results 
+        ctx_msg = (f"File content:"
+                   f"** [BEGIN] {self.payload.file_path} content:**\n"
+                   f"{result}\n"
+                   f"** [END] {self.payload.file_path} content:**\n"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 
 class WriteFileActionArgs(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -50,7 +62,15 @@ class WriteFileAction(AgentAction):
                     append=self.payload.append,
                     )
         except Exception as action_err:
-            result = f"""[system][WriteFileAction][error]: problem writing '{self.payload.file_path}':\n
+            result = f"""[WriteFileAction][error]: problem writing '{self.payload.file_path}':\n
                                        error message: {action_err}"""
-        return result
+        ## Show results 
+        ctx_msg = f"{result}\n"
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
 

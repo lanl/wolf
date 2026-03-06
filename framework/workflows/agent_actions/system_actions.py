@@ -35,22 +35,32 @@ class SysCallAction(AgentAction):
                 timeout=self.payload.timeout,
                 check=False,
             )
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
+            response = {"stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "returncode": result.returncode
+                        }
         except subprocess.TimeoutExpired as te:
-            return {
-                "stdout": te.stdout or "",
-                "stderr": te.stderr or "",
-                "returncode": getattr(te, "returncode", -1),
-                "error": f"Timeout after {self.payload.timeout}s"
-            }
+            response = {"stdout": te.stdout or "",
+                        "stderr": te.stderr or "",
+                        "returncode": getattr(te, "returncode", -1),
+                        "error": f"Timeout after {self.payload.timeout}s"
+                        }
         except Exception as e:
-            return {
-                "stdout": "",
-                "stderr": str(e),
-                "returncode": -1,
-                "error": f"Exception: {e}"
-            }
+            response ={"stdout": "",
+                       "stderr": str(e),
+                       "returncode": -1,
+                       "error": f"Exception: {e}"
+                       }
+        ## Show syscal results 
+        ctx_msg = (f"** 'Sys_Call' Results: **\n"
+                   f"{response}\n"
+                   )
+        infra.append_chat_history(
+            actor="system",
+            content=ctx_msg,
+            action={"action": "system_info"},
+            log_console=True,
+        )
+        return
+
+
