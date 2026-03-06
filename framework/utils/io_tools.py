@@ -390,7 +390,7 @@ def extract_functions(file_path: str) -> List[Dict[str, Any]]:
 
 
 
-def clone_dict(template_dict, replace: dict| None = None) -> dict:
+def clone_dict(template_dict:dict, replace: dict| None = None) -> dict:
     clone = copy.deepcopy(template_dict)
     if replace is not None:
         ks = replace.keys()

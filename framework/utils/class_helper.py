@@ -106,7 +106,7 @@ def pydantic_discriminated_union_builder(
     return Annotated[union_type, Field(discriminator=discriminator)]
 
 
-def get_class_by_discriminator(
+def get_class_by_discriminator_BROKEN(
     discriminated_union: Any,
     discriminator_value: str,
 ) -> Type[Any]:
@@ -144,6 +144,57 @@ def get_class_by_discriminator(
     # Iterate over concrete classes in the Union.
     for cls in getattr(union_type, "__args__", []):
         # Most providers expose the discriminator via a ``name`` attribute.
+        if getattr(cls, "name", None) == discriminator_value:
+            return cls
+
+    raise ValueError(f"Unknown discriminator value: {discriminator_value}")
+
+
+def get_class_by_discriminator(
+    discriminated_union: Any,
+    discriminator_value: str,
+) -> Type[Any]:
+    """Return the concrete subclass from a discriminated union matching *discriminator_value*.
+
+    The function extracts the underlying ``Union`` type from the ``Annotated`` wrapper
+    and searches for a class whose discriminator field (defined via Pydantic) has the
+    default value equal to ``discriminator_value``.
+
+    Parameters
+    ----------
+    discriminated_union:
+        The ``Annotated`` union returned by ``pydantic_discriminated_union_builder``.
+    discriminator_value:
+        The value of the discriminator field (e.g., ``"openai"``).
+
+    Returns
+    -------
+    Type[Any]
+        The matching concrete provider class.
+
+    Raises
+    ------
+    ValueError
+        If no matching class is found or the supplied type is not a valid
+        discriminated union.
+    """
+    # Extract the Union type from the Annotated wrapper.
+    try:
+        union_type = get_args(discriminated_union)[0]
+    except Exception as exc:
+        raise ValueError("Provided type is not an Annotated discriminated union") from exc
+
+    # Iterate over concrete classes in the Union.
+    for cls in getattr(union_type, "__args__", []):
+        # For Pydantic models the discriminator field is stored in ``model_fields``.
+        # ``model_fields`` is a mapping of field name -> ModelFieldInfo.
+        # The default value is accessible via ``.default``.
+        field_info = getattr(cls, "model_fields", {}).get("name")
+        if field_info is not None:
+            default_val = getattr(field_info, "default", None)
+            if default_val == discriminator_value:
+                return cls
+        # Fallback: some classes may expose the discriminator as a plain class attribute.
         if getattr(cls, "name", None) == discriminator_value:
             return cls
 

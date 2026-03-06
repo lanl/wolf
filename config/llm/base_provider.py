@@ -10,6 +10,6 @@ class Base_LLM_Provider(BaseModel):
     port: Optional[int] = Field(default=None, description="port of the inference endpoint")
     api_key: Optional[str] = Field(default=None, description="API key to make inference with")
     api_version: Optional[str] = Field(default=None, description="version of the api endpoint")
-    endpoints: Optional[List[str]] = Field(default=None, description="['different','endpoint']")
+    endpoints: Optional[List[str]] = Field(default=[], description="['different','endpoint']")
 
-base_llm_provider = NewType('llm_provider', Type[Base_LLM_Provider])
+base_llm_provider_type = NewType('base_llm_provider_type', Type[Base_LLM_Provider])

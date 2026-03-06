@@ -84,6 +84,7 @@ test_data/
 # Project-specific ignores
 # (add trailing / for directories)
 # -------------------------
+wf_workspace
 update_env.sh
 .HOLD
 HOLD/
