@@ -29,7 +29,7 @@ class BaseChatManager:
     ):
         # Support session_dir as primary, fall back to wf_log_dir for backwards compatibility
         self.session_dir = session_dir.strip().rstrip("/")
-        self.log_dir = f"{self.session_dir}/{session_dir.strip().rstrip('/')}"
+        self.log_dir = f"{self.session_dir}/{wf_log_dir.strip().rstrip('/')}"
         self.chat_history_fname = chat_history_fname.strip()
         self.chat_entries_fname = chat_entries_fname.strip()
 

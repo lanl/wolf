@@ -39,7 +39,7 @@ class BaseInfrastructure:
     ):
         # Support session_dir as primary, fall back to wf_log_dir for backwards compatibility
         self.session_dir = session_dir.strip().rstrip("/")
-        self.log_dir = f"{self.session_dir}/{session_dir.strip().rstrip('/')}"
+        self.log_dir = f"{self.session_dir}/{wf_log_dir.strip().rstrip('/')}"
         # Store basic parameters
         self.agent = agent
         self.max_ctx_tokens = max_ctx_tokens
@@ -78,7 +78,11 @@ class BaseInfrastructure:
         for obj in self.objects:
             obj_type = None
             if isinstance(obj, BaseUniverse):
-                self.UNIVs[obj.name] = obj
+                self.UNIVs[obj.name] = BaseUniverseParams(info=obj)
+                obj_type = "universe"
+            elif isinstance(obj, BaseUniverseParams):
+                univ_info = obj.info
+                self.UNIVs[univ_info.name] = obj
                 obj_type = "universe"
             elif isinstance(obj, KnowledgeBase):
                 self.KBs[obj.name] = obj

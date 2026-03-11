@@ -72,20 +72,6 @@ def get_universe_info(host: str, port: int, *, scheme: str = "http", timeout: in
             f"Response from {info_url} is not valid JSON: {exc}"
         ) from exc
 
-# ---------------------------------------------------------------------------
-# Example usage
-# ---------------------------------------------------------------------------
-#if __name__ == "__main__":
-#    # Replace with the actual host/port of your running server
-#    host = "0.0.0.0"
-#    port = 8115
-#    try:
-#        info = get_universe_info(host, port)
-#        print("Universe info:")
-#        print(info)
-#    except Exception as e:
-#        print(f"Error: {e}")
-
 
 def build_params_from_info(universe_info: Dict[str, Any]) -> BaseUniverseParams:
     """Create a ``BaseUniverseParams`` instance from the JSON payload of ``/info``.

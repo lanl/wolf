@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 import requests
 from framework.workflows.base_agent_action import AgentAction
+from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
+from framework.universes.universe_tools import get_universe_info, build_params_from_info, get_base_universe_params
 
 # Default timeout for all HTTP requests
 DEFAULT_TIMEOUT = 30
@@ -16,7 +18,13 @@ class KnownUniversesQueryArgs(BaseModel):
     system: str = Field(description="Name of the system to which the universes are connected to (typically the local system)")
 
 class UniverseDiscoveryArgs(BaseModel):
-    universe_url: str = Field(description="Base URL of the universe (e.g., http://localhost:8000)")
+    system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
+    #host: str = Field(description="Adress of the machine hosting the universe (e.g., 'localhost', '127.0.0.1',...)")
+    #port: int = Field(description="Port on which the universe's API is accessible (e.g., 8000)")
+    #api_version: Optional[str] = Field(default=None, description="version of API endpoint if known, otherwise set to None")
+    #api_token: Optional[str] = Field(default=None, description="API Auth token if known, otherwise set to None")
+    #scheme: str = Field(default='http',description="URL scheme – `http`(default) or `https`")
+    #timeout: int = Field(default=5,description="Time before your request times out")
 
 
 class FindKnownUniversesAction(AgentAction):
@@ -24,20 +32,37 @@ class FindKnownUniversesAction(AgentAction):
     action: Literal["get_list_known_universes"] = "get_list_known_universes"
     description: Literal["Action to query the list of universes known to a system"] = "Action to query the list of universes known to a system"
     payload: KnownUniversesQueryArgs
-    payload_schema: str = '{"system": <string>: "name of system i.e "local" for the local system"}'
-    #yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
-
+    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system"} """
     def execute(self, infra) -> Dict[str, Any]:
         result = []
-        try:
-            for univ in infra.UNIVs:
-                result.append(univ.info)
-            result = {"system":"local", "universes": result}
-        except Exception as e:
-            result = {"error": str(e), "action": self.action}
-        ## Show results
-        ctx_msg = (f"[UNIVERSES][AVAILABILITY][QURY][RESULT] for system = {self.payload.system}:\n"
-                   f"{result}"
+        system_name = self.payload.system.strip().lower()
+        if system_name.startswith("https"): system_name = system_name.lstrip('https').lstrip("://")
+        if system_name.startswith("http"): system_name = system_name.lstrip('http').lstrip("://")
+        if system_name in ['global', 'local', 'localhost','0.0.0.0', '127.0.0.1']:
+            for univ in infra.UNIVs.keys():
+                try:
+                    u_info = infra.UNIVs[univ].info
+                    u_host = u_info.host.strip().lower()
+                    if u_host.startswith("https"): u_host = u_host.lstrip('https').lstrip("://")
+                    if u_host.startswith("http"): u_host = u_host.lstrip('http').lstrip("://")
+                    try:
+                        u_scheme = u_info.scheme
+                    except:
+                        u_scheme = None
+                    if u_scheme is not None:
+                        u_scheme = u_scheme.strip().lower()
+                    else:
+                        u_scheme = "http" # Setting to default
+                    univ_stat = get_universe_info(host=u_host,
+                                      port=int(u_info.port),
+                                      scheme=u_scheme)
+                    result.append({f"{u_info.name}": univ_stat})
+                except Exception as e:
+                    print(f"[!!!!] error:={e}")
+                    result.append({f"{u_info.name}": f"UNAVAILABLE: {str(e)}"})
+        univ_info = {"system":{self.payload.system}, "universes": result}
+        ctx_msg = (f"[AVAILABLE][UNIVERSES] to system = {self.payload.system}:\n"
+                   f"{univ_info}"
                    )
         infra.append_chat_history(
             actor="system",
