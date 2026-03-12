@@ -21,6 +21,9 @@ Setup the correct conda environement.
 conda create -n wolf python=3.13  # Python version >=3.13
 conda activate wolf
 bash install_env.sh
+pip install dotenv searxng_wrapper rich openai funkybob tiktoken pdfplumber nbformat alive_progress prompt_toolkit
+pip install chromadb
+pip install fastapi
 ```
 
 ## 2.2 Set up your .env
