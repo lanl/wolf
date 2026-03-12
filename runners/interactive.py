@@ -4,6 +4,7 @@ banner_image_file = "config/preferences/banner/WOLF.png"
 banner_image_width  = 100
 banner_image_color  = 'purple' #'red', 'america', raimbow
 Universes = [{"host":"0.0.0.0", "port":8115, "scheme":"http"}]
+VRBZ = 0
 
 from framework.utils.io_tools import image_to_ascii
 from framework.utils.machines_ssl_config import conform_machine_ssl_certs
@@ -103,16 +104,19 @@ if __name__ == "__main__":
     )
     # UNIVERSES
     UNIVs = []
+    console.print("|=================================================================================|")
+    print("[+] --------------------------------[  UNIVERSES  ]-------------------------------- ") 
+    console.print("|=================================================================================|")
     for univ in Universes:
-        univ_param = get_base_universe_params(host=univ["host"], port=univ["port"], verbose=1)
+        univ_param = get_base_universe_params(host=univ["host"], port=univ["port"], verbose=VRBZ)
         if univ_param is not None:
             univ_info = univ_param.info
-            print(f""" [+] {univ_info.name}: {univ} 
-                            | > host = {univ_info.host} 
-                            | > port = {univ_info.port} 
-                            | > description = '{univ_info.description}
-                            | > api_version = {univ_info.api_version} 
-                            | > api_token = {univ_info.api_token}
+            print(f""" --  [{univ_info.name}] --:
+              | > host = {univ_info.host} 
+              | > port = {univ_info.port} 
+              | > description = '{univ_info.description}
+              | > api_version = {univ_info.api_version} 
+              | > api_token = {univ_info.api_token}
                   """
                   )
             UNIVs.append(univ_param)
