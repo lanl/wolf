@@ -20,7 +20,7 @@ Setup the correct conda environement.
 ```sh
 conda create -n wolf python=3.13  # Python version >=3.13
 conda activate wolf
-bash install_dependencies.sh
+bash install_env.sh
 ```
 
 ## 2.2 Set up your .env
