@@ -1,7 +1,5 @@
 # wolf
 
-
-
 ## Getting started
 
 # Welcome to the Workflow Orchestration Language Framework (WOLF)!
@@ -20,10 +18,8 @@ Setup the correct conda environement.
 ```sh
 conda create -n wolf python=3.13  # Python version >=3.13
 conda activate wolf
-bash install_env.sh
-pip install dotenv searxng_wrapper rich openai funkybob tiktoken pdfplumber nbformat alive_progress prompt_toolkit
-pip install chromadb
-pip install fastapi
+pip install dotenv searxng_wrapper rich openai funkybob tiktoken pdfplumber nbformat alive_progress prompt_toolkit chromadb fastapi
+
 ```
 
 ## 2.2 Set up your .env
@@ -34,8 +30,8 @@ A sample of .env file, sample.env,is provided to help you get started:
 cp sample.env .env
 ```
 ### 2.2.1 Insert you inference API Key
-Obtain an API key from eithet  [LANL AI Portal](https://aiportal-api.aws.lanl.gov/ui/) or Venadao,
-and place the in the corresponding variable inside the .env file.
+Open .env and paste your inference API key obtained from [LANL AI Portal](https://aiportal-api.aws.lanl.gov/ui/) or Venadao,
+into the appropriate variable.
 
 # 3. Run WOLF interactively
 
