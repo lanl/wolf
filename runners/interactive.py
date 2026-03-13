@@ -6,35 +6,45 @@ banner_image_color  = 'purple' #'red', 'america', raimbow
 Universes = [{"host":"0.0.0.0", "port":8115, "scheme":"http"}]
 VRBZ = 0
 
-from framework.utils.io_tools import image_to_ascii
-from framework.utils.machines_ssl_config import conform_machine_ssl_certs
-
 import asyncio
 import os, copy, time, gc
+import tiktoken
+from pathlib import Path 
+from rich.console import Console
 
+# UTILs
 from framework.utils.io_tools import load_env_vars, expand_dict, image_to_ascii
 from framework.utils.config_tools import create_session_dir, set_llm_api_key
 from framework.utils.machines_ssl_config import conform_machine_ssl_certs
 
+# VStore
+from framework.data_store.vstore import VectorStore
+from framework.data_store.default.params.embedding_params import (Default_summaries_vs_params as SUMMARIES_PARAMS,
+                                                                  Default_traces_vs_params as TRACES_PARAMS)
+# KBs
+#
+
+# Agents
 from framework.agentic.agents import OpenAIAgent
+from framework.agentic.default.params.llm_params import LANL_AIPORTAL_LLMs as LLMs
+
+# UNIVERSEs (a.k.a ActionBoxes)
+from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
+from framework.universes.universe_tools import get_base_universe_params
+
+# WORKFLOWS
 from framework.workflows.workflow_models import Actions
 from framework.workflows.chat_manager import BaseChatManager
 from framework.workflows.memory_manager import MemoryManager
 from framework.workflows.context_manager import ContextManager
 from framework.workflows.workflow_infrastructure import BaseInfrastructure
 from framework.workflows.agentic_workflows import BaseWorkflow
-from framework.data_store.vstore import VectorStore
 
-from config.defaults.deployment.embedding_params import Default_summaries_vs_params as SUMMARIES_PARAMS
-from config.defaults.deployment.embedding_params import Default_traces_vs_params as TRACES_PARAMS
-from config.defaults.deployment.llm_params import LANL_AIPORTAL_LLMs as LLMs
+#from config.defaults.deployment.embedding_params import Default_summaries_vs_params as SUMMARIES_PARAMS
+#from config.defaults.deployment.embedding_params import Default_traces_vs_params as TRACES_PARAMS
+#from config.defaults.deployment.llm_params import LANL_AIPORTAL_LLMs as LLMs
 
-from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
-from framework.universes.universe_tools import get_base_universe_params
 
-import tiktoken, os
-from pathlib import Path
-from rich.console import Console
 console = Console()
 
 cache_dir = (Path.cwd() / ".tiktoken_cache").resolve()
