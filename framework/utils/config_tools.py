@@ -10,8 +10,8 @@ from framework.utils.machines_ssl_config import conform_machine_ssl_certs
 
 # VStore
 from framework.data_store.vstore import VectorStore
-from framework.data_store.default.params.embedding_params import (Default_summaries_vs_params as SUMMARIES_PARAMS,
-                                                                  Default_traces_vs_params as TRACES_PARAMS)
+from framework.data_store.default.params.vstore_params import (Default_summaries_vs_params as SUMMARIES_PARAMS,
+                                                               Default_traces_vs_params as TRACES_PARAMS)
 # KBs
 #
 
