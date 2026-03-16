@@ -5,6 +5,7 @@
 # Welcome to the Workflow Orchestration Language Framework (WOLF)!
 
 Follow these steps to use WOLF
+NOTE: Make sure you are on a bash session
 
 # 1. Clone the WOLF repo
 ```sh
