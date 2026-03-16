@@ -4,8 +4,7 @@
 
 # Welcome to the Workflow Orchestration Language Framework (WOLF)!
 
-Follow these steps to use WOLF
-NOTE: Make sure you are on a bash session
+Follow these steps to use WOLF. 
 
 # 1. Clone the WOLF repo
 ```sh
@@ -15,6 +14,7 @@ NOTE: Make sure you are on a bash session
 # 2. Set up the environment
 ## 2.1 Set up your conda env:
 Setup the correct conda environement.
+NOTE: Make sure you are in a bash session
 
 ```sh
 conda create -n wolf python=3.13  # Python version >=3.13
