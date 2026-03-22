@@ -49,17 +49,14 @@ class BaseWorkflow:
         self.chat_manager = infra.chat_manager
         self.memory_manager = infra.memory_manager
         self.context_manager = infra.context_manager
-        self.chat_history = infra.chat_history
-        self.CTX = infra.CTX
         self.chat_block_divider = infra.chat_block_divider
         self.log = infra.log
 
         # workflow‑specific state
         self.WORKFLOW_TURN = "user"  # primary turn tracker
         self.WF_USER = "user"
-        self.CONSOLE_HEAD = 0
-        self.HEADER = copy.deepcopy(self.CTX)  # retained for possible external use
-        self.HEADER_IDX = len(self.chat_history)
+        self.HEADER = copy.deepcopy(self.infra.CTX)  # retained for possible external use
+        self.HEADER_IDX = len(self.infra.chat_history)
         self.Actions = actions_union
         self.action_adapter = TypeAdapter(self.Actions)
         # Full schema (fallback) and placeholder for the active schema string
@@ -67,21 +64,25 @@ class BaseWorkflow:
         self.schema_to_use = self.full_schema_string
         self.agent_role_prompt = FULL_AGENT_ROLE_PROMPT
 
+        # -----------------------------------------------------------------
+        # Initialise some default memory entries so that Facts, User Preferences,
+        # and Task State sections are never empty in the context window.
+        # -----------------------------------------------------------------
+        #try:
+        #    self.memory_manager.remember("app_name", "Cerberus", category="facts")
+        #    self.memory_manager.remember("workflow_phase", {"phase": "init"}, category="task_state")
+        #    self.memory_manager.remember("preferred_language", "en", category="user_prefs")
+        #except Exception as exc:
+        #    console.print(f"[MEMORY INIT] Failed to set default entries: {exc}")
+
     # -----------------------------------------------------------------
     # Helper forwarding methods (mostly thin wrappers around infra)
     # -----------------------------------------------------------------
-    def rebuild_chat_history(self, starting_from_line: int = 0):
-        self.infra.rebuild_chat_history(starting_from_line)
-        self.chat_history = self.infra.chat_history
-        self.CTX = self.infra.CTX
-
     def console_log(self, msg: str):
         self.infra.console_log(msg)
 
     def append_chat_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.infra.append_chat_history(actor, content, action, log_console)
-        self.chat_history = self.infra.chat_history
-        self.CTX = self.infra.CTX
         # inform memory manager about the new entry for possible summarisation
         new_entries = [self.chat_manager.CHAT_HISTORY[-1]] if self.chat_manager.CHAT_HISTORY else []
         if new_entries:
@@ -106,8 +107,6 @@ class BaseWorkflow:
 
     def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.append_chat_history(actor, content, action, log_console)
-        #context_str, diagnostics = self.get_compated_context_and_diagnostics()
-        #self.memory_manager.generate_memory_fragments(context_str,  self.agent) #summarization_format ="...")
 
     def normalize_and_validate_agent_response(self, response):
         try:
@@ -145,6 +144,7 @@ class BaseWorkflow:
         *actor* – the agent/worker instance.
         *name*  – string identifier used for routing the next turn.
         """
+        #self.show_updated_history() [IDB1]
         self.infra.show_updated_history()
         # Build context and diagnostics
         context_str, diagnostics = self.get_compated_context_and_diagnostics()
@@ -240,7 +240,6 @@ class BaseWorkflow:
         self.WF_USER = user_name
         self.infra.ROLEs[user_name] = "user"
         self.WORKFLOW_TURN = wf_first_turn
-        self.CONSOLE_HEAD = 0
 
         while True:
             turn = self.WORKFLOW_TURN.strip().lower()
@@ -298,7 +297,3 @@ class BaseWorkflow:
             # FALLBACK – unknown turn, reset to user
             # ---------------------------------------------------------
             self.WORKFLOW_TURN = "user"
-
-        # end while loop
-
-    # End of BaseWorkflow class
