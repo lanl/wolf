@@ -18,7 +18,7 @@ DEFAULT_AIPORTAL_LLM_PARAMS = {"provider_name": "litellm",
 #                        "phi4","darwin.gemma-3-27b-it", "llama3bv32instr"
 #                        "anthropic.claude-sonnet-4-5-20250929-v1:0"]
 INSTRUCT_CAPABLE_MODELS = ["gpt-oss-120b", "phi4"]
-LANL_AIPORTAL_MODELS = ["gpt-oss-120b", "phi4"]
+LANL_AIPORTAL_MODELS = ["NVIDIA-Nemotron-3-Super-120B-A12B-FP8", "gpt-oss-120b", "phi4"]
 
 LANL_AIPORTAL_LLMs = {}
 
