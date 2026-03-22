@@ -274,10 +274,18 @@ class OpenAIAgent:
         CTX = self._make_ctx(user_prompt)
         if self.instructor_client:
             if "structured_output" in self.capabilities:
+                print(f"[INSTRUCTOR][STRUCTURED OUT]")
                 return self.instructor_client.chat.completions.create(
                     model=model, messages=CTX, response_model=output_format
                 )
+                #return self.instructor_client.create(
+                #        model=model,
+                #        response_model=output_format,
+                #        messages=CTX,
+                #        )
+
             else:
+                print(f"[DIY][STRUCTURED OUT]")
                 return self.get_json_structured_output(CTX, output_format, temperature, model)
         else:
             return self.get_json_structured_output(CTX, output_format, temperature, model)

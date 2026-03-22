@@ -7,3 +7,4 @@ pip install requests beautifulsoup4
 pip install fastapi
 pip install faster_whisper
 conda install -c conda-forge ffmpeg
+pip install instructor

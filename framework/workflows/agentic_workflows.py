@@ -67,17 +67,6 @@ class BaseWorkflow:
         self.schema_to_use = self.full_schema_string
         self.agent_role_prompt = FULL_AGENT_ROLE_PROMPT
 
-        # -----------------------------------------------------------------
-        # Initialise some default memory entries so that Facts, User Preferences,
-        # and Task State sections are never empty in the context window.
-        # -----------------------------------------------------------------
-        #try:
-        #    self.memory_manager.remember("app_name", "Cerberus", category="facts")
-        #    self.memory_manager.remember("workflow_phase", {"phase": "init"}, category="task_state")
-        #    self.memory_manager.remember("preferred_language", "en", category="user_prefs")
-        #except Exception as exc:
-        #    console.print(f"[MEMORY INIT] Failed to set default entries: {exc}")
-
     # -----------------------------------------------------------------
     # Helper forwarding methods (mostly thin wrappers around infra)
     # -----------------------------------------------------------------
@@ -88,12 +77,6 @@ class BaseWorkflow:
 
     def console_log(self, msg: str):
         self.infra.console_log(msg)
-
-    def get_true_role_and_alias(self, actor: str, content: str):
-        return self.infra.get_true_role_and_alias(actor, content)
-
-    def expand_dict(self, dct: dict, dept: int = 0, stride: int = 2):
-        return self.infra.expand_dict(dct, dept, stride)
 
     def append_chat_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.infra.append_chat_history(actor, content, action, log_console)
@@ -125,23 +108,6 @@ class BaseWorkflow:
         self.append_chat_history(actor, content, action, log_console)
         #context_str, diagnostics = self.get_compated_context_and_diagnostics()
         #self.memory_manager.generate_memory_fragments(context_str,  self.agent) #summarization_format ="...")
-
-    def show_ctx(self):
-        console.print(self.CTX)
-
-    def get_partial_ctx(self, idx0: int | None = None, idx1: int | None = None):
-        return self.infra.get_partial_ctx(idx0, idx1)
-
-    def show_partial_ctx(self, idx0: int | None = None, idx1: int | None = None):
-        console.print(self.get_partial_ctx(idx0, idx1))
-
-    def show_updated_history(self, console_head: int | None = None):
-        head = self.CONSOLE_HEAD if console_head is None else console_head
-        self.show_partial_ctx(idx0=head)
-        self.CONSOLE_HEAD = len(self.chat_history)
-
-    def process_user_input(self, user_prompt: str):
-        return self.infra.process_user_input(user_prompt)
 
     def normalize_and_validate_agent_response(self, response):
         try:
@@ -179,7 +145,6 @@ class BaseWorkflow:
         *actor* – the agent/worker instance.
         *name*  – string identifier used for routing the next turn.
         """
-        #self.show_updated_history() [IDB1]
         self.infra.show_updated_history()
         # Build context and diagnostics
         context_str, diagnostics = self.get_compated_context_and_diagnostics()
@@ -291,7 +256,7 @@ class BaseWorkflow:
                 if raw_input is None:
                     break
                 user_prompt = raw_input.strip()
-                BREAK, IS_CMD, ERROR, INTERLOCUTOR, WF_PROMPT = self.process_user_input(user_prompt)
+                BREAK, IS_CMD, ERROR, INTERLOCUTOR, WF_PROMPT = self.infra.process_user_input(user_prompt)
                 if IS_CMD:
                     if WF_PROMPT:
                         console.print(WF_PROMPT)
