@@ -72,7 +72,7 @@ def load_session_certs(session_params):
     cache_dir = session_params.get('tiktoken_cache_dir', (Path.cwd() / ".tiktoken_cache").resolve())
     os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(cache_dir))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ['CURL_CA_BUNDLE'] = session_params.get('curl_ca_bundle_file','/etc/ssl/ca-bundle.pem')
+    #os.environ['CURL_CA_BUNDLE'] = session_params.get('curl_ca_bundle_file','/etc/ssl/ca-bundle.pem')
 
 def show_banner(session_params):
     console.print("|=================================================================================|")
@@ -175,9 +175,9 @@ def setup_cli_session(session_params):
                                                                         traces_vector_store=traces_vs,
                                                                         summaries_vector_store=summaries_vs)
                                         )
-    context_manager = session_params.get('context_manager', ContextManager(max_ctx_tokens=10000,
-                                                                           recent_chat_ratio=0.30,
-                                                                           memory_ratio=0.50,
+    context_manager = session_params.get('context_manager', ContextManager(max_ctx_tokens=100000,
+                                                                           recent_chat_ratio=0.50,
+                                                                           memory_ratio=0.30,
                                                                            trace_ratio=0.20,
                                                                            traces_vector_store=traces_vs)
                                          )

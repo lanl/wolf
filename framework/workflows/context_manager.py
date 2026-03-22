@@ -79,7 +79,7 @@ class ContextManager:
             tokens = self._estimate_token_count(ctx)
             if total_tokens + tokens > recent_chat_budget:
                 # Budget for recent chat reached – stop adding further entries
-                break
+                break # NOTE: This is not a useful strategy (place holder): We should try to may be summarize the entry insted
             recent_entries.insert(0, ctx)
             total_tokens += tokens
             diagnostics["recent_chat_tokens"] += tokens
