@@ -187,7 +187,7 @@ class BaseWorkflow:
                 )
                 return
             # Remember facts
-            self.memory_manager.generate_memory_fragments(context_str,  self.agent)
+            #self.memory_manager.generate_memory_fragments(context_str,  self.agent) # I.D.B: Frreezing for now
             # Show Actor's action
             self.update_history(
                 actor=actor.name,

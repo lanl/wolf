@@ -359,6 +359,7 @@ class OpenAIAgent:
     def format_agent_response(self, prompt, schema, n_max_trials=5):
         n_trial = 0
         while n_trial < n_max_trials:
+            #print(f"[+] Formatting agent's response {n_trial+1}/{n_max_trials}\n prompt={prompt}")
             raw = self.get_chat_response(user_prompt=prompt + f"\n{schema}")
             result = robust_jsonfy(raw)
             if "parsed" in result:
@@ -370,4 +371,4 @@ class OpenAIAgent:
             if "parsed" in result:
                 return False, result["parsed"], raw, result
             n_trial += 1
-            return True, None, raw, result
+        return True, None, raw, result
