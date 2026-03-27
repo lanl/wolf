@@ -42,6 +42,7 @@ class OpenAIAgent:
         cache_history: bool = True,
         verbose: int = 0,
         capabilities=[],
+        ctx_window_length=None,
     ) -> None:
         # Name assignment
         if agent_name is None:
@@ -59,6 +60,7 @@ class OpenAIAgent:
         self.cache_history = cache_history
         self.console = console if console is not None else print
         self.capabilities=capabilities
+        self.ctx_window_length = ctx_window_length
         # Construct base_url safely
         #if verbose> 1: print(f"[++] HOST: {self.host_address}")
         parsed = urlparse(host_address)
@@ -105,6 +107,7 @@ class OpenAIAgent:
                   Sys Prompt: {self.sys_prompt}
                   LLM Model: {self.model}
                   Base URL: {self.base_url}
+                  Max CTX: {self.ctx_window_length}
                   Instructor Support: {self.instructor_client is not None}
                 """
             )

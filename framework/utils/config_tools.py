@@ -92,6 +92,10 @@ def build_list_agents(session_params):
     for k in LLMs.keys():
         llm = LLMs[k]
         set_llm_api_key(llm, env_vars=ENV_VARs)
+        try:
+            max_ctx = llm["ctx_window_length"]
+        except:
+            max_ctx = None
         AGENTs[k] = OpenAIAgent(
             model=llm["model"],
             host_address=llm["host"],
@@ -99,7 +103,8 @@ def build_list_agents(session_params):
             api_version=llm["api_version"],
             api_key=llm["api_key"],
             verbose=llm["verbose"],
-            capabilities=llm["capabilities"]
+            capabilities=llm["capabilities"],
+            ctx_window_length = max_ctx
         )
     return AGENTs
 

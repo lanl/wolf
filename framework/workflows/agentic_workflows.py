@@ -36,7 +36,15 @@ class BaseWorkflow:
     a matching schema string; otherwise the full set of actions is used.
     """
 
-    def __init__(self, infra: BaseInfrastructure, actions_union: Any = FullActions):
+    def __init__(self, 
+                 infra: BaseInfrastructure, 
+                 actions_union: Any = FullActions,
+                 wf_rules_file: str|None ="config/preferences/rules/workflow/basewf.md",
+                 wf_agent_behaviour_file: str|None ="config/preferences/behaviour/workflow/basewf.md",
+                 wf_agent_sys_prompt_file: str|None ="config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md",
+                 ):
+        self.WF_TAG = "BaseWorkflow"
+
         self.infra = infra
         # expose frequently used components for convenience
         self.agent = infra.agent
@@ -63,6 +71,16 @@ class BaseWorkflow:
         self.full_schema_string = FULL_SCHEMA_STRING
         self.schema_to_use = self.full_schema_string
         self.agent_role_prompt = FULL_AGENT_ROLE_PROMPT
+        ## AGENT BEHAVIOUR
+        self.wf_agent_behaviour_file  = wf_agent_behaviour_file
+        self.AGENT_BEHAVIOUR = ""
+        self.update_agent_behaviour(wf_agent_behaviour_file)
+        ## WORKFLOW RULES
+        self.wf_rules_file = wf_rules_file
+        self.WF_RULES = ''
+        self.update_workflow_rules(wf_rules_file)
+
+
 
         # -----------------------------------------------------------------
         # Initialise some default memory entries so that Facts, User Preferences,
@@ -80,6 +98,25 @@ class BaseWorkflow:
     # -----------------------------------------------------------------
     def console_log(self, msg: str):
         self.infra.console_log(msg)
+
+    def update_workflow_rules(self, wf_rules_file: str|None =None):
+        if wf_rules_file is not None:
+            self.wf_rules_file = wf_rules_file
+        else:
+            if self.wf_rules_file is None:
+                self.WF_RULES = ''
+                return
+        with open(self.wf_rules_file, "r") as f: self.WF_RULES = f.read()
+
+    def update_agent_behaviour(self, agent_behaviour_file: str|None =None):
+        if agent_behaviour_file is not None:
+           self.wf_agent_behaviour_file = agent_behaviour_file
+        else:
+            if self.wf_agent_behaviour_file is None:
+                self.AGEN_BEHAVIOUR = '', self.WF_RULES
+                return
+        with open(self.wf_agent_behaviour_file, "r") as f: self.AGENT_BEHAVIOUR = f.read()
+
 
     def append_chat_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.infra.append_chat_history(actor, content, action, log_console)
