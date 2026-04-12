@@ -80,19 +80,6 @@ class BaseWorkflow:
         self.WF_RULES = ''
         self.update_workflow_rules(wf_rules_file)
 
-
-
-        # -----------------------------------------------------------------
-        # Initialise some default memory entries so that Facts, User Preferences,
-        # and Task State sections are never empty in the context window.
-        # -----------------------------------------------------------------
-        #try:
-        #    self.memory_manager.remember("app_name", "Cerberus", category="facts")
-        #    self.memory_manager.remember("workflow_phase", {"phase": "init"}, category="task_state")
-        #    self.memory_manager.remember("preferred_language", "en", category="user_prefs")
-        #except Exception as exc:
-        #    console.print(f"[MEMORY INIT] Failed to set default entries: {exc}")
-
     # -----------------------------------------------------------------
     # Helper forwarding methods (mostly thin wrappers around infra)
     # -----------------------------------------------------------------
@@ -117,7 +104,6 @@ class BaseWorkflow:
                 return
         with open(self.wf_agent_behaviour_file, "r") as f: self.AGENT_BEHAVIOUR = f.read()
 
-
     def append_chat_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.infra.append_chat_history(actor, content, action, log_console)
         # inform memory manager about the new entry for possible summarisation
@@ -126,21 +112,20 @@ class BaseWorkflow:
             self.memory_manager.process_new_entries(new_entries)
 
     def get_compated_context_and_diagnostics(self, verbose=0):
-        recent_budget = int(self.context_manager.max_ctx_tokens * self.context_manager.recent_chat_ratio)
-        memory_budget = int(self.context_manager.max_ctx_tokens * self.context_manager.memory_ratio)
-        trace_budget = int(self.context_manager.max_ctx_tokens * self.context_manager.trace_ratio)
-        context_str, diagnostics = self.context_manager.build_context(
-            chat_history=self.chat_manager.CHAT_HISTORY,
-            memory_manager=self.memory_manager,
-            recent_chat_budget=recent_budget,
-            memory_budget=memory_budget,
-            trace_budget=trace_budget,
-            user_query="",
-            agent_plan="",
-        )
-        if verbose > 1: console.print(f"[CTX][COMPACPTION]: context_str = {context_str}")
-        if verbose > 0:console.print(f"[CTX][COMPACPTION]: Diagnostics = {diagnostics}")
-        return context_str, diagnostics 
+        """Get the current compacted context and diagnostics.
+        
+        This method now uses the context manager's current buffer
+        instead of rebuilding on every call.
+        """
+        context_str = self.context_manager.get_compacted_context()
+        diagnostics = self.context_manager.get_context_diagnostics()
+        
+        if verbose > 1:
+            console.print(f"[CTX][compaction]: context_str = {context_str}")
+        if verbose > 0:
+            console.print(f"[CTX][compaction]: Diagnostics = {diagnostics}")
+        
+        return context_str, diagnostics
 
     def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.append_chat_history(actor, content, action, log_console)
@@ -180,11 +165,17 @@ class BaseWorkflow:
 
         *actor* – the agent/worker instance.
         *name*  – string identifier used for routing the next turn.
+        
+        This method now uses the context manager's current_ctx buffer
+        instead of rebuilding the context on every call.
         """
-        #self.show_updated_history() [IDB1]
         self.infra.show_updated_history()
-        # Build context and diagnostics
-        context_str, diagnostics = self.get_compated_context_and_diagnostics()
+        
+        # Get the current context buffer (no rebuild unless threshold exceeded)
+        context_str = self.context_manager.get_compacted_context()
+        diagnostics = self.context_manager.get_context_diagnostics()
+        
+        # Build agent prompt with the current context
         AGENT_PROMPT = (
             f"{self.agent_role_prompt}\n\n"
             "Below is the context formed from the current chat history:\n"
@@ -196,6 +187,7 @@ class BaseWorkflow:
             f"{self.schema_to_use}\n"
             "*** List of allowed Actions End *** \n\n"
         )
+        
         # Obtain a response (structured or free‑form)
         if "structured_output" in getattr(actor, "capabilities", []):
             response = actor.get_structured_output(user_prompt=AGENT_PROMPT, output_format=self.Actions)
@@ -211,6 +203,7 @@ class BaseWorkflow:
                     log_console=True,
                 )
                 return
+        
         # Validate payload
         if isinstance(response, dict) and "action" in response:
             bad_format, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(response)
@@ -223,8 +216,7 @@ class BaseWorkflow:
                     log_console=True,
                 )
                 return
-            # Remember facts
-            #self.memory_manager.generate_memory_fragments(context_str,  self.agent) # I.D.B: Frreezing for now
+            
             # Show Actor's action
             self.update_history(
                 actor=actor.name,
@@ -232,8 +224,10 @@ class BaseWorkflow:
                 action=normalized["action"],
                 log_console=True,
             )
+            
             # Execute the concrete action
             result = action_obj.execute(infra=self.infra)
+            
             # Determine next turn
             if getattr(action_obj, "yield_motion_to", None):
                 self.WORKFLOW_TURN = action_obj.yield_motion_to
@@ -286,7 +280,6 @@ class BaseWorkflow:
             # USER TURN
             # ---------------------------------------------------------
             if turn in ["user", self.WF_USER.lower()]:
-                #self.show_updated_history() [IDB1]
                 self.infra.show_updated_history()
                 raw_input = interactive_input_line_wrapped(prompt_text=f"[{self.WF_USER}]> ")
                 if raw_input is None:
@@ -310,9 +303,7 @@ class BaseWorkflow:
                             action={"action": "user_input"},
                             log_console=log_console,
                         )
-                        #self.memory_manager.remember("last_user_input", user_prompt, category="facts")
                         self.WORKFLOW_TURN = INTERLOCUTOR
-                # keep alias up‑to‑date
                 continue
 
             # ---------------------------------------------------------

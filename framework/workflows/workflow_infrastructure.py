@@ -26,9 +26,9 @@ class BaseInfrastructure:
         agent: Any,
         workers: List[Any] = [],
         objects: List[Any] = [],
-        max_ctx_tokens: int = 20000,
+        max_ctx_tokens: int = 100,
         wf_log_dir: str = "wf_logs",
-        session_dir: str = "./", #Optional[str] = None,
+        session_dir: str = "./",
         chat_block_divider: str = "/" * 120,
         schema_string: str | None = None,
         chat_manager: Any = None,
@@ -134,7 +134,7 @@ class BaseInfrastructure:
         else:
             from framework.workflows.chat_manager import BaseChatManager
             self.chat_manager = BaseChatManager(
-                session_dir=self.session_dir, #self.log_dir,
+                session_dir=self.session_dir,
                 chat_block_divider=chat_block_divider
             )
 
@@ -143,7 +143,7 @@ class BaseInfrastructure:
         else:
             from framework.workflows.memory_manager import MemoryManager
             self.memory_manager = MemoryManager(
-                session_dir=self.session_dir, #self.log_dir,
+                session_dir=self.session_dir,
                 traces_vector_store=traces_vector_store,
                 summaries_vector_store=summaries_vector_store
             )
@@ -154,7 +154,8 @@ class BaseInfrastructure:
             from framework.workflows.context_manager import ContextManager
             self.context_manager = ContextManager(
                 max_ctx_tokens=max_ctx_tokens,
-                traces_vector_store=traces_vector_store
+                traces_vector_store=traces_vector_store,
+                session_dir=self.session_dir
             )
 
         # Logging setup
@@ -237,14 +238,20 @@ class BaseInfrastructure:
         return role, alias
 
     def append_chat_history(self, actor: str, content: Any, action=None, log_console: bool = True):
+        """Append a new entry to chat history and update context manager.
+        
+        FIXED: Now properly uses context_manager.get_compacted_context() instead of
+        rebuilding context on every call.
+        """
         role, alias = self.get_true_role_and_alias(actor, str(content))
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = {"role": role, "actor": actor, "content": content, "timestamp": timestamp, "action": action}
+        
+        # Update FULL_CTX (complete history)
         self.FULL_CTX.append(line)
         self.FULL_CTX_TOKENS += num_tokens_chat_entry(line)
 
         if isinstance(content, dict):
-            #ctx = f"|{role}('{actor}')> {self.expand_dict(content, dept=1)}"
             ctx = f"|{role}('{actor}')> {expand_dict(content, dept=1)}"
         else:
             ctx = f"|{role}('{actor}')> {content}"
@@ -253,17 +260,50 @@ class BaseInfrastructure:
         self.CTX += f"[{timestamp}]{ctx}\n"
 
         # Also persist in chat_manager
-        self.chat_manager.CHAT_HISTORY.append({
+        chat_entry = {
             "sender": actor,
             "content": content,
             "timestamp": timestamp
-        })
+        }
+        self.chat_manager.CHAT_HISTORY.append(chat_entry)
+
+        # Incrementally update context manager's current_ctx
+        self.context_manager.append_to_current_ctx(chat_entry)
+        
+        # Check if rebuild is needed
+        if self.context_manager.should_rebuild():
+            diagnostics = self.context_manager.get_context_diagnostics()
+            console.print(
+                f"[CONTEXT] Threshold exceeded: {diagnostics['utilization_pct']:.1f}% "
+                f"(threshold: {diagnostics['rebuild_threshold']*100:.0f}%). Triggering rebuild..."
+            )
+            self.context_manager.rebuild_current_ctx(
+                chat_history=self.chat_manager.CHAT_HISTORY,
+                memory_manager=self.memory_manager,
+                target_utilization=0.6,
+                verbose=1
+            )
 
         if log_console:
             self.console_log(ctx)
 
     def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.append_chat_history(actor, content, action, log_console=log_console)
+
+    def get_compacted_context_and_diagnostics(self, verbose=0):
+        """Get the current compacted context and diagnostics.
+        
+        FIXED: Now uses context_manager.get_compacted_context() instead of rebuilding.
+        """
+        context_str = self.context_manager.get_compacted_context()
+        diagnostics = self.context_manager.get_context_diagnostics()
+        
+        if verbose > 1:
+            console.print(f"[CTX][compaction]: context_str = {context_str}")
+        if verbose > 0:
+            console.print(f"[CTX][compaction]: diagnostics = {diagnostics}")
+        
+        return context_str, diagnostics
 
     def show_ctx(self):
         console.print(self.CTX)
