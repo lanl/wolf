@@ -133,7 +133,8 @@ class BaseInfrastructure:
         if chat_manager is not None:
             self.chat_manager = chat_manager
         else:
-            from framework.workflows.chat_manager import BaseChatManager
+            #from framework.workflows.chat_manager import BaseChatManager
+            from framework.infrastructure.base_chat_manager import BaseChatManager 
             self.chat_manager = BaseChatManager(
                 session_dir=self.session_dir,
                 chat_block_divider=chat_block_divider
@@ -142,7 +143,8 @@ class BaseInfrastructure:
         if memory_manager is not None:
             self.memory_manager = memory_manager
         else:
-            from framework.workflows.memory_manager import MemoryManager
+            #from framework.workflows.memory_manager import MemoryManager
+            from framework.infrastructure.base_memory_manager import MemoryManager 
             self.memory_manager = MemoryManager(
                 session_dir=self.session_dir,
                 traces_vector_store=traces_vector_store,
@@ -152,7 +154,8 @@ class BaseInfrastructure:
         if context_manager is not None:
             self.context_manager = context_manager
         else:
-            from framework.workflows.context_manager import ContextManager
+            #from framework.workflows.context_manager import ContextManager
+            from framework.infrastructure.base_context_manager import ContextManager 
             self.context_manager = ContextManager(
                 max_ctx_tokens=max_ctx_tokens,
                 traces_vector_store=traces_vector_store,

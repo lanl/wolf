@@ -28,10 +28,14 @@ from framework.agentic.default.params.llm_params import LANL_AIPORTAL_LLMs as LL
 
 # WORKFLOWS
 from framework.workflows.workflow_models import Actions
-from framework.workflows.chat_manager import BaseChatManager
-from framework.workflows.memory_manager import MemoryManager
-from framework.workflows.context_manager import ContextManager
-from framework.workflows.workflow_infrastructure import BaseInfrastructure
+#from framework.workflows.chat_manager import BaseChatManager
+from framework.infrastructure.base_chat_manager import BaseChatManager
+#from framework.workflows.memory_manager import MemoryManager
+from framework.infrastructure.base_memory_manager import MemoryManager
+#from framework.workflows.context_manager import ContextManager
+from framework.infrastructure.base_context_manager import ContextManager
+#from framework.workflows.workflow_infrastructure import BaseInfrastructure
+from framework.infrastructure.base_infrastructure import BaseInfrastructure 
 from framework.workflows.agentic_workflows import BaseWorkflow
 
 

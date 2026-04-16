@@ -2,7 +2,7 @@ import os, copy, logging, pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Dict
-from framework.workflows.chat_data_models import ChatEntry
+from framework.infrastructure.chat_data_models import ChatEntry
 from framework.utils.io_tools import console, jsonfy, save_pickle_file, load_pickle_file
 from framework.utils.tokenomics import (
     num_tokens_from_string,

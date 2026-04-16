@@ -12,7 +12,8 @@ from framework.workflows.workflow_models import (
     AGENT_ROLE_PROMPT as FULL_AGENT_ROLE_PROMPT,
     get_actions_subset,
 )
-from framework.workflows.workflow_infrastructure import BaseInfrastructure
+#from framework.workflows.workflow_infrastructure import BaseInfrastructure
+from framework.infrastructure.base_infrastructure import BaseInfrastructure
 from framework.workflows.enhanced_input import interactive_input_line_wrapped
 
 
