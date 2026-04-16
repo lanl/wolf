@@ -2,6 +2,7 @@ from typing import Literal, Dict, Optional
 from pydantic import BaseModel, Field
 from framework.workflows.base_agent_action import AgentAction
 from framework.universes.universe_tools import build_params_from_info, get_base_universe_params
+import uuid
 
 # ---------------------------
 # PlayBook Deployment Metadata
@@ -22,14 +23,16 @@ class PlaybookDeploymentArg(BaseModel):
     info: PlaybookDeploymentInfo = Field(description="Information about the playbook to deploy")
 
 
-import uuid
-
 # Helper constants
 METADATA_KEYS = {'state', 'scenario', 'variables', 'validated', 'task_list'}
 
 # Helper functions
 def _get_deployment(infra, deployment_id):
     """Get deployment dict if exists, else log error and return None."""
+    # Initialize PLAYBOOK_DEPLOYMENTS if it doesn't exist
+    if not hasattr(infra, 'PLAYBOOK_DEPLOYMENTS'):
+        infra.PLAYBOOK_DEPLOYMENTS = {}
+    
     if deployment_id not in infra.PLAYBOOK_DEPLOYMENTS:
         ctx_msg = f"[ERROR] Unable to find Deployment[{deployment_id}]. Has the deployment been created (as a result of playbook deployment)?"
         infra.append_chat_history(
@@ -756,27 +759,43 @@ class RunPlayBook(AgentAction):
     """
 
     def execute(self, infra) -> None:
-        # Get parent ID
+        # Initialize PLAYBOOK_DEPLOYMENTS if it doesn't exist
+        if not hasattr(infra, 'PLAYBOOK_DEPLOYMENTS'):
+            infra.PLAYBOOK_DEPLOYMENTS = {}
+        
+        # Generate a random UUID if ID not provided or empty
+        try:
+            deployment_id = self.payload.id
+        except:
+            deployment_id = None
+        if not deployment_id or len(deployment_id) < 1:
+            deployment_id = str(uuid.uuid4())[:8]
+        
+        # Get parent ID and validate if provided
         try:
             parent_id = self.payload.parent_id
         except:
             parent_id = None
-        # We need to verify whether parent_id is legit
-        if ( (parent_id is not None) and (len(deployment_id)>1) ):
+        
+        # Validate parent_id if provided
+        if parent_id and len(parent_id) > 1:
             VALID_PARENT = False
-            if infra.PLAYBOOK_DEPLOYMENTS is not None:
-                if parent_id not in infra.PLAYBOOK_DEPLOYMENTS.keys(): 
+            if infra.PLAYBOOK_DEPLOYMENTS:
+                if parent_id not in infra.PLAYBOOK_DEPLOYMENTS:
+                    ctx_msg = (f"[ERROR]: Parent playbook deployment with ID {parent_id} was not found")
                     VALID_PARENT = False
-                else: #We now need to check whether the the parent deployment is active (not concluded)
-                    if infra.PLAYBOOK_DEPLOYMENTS[parent_id]['state'].lower() in ['completed','canceled','terminated']:
-                        ctx_msg = (f"[ERROR]: Parent playbook deployment with ID {parent_id}'s state={infra.PLAYBOOK_DEPLOYMENTS[parent_id]['state']}:"
-                                   f"    Meaning is inactive; check and provide correct parent ID")
+                else:
+                    # Check whether the parent deployment is active (not concluded)
+                    parent_state = infra.PLAYBOOK_DEPLOYMENTS[parent_id].get('state', '').lower()
+                    if parent_state in ['completed', 'canceled', 'terminated']:
+                        ctx_msg = (f"[ERROR]: Parent playbook deployment with ID {parent_id}'s state={parent_state}: "
+                                   f"Meaning is inactive; check and provide correct parent ID")
                         VALID_PARENT = False
                     else:
                         VALID_PARENT = True
             else:
-                ctx_msg = (f"[ERROR]: Parent playbook deployment with ID {parent_id} was not found:"
-                           f"    In fact no precedent playbook has been deployed")
+                ctx_msg = (f"[ERROR]: Parent playbook deployment with ID {parent_id} was not found: "
+                           f"In fact no precedent playbook has been deployed")
                 VALID_PARENT = False
 
             if not VALID_PARENT:
@@ -788,45 +807,36 @@ class RunPlayBook(AgentAction):
                 )
                 return
 
-        # Generate a random UUID if ID not provided
-        try:
-            deployment_id = self.payload.id
-        except:
-            deployment_id = None
-        if ( (deployment_id is None) or (len(deployment_id)<1) ):
-            deployment_id = str(uuid.uuid4())[:8]
-
-        # Obtain Playbook
+        # Obtain Playbook - FIXED: Use Pydantic attribute access
         VALID_PLAYBOOK = False
-        deployment_type = self.payload.info['type'].strip().lower()
+        deployment_type = self.payload.info.type.strip().lower()  # FIXED: Changed from ['type']
+        
         if deployment_type in ['id', 'by_id', 'by id']:
-            playbook_id = self.payload.info['playbook'].strip()
-            playbook = infra.get_playbook_by_id(playbook_id)
-            if playbook is None:
-                ctx_msg = (f"[ERROR]: Playbook with ID {playbook_id} was not found:"
-                           f"    Playbook search result = {playbook}")
-                VALID_PLAYBOOK = False
-            else:
-                ctx_msg = f"[+]  PlayBook['{playbook_id}'] Found"
-                VALID_PLAYBOOK = True
+            playbook_id = self.payload.info.playbook.strip()  # FIXED: Changed from ['playbook']
+            # TODO: Implement get_playbook_by_id() method in infrastructure
+            # For now, return error message
+            ctx_msg = (f"[ERROR]: Playbook retrieval by ID is not yet implemented. "
+                       f"Please use 'raw_text' or 'file' deployment types instead.")
+            VALID_PLAYBOOK = False
         elif deployment_type in ['raw_text', 'text', 'content', 'raw', 'playbook_content', 'content_playbook', 'playbook content', 'content playbook']:
-            playbook = self.payload.info['playbook'].strip()
+            playbook = self.payload.info.playbook.strip()  # FIXED: Changed from ['playbook']
             ctx_msg = f"[+] RAW Playbook Copied OK"
             VALID_PLAYBOOK = True
-        elif deployment_type in  ['file', 'playbook file', 'playbook_file', 'path', 'file_path', 'playbook path', 'playbook_path']:
-            plbk_file_path = self.payload.info['playbook'].strip()
+        elif deployment_type in ['file', 'playbook file', 'playbook_file', 'path', 'file_path', 'playbook path', 'playbook_path']:
+            plbk_file_path = self.payload.info.playbook.strip()  # FIXED: Changed from ['playbook']
             try:
                 with open(plbk_file_path, 'r') as pb_file:
                     playbook = pb_file.read()
                 ctx_msg = f"[+] PlayBook Read from {plbk_file_path}"
                 VALID_PLAYBOOK = True
             except Exception as plbk_read_err:
-                ctx_msg = (f"[ERROR]:Reading Playbook from file: {plbk_file_path}:"
-                           f"  exception message: {plbk_read_err}")
+                ctx_msg = (f"[ERROR]: Reading Playbook from file: {plbk_file_path}: "
+                           f"exception message: {plbk_read_err}")
                 VALID_PLAYBOOK = False
         else:
             ctx_msg = f"[ERROR]: Unsupported Playbook deployment of type {deployment_type}"
             VALID_PLAYBOOK = False
+        
         # Message out progress
         infra.append_chat_history(
             actor="system",
@@ -834,30 +844,37 @@ class RunPlayBook(AgentAction):
             action={"action": "system_info"},
             log_console=True,
         )
-        if not VALID_PLAYBOOK: return
+        if not VALID_PLAYBOOK:
+            return
 
-        deployment_scenario  = self.payload.context
+        deployment_scenario = self.payload.context
         deployment_variables = self.payload.var
-        if infra.PLAYBOOK_DEPLOYMENTS is None:
-            infra.PLAYBOOK_DEPLOYMENTS={deployment_id:{"state":"created", "scenario":deployment_scenario, "variables":deployment_variables, "parent_id":parent_id}}
-        else:
-            infra.PLAYBOOK_DEPLOYMENTS[deployment_id]={"state":"created", "scenario":deployment_scenario, "variables":deployment_variables, "parent_id":parent_id}
+        
+        # Create deployment entry
+        infra.PLAYBOOK_DEPLOYMENTS[deployment_id] = {
+            "state": "created",
+            "scenario": deployment_scenario,
+            "variables": deployment_variables,
+            "parent_id": parent_id,
+            "validated": False
+        }
 
-        ctx_msg = (f"=================[ BEGINING PLAYBOOK DEPLOYMENT '{self.payload.name}' HISTORY ]=================\n"
-                   f"[SYSTEM]:\n"
-                   f"**Deployment ID** = {deployment_id}\n" 
-                   f"<Deployment Scenario/Context>\n"
-                   f"{deployment_scenario} \n"
-                   f"</Deployment Scenario/Context>\n"
-                   f"<Playbook Content>\n"
-                   f"{playbook}\n"
-                   f"</Playbook Content>\n"
-                   f"<Playbook Variables>\n"
-                   f"{deployment_variables}\n"
-                   f"</Playbook Variables> \n"
-                   f"Build a workplan for the scenario/context provided above using the provided playbook\n"
-                   f"Show the workplan to user for approval or feedback\n"
-                   )
+        ctx_msg = (
+            f"=================[ BEGINING PLAYBOOK DEPLOYMENT '{self.payload.name}' HISTORY ]=================\n"
+            f"[SYSTEM]:\n"
+            f"**Deployment ID** = {deployment_id}\n"
+            f"<Deployment Scenario/Context>\n"
+            f"{deployment_scenario} \n"
+            f"</Deployment Scenario/Context>\n"
+            f"<Playbook Content>\n"
+            f"{playbook}\n"
+            f"</Playbook Content>\n"
+            f"<Playbook Variables>\n"
+            f"{deployment_variables}\n"
+            f"</Playbook Variables> \n"
+            f"Build a workplan for the scenario/context provided above using the provided playbook\n"
+            f"Show the workplan to user for approval or feedback\n"
+        )
         infra.append_chat_history(
             actor="system",
             content=ctx_msg,
