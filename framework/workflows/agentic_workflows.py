@@ -100,7 +100,7 @@ class BaseWorkflow:
            self.wf_agent_behaviour_file = agent_behaviour_file
         else:
             if self.wf_agent_behaviour_file is None:
-                self.AGEN_BEHAVIOUR = '', self.WF_RULES
+                self.AGENT_BEHAVIOUR = ''
                 return
         with open(self.wf_agent_behaviour_file, "r") as f: self.AGENT_BEHAVIOUR = f.read()
 
@@ -185,7 +185,16 @@ class BaseWorkflow:
             "The following are the actions you can take in  response to the context\n"
             "*** List of allowed Actions Start *** \n"
             f"{self.schema_to_use}\n"
-            "*** List of allowed Actions End *** \n\n"
+            "*** List of allowed Actions End *** \n"
+            "*** Description of the infrastructure Start *** \n"
+            f"{self.infra.INFRA_DESCRIPTION}\n"
+            "*** Description of the infrastructure End *** \n"
+            f"*** Best Practices Start *** \n"
+            f"{self.AGENT_BEHAVIOUR}\n"
+            f"*** Best Practices End *** \n"
+            f"*** WORKFLOW RULES Start *** \n"
+            f"{self.WF_RULES}\n"
+            "*** WORKFLOW RULES End *** \n\n"
         )
         
         # Obtain a response (structured or free‑form)

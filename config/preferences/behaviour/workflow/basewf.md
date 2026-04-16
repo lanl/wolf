@@ -20,11 +20,11 @@ Playbooks are written to work for a broader range of cases:
 - Consequently, an unsuccessful search is likely due to a too specific query; next time, try using a more general search query that captures the main goal or task you are trying to accomplish, rather than a very specific and detailed query.  
 - Conversely, when writing playbooks, write them to be general and applicable to a broader range of cases.
 
-### 6. Interacting/using actionboxes:
+### 6. Interacting/using universes:
 Actionboxes are remote (non-local) environments that provide a self-contained sandbox where you can perform tasks, i.e., containers, screen/tmux sessions, etc.  
-- The SYSTEM may provide different actionboxes for you to use. You can always find out which actionboxes are available to you by querying the system.  
-- Before attempting to use/interact with an actionbox, you must first find out how to interact with it by getting the list of actions you are allowed to take in the actionbox.  
-- If you determine any of the permitted actions to be useful for performing your task, then use the actionbox by taking the action of interest.  
+- The SYSTEM may provide different universes for you to use. You can always find out which universes are available to you by querying the system.  
+- Before attempting to use/interact with an universe, you must first find out how to interact with it by getting the list of actions you are allowed to take in the universe.  
+- If you determine any of the permitted actions to be useful for performing your task, then use the universe by taking the action of interest.  
 
 ### 7. Playbook deployment:
 When deploying a playbook, a workplan deployment tracking widget is created in the UI to allow the user to monitor the workplan deployement, so it is important to:

@@ -36,6 +36,7 @@ class BaseInfrastructure:
         context_manager: Any = None,
         traces_vector_store: Any = None,
         summaries_vector_store: Any = None,
+        infra_description_file = "framework/infrastructure/config/base_infra_description.md"
     ):
         # Support session_dir as primary, fall back to wf_log_dir for backwards compatibility
         self.session_dir = session_dir.strip().rstrip("/")
@@ -191,8 +192,22 @@ class BaseInfrastructure:
         self.HEADER = copy.deepcopy(self.CTX)
         self.HEADER_IDX = len(self.chat_history)
         self.CONSOLE_HEAD = 0
+        self.infra_description_file = infra_description_file
+        self.INFRA_DESCRIPTION = ''
+        self.update_infra_description(infra_description_file)
 
     # ------ Helper / utility methods ------
+
+    def update_infra_description(self, infra_description_file: str|None =None):
+        if infra_description_file is not None:
+            self.infra_description_file = infra_description_file
+        else:
+            if self.infra_description_file is None:
+                self.INFRA_DESCRIPTION = ''
+                return
+        with open(self.infra_description_file, "r") as f: self.INFRA_DESCRIPTION = f.read()
+
+
     def rebuild_chat_history(self, starting_from_line: int = 0):
         """Rebuild chat_history and CTX from FULL_CTX and chat_manager."""
         if starting_from_line > 0:
