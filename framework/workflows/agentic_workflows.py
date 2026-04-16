@@ -104,31 +104,12 @@ class BaseWorkflow:
                 return
         with open(self.wf_agent_behaviour_file, "r") as f: self.AGENT_BEHAVIOUR = f.read()
 
-    def append_chat_history(self, actor: str, content: Any, action=None, log_console: bool = True):
+    def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.infra.append_chat_history(actor, content, action, log_console)
         # inform memory manager about the new entry for possible summarisation
         new_entries = [self.chat_manager.CHAT_HISTORY[-1]] if self.chat_manager.CHAT_HISTORY else []
         if new_entries:
             self.memory_manager.process_new_entries(new_entries)
-
-    def get_compated_context_and_diagnostics(self, verbose=0):
-        """Get the current compacted context and diagnostics.
-        
-        This method now uses the context manager's current buffer
-        instead of rebuilding on every call.
-        """
-        context_str = self.context_manager.get_compacted_context()
-        diagnostics = self.context_manager.get_context_diagnostics()
-        
-        if verbose > 1:
-            console.print(f"[CTX][compaction]: context_str = {context_str}")
-        if verbose > 0:
-            console.print(f"[CTX][compaction]: Diagnostics = {diagnostics}")
-        
-        return context_str, diagnostics
-
-    def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):
-        self.append_chat_history(actor, content, action, log_console)
 
     def normalize_and_validate_agent_response(self, response):
         try:
@@ -162,12 +143,8 @@ class BaseWorkflow:
     # -----------------------------------------------------------------
     def _handle_actor_turn(self, actor, name: str):
         """Process a turn for *actor* (either the main agent or a worker).
-
         *actor* – the agent/worker instance.
         *name*  – string identifier used for routing the next turn.
-        
-        This method now uses the context manager's current_ctx buffer
-        instead of rebuilding the context on every call.
         """
         self.infra.show_updated_history()
         

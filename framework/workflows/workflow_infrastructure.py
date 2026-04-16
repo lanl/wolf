@@ -251,12 +251,9 @@ class BaseInfrastructure:
         if role not in self.NON_SYS_ROLES:
             role = "system"
         return role, alias
-
+    
     def append_chat_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         """Append a new entry to chat history and update context manager.
-        
-        FIXED: Now properly uses context_manager.get_compacted_context() instead of
-        rebuilding context on every call.
         """
         role, alias = self.get_true_role_and_alias(actor, str(content))
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -301,24 +298,6 @@ class BaseInfrastructure:
 
         if log_console:
             self.console_log(ctx)
-
-    def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):
-        self.append_chat_history(actor, content, action, log_console=log_console)
-
-    def get_compacted_context_and_diagnostics(self, verbose=0):
-        """Get the current compacted context and diagnostics.
-        
-        FIXED: Now uses context_manager.get_compacted_context() instead of rebuilding.
-        """
-        context_str = self.context_manager.get_compacted_context()
-        diagnostics = self.context_manager.get_context_diagnostics()
-        
-        if verbose > 1:
-            console.print(f"[CTX][compaction]: context_str = {context_str}")
-        if verbose > 0:
-            console.print(f"[CTX][compaction]: diagnostics = {diagnostics}")
-        
-        return context_str, diagnostics
 
     def show_ctx(self):
         console.print(self.CTX)
