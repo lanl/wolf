@@ -62,7 +62,7 @@ class BaseInfrastructure:
         self.workers = {}
         self.workers_names = []
         for ag in workers:
-            if ag.name == self.agent:
+            if ag.name == self.agent.name:
                 raise Exception(
                     f"[!][BaseInfrastructure][__init__]: worker agent {ag.name} has the same name as main agent"
                 )
