@@ -116,10 +116,12 @@ class BaseWorkflow:
         try:
             normalized = normalize_payload(response)
         except Exception as exc:
+            print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to normalize agent_response:\n type(response) = {type(response)} \n response = {response}")
             return True, f"[payload normalization error] {exc}", None, None
         try:
             action_obj = self.action_adapter.validate_python(normalized)
         except Exception as exc:
+            print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to validate agent_response:\n type(response) = {type(response)} \n response = {response}")
             return True, f"[Normalized payload validation error] {exc}", None, normalized
         return False, None, action_obj, normalized
 

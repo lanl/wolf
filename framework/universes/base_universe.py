@@ -586,25 +586,45 @@ def create_app_default() -> FastAPI:
     return create_app(universe)
 
 
-def run_app(params: base_universe_params_type|None = None ,
-            host: str = "0.0.0.0", port: int = 8000, 
-            cors: Optional[List[str]] = None) -> None:
-    host = host.lstrip().strip()
-    if (host.startswith("https://") or host.startswith("http://")):
-        _host = host
-    else:
-        _host = f"http://{host}"
+def run_app(
+    params: BaseUniverseParams | None = None,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    cors: Optional[List[str]] = None,
+) -> None:
+    host = host.strip()
+
     if params is None:
         name_generator = NameGenerator()
-        info = BaseUniverseModel(name=name_generator.get_name(),
-                                 host=_host, port=port) 
-        _params = BaseUniverseParams(info=info) 
+        info = BaseUniverseModel(
+            name=name_generator.get_name(),
+            host=host,
+            port=port,
+        )
+        _params = BaseUniverseParams(info=info)
     else:
         _params = params
-        params.info.host = _host
-        params.info.port = port
+        if _params.info is None:
+            raise ValueError("params.info must not be None")
+        _params.info.host = host
+        _params.info.port = port
+
     universe = build_default_universe(_params)
     app = create_app(universe, cors_origins=cors)
 
+    # Pre-bind socket ourselves so we know the real port before Uvicorn starts.
+    import socket
     import uvicorn
-    uvicorn.run(app, host=host, port=port)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))          # port=0 => OS picks a free port
+    sock.listen()
+    actual_port = sock.getsockname()[1]
+
+    _params.info.port = actual_port
+
+    print(f"Universe available at {_params.info.get_base_url()}")
+
+    config = uvicorn.Config(app=app, host=host, port=actual_port)
+    server = uvicorn.Server(config)
+    server.run(sockets=[sock])

@@ -1,4 +1,4 @@
-"""Workflow model definitions for Cerberus.
+"""Workflow model definitions for WOLF.
 Imports the concrete action classes from ``agent_actions`` and builds the
 Pydantic discriminated union ``Actions`` dynamically. The JSON schema used
 by the system prompt is also generated dynamically from action definitions.
