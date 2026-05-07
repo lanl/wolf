@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-import re, copy, subprocess, pickle, ast, json
+import re, copy, subprocess, pickle, dill, ast, json
 from PIL import Image
 
 import base64
@@ -417,13 +417,24 @@ def expand_dict(dct: dict, dept: int = 0, stride: int = 2) -> str:
             message += f"{tab}{k}: {dct[k]}\n"
     return message
 
-def save_pickle_file(fname, fcontent):
+def save_pickle_file(fname, fcontent, verbose=0):
     with open(fname, 'wb') as f:
         pickle.dump(fcontent, f)
+    if verbose>0: print(f"[+] {fname} saved OK")
 
 def load_pickle_file(fname):
     with open(fname, 'rb') as f:
         return pickle.load(f)
+
+def save_dill_file(fname, fcontent, verbose=0):
+    with open(fname, 'wb') as f:
+        dill.dump(fcontent, f)
+    if verbose>0: print(f"[+] {fname} saved OK")
+ 
+def load_dill_file(fname):
+    with open(fname, 'rb') as f:
+        return dill.load(f)
+
 
 
 def save_json_file(fname, fcontent, indent=4):
