@@ -3,6 +3,8 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 import tiktoken
+import json
+import glob
 
 # UTILs
 from framework.utils.io_tools import console, load_env_vars, image_to_ascii
@@ -28,13 +30,9 @@ from framework.agentic.default.params.llm_params import LANL_AIPORTAL_LLMs as LL
 
 # WORKFLOWS
 from framework.workflows.workflow_models import Actions
-#from framework.workflows.chat_manager import BaseChatManager
 from framework.infrastructure.base_chat_manager import BaseChatManager
-#from framework.workflows.memory_manager import MemoryManager
 from framework.infrastructure.base_memory_manager import MemoryManager
-#from framework.workflows.context_manager import ContextManager
 from framework.infrastructure.base_context_manager import ContextManager
-#from framework.workflows.workflow_infrastructure import BaseInfrastructure
 from framework.infrastructure.base_infrastructure import BaseInfrastructure 
 from framework.workflows.agentic_workflows import BaseWorkflow
 
@@ -136,84 +134,236 @@ def build_list_universes(session_params):
     return UNIVs
 
 
-def setup_cli_session(session_params):
+def load_existing_session(session_identifier: str, session_params: dict) -> dict:
+    """Load an existing session from snapshots.
+    
+    Args:
+        session_identifier: Path, date, keyword, or session ID to load
+        session_params: Session parameters for reconstructing components
+        
+    Returns:
+        Session dictionary with reconstructed workflow
+    """
+    # Resolve session path
+    LATEST_KEYWORDS = ['latest', 'last', 'recent', 'most_recent', 'newest']
+    session_lower = session_identifier.strip().lower()
+    
+    snapshot_path = None
+    
+    if session_lower in LATEST_KEYWORDS:
+        pattern = "wf_workspace/session_*/session.snapshot.json"
+        all_sessions = sorted(glob.glob(pattern), reverse=True)
+        if all_sessions:
+            snapshot_path = all_sessions[0]
+            console.print(f"[cyan]Loading most recent session: {os.path.dirname(snapshot_path)}[/cyan]")
+    elif session_identifier.endswith('.snapshot.json') and os.path.exists(session_identifier):
+        snapshot_path = session_identifier
+    elif session_identifier.startswith('wf_workspace'):
+        if session_identifier.endswith('.snapshot.json'):
+            snapshot_path = session_identifier
+        else:
+            snapshot_path = os.path.join(session_identifier, 'session.snapshot.json')
+    elif session_identifier.startswith('session_'):
+        snapshot_path = f"wf_workspace/{session_identifier}/session.snapshot.json"
+    elif len(session_identifier) == 8 and session_identifier.isdigit():
+        pattern = f"wf_workspace/session_{session_identifier}_*/session.snapshot.json"
+        matching_sessions = sorted(glob.glob(pattern), reverse=True)
+        if matching_sessions:
+            snapshot_path = matching_sessions[0]
+            console.print(f"[cyan]Loading latest session from {session_identifier}[/cyan]")
+    else:
+        pattern = f"wf_workspace/session_*{session_identifier}*/session.snapshot.json"
+        matching_sessions = sorted(glob.glob(pattern), reverse=True)
+        if matching_sessions:
+            snapshot_path = matching_sessions[0]
+            console.print(f"[cyan]Found matching session: {os.path.dirname(snapshot_path)}[/cyan]")
+    
+    if not snapshot_path or not os.path.exists(snapshot_path):
+        raise Exception(f"[!][ERROR] Unable to find session matching '{session_identifier}'")
+    
+    # Load snapshot
+    with open(snapshot_path, 'r') as f:
+        snapshot_data = json.load(f)
+    
+    console.print(f"[green]Successfully loaded snapshot from {snapshot_path}[/green]")
+    
+    # Extract session directory
+    session_dir = snapshot_data.get('session_dir', os.path.dirname(snapshot_path))
+    
+    # Reconstruct agents (these can't be serialized, must be rebuilt)
+    AGENTs = build_list_agents(session_params)
+    agents = list(AGENTs.keys())
+    main_agent = AGENTs[agents[0]]
+    workers = [AGENTs[worker] for worker in agents[1:]] if len(agents) > 1 else []
+    
+    # Reconstruct universes
+    UNIVs = build_list_universes(session_params)
+    
+    # Setup vector stores
+    memory_db_persist_sub_dir = session_params.get('memory_db_persist_sub_dir', 'memory')
+    
+    summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
+    summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
+    summaries_vs = VectorStore(summaries_vs_params)
+    
+    traces_vs_params = copy.deepcopy(TRACES_PARAMS)
+    traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
+    traces_vs = VectorStore(traces_vs_params)
+    
+    # Reconstruct managers
+    chat_manager = BaseChatManager(session_dir=session_dir)
+    memory_manager = MemoryManager(
+        memory_path=os.path.join(session_dir, "memory.json"),
+        traces_vector_store=traces_vs,
+        summaries_vector_store=summaries_vs
+    )
+    context_manager = ContextManager(
+        max_ctx_tokens=100000,
+        traces_vector_store=traces_vs,
+        session_dir=session_dir
+    )
+    
+    # Restore manager states from snapshots
+    infra_snapshot = snapshot_data.get('infrastructure', {})
+    if 'chat_manager' in infra_snapshot:
+        chat_manager.restore(infra_snapshot['chat_manager'])
+    if 'context_manager' in infra_snapshot:
+        context_manager.restore(infra_snapshot['context_manager'])
+    if 'memory_manager' in infra_snapshot:
+        memory_manager.restore(infra_snapshot['memory_manager'])
+    
+    # Reconstruct infrastructure
+    INFRA = BaseInfrastructure(
+        agent=main_agent,
+        workers=workers,
+        objects=UNIVs,
+        max_ctx_tokens=snapshot_data.get('max_ctx_tokens', 50000),
+        wf_log_dir=session_dir,
+        session_dir=session_dir,
+        chat_manager=chat_manager,
+        memory_manager=memory_manager,
+        context_manager=context_manager
+    )
+    
+    # Restore infrastructure state
+    INFRA.restore(infra_snapshot)
+    
+    # Create workflow with restored infrastructure
+    WF = BaseWorkflow(
+        session=None,  # Will be set during load_session_state
+        infra=INFRA,
+        actions_union=Actions,
+        wf_rules_file=snapshot_data.get('wf_rules_file'),
+        wf_agent_behaviour_file=snapshot_data.get('wf_agent_behaviour_file'),
+        wf_agent_sys_prompt_file=snapshot_data.get('wf_agent_sys_prompt_file'),
+        wf_user=snapshot_data.get('WORKFLOW_USER', 'user'),
+        wf_turn=snapshot_data.get('WORKFLOW_TURN')
+    )
+    
+    console.print(f"[green]Session restored successfully from {session_dir}[/green]")
+    
+    return {
+        'agents': {'main': main_agent, 'workers': workers},
+        'objects': {'universes': UNIVs, 'kbs': [], 'tbs': []},
+        'managers': {'chat': chat_manager, 'memory': memory_manager, 'context': context_manager},
+        'session_dir': session_dir,
+        'wf': WF
+    }
+
+
+def setup_cli_session(session_params, resume_session: str|None = None):
+    """Setup CLI session - either new or resumed.
+    
+    Args:
+        session_params: Session parameters
+        resume_session: If provided, resume from this session (path/date/keyword)
+        
+    Returns:
+        Session dictionary
+    """
     params = list(session_params.keys())
     assert 'LLMs' in params, "[ERROR][CLI SESSION SETUP]: 'LLMs' are required parameters for building agents"
-    LLMs = session_params['LLMs']
-    verbose = session_params.get('verbose', 0)
+    
     # INIT
     load_session_certs(session_params)
     show_banner(session_params)
+    
+    # Check if resuming existing session
+    if resume_session:
+        return load_existing_session(resume_session, session_params)
+    
+    # Otherwise create new session
+    LLMs = session_params['LLMs']
+    verbose = session_params.get('verbose', 0)
+    
     # AGENTS
     AGENTs = build_list_agents(session_params)
     agents = list(AGENTs.keys())
     main_agent = AGENTs[agents[0]]
-    # Workers
-    if len(agents)> 1: 
-        workers = [AGENTs[worker] for worker in agents[1:]]
-    else:
-        workers = []
+    workers = [AGENTs[worker] for worker in agents[1:]] if len(agents) > 1 else []
+    
     # KBs
     KBs = []
     # TBs
     TBs = []
     # UNIVERSES
     UNIVs = build_list_universes(session_params)
+    
     # SESSION
     session_dir = session_params.get('session_dir', create_session_dir())
     console.print(f"[INFO] Session directory: {session_dir}")
+    
     ## Memory VS persist subdirectory
     memory_db_persist_sub_dir = session_params.get('memory_db_persist_sub_dir', 'memory')
+    
     ## Summaries
     summaries_vs_params = session_params.get('summaries_params', None)
-    if summaries_vs_params is None: # Defaults
+    if summaries_vs_params is None:
         summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
         summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
-    if verbose> 0: console.print(f"[INFO][MEMORY] Summaries params: {summaries_vs_params}")
+    if verbose > 0: console.print(f"[INFO][MEMORY] Summaries params: {summaries_vs_params}")
     summaries_vs = VectorStore(summaries_vs_params)
+    
     ## Traces
     traces_vs_params = session_params.get('traces_params', None)
-    if traces_vs_params is None: # Defaults
+    if traces_vs_params is None:
         traces_vs_params = copy.deepcopy(TRACES_PARAMS)
         traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
-    if verbose> 0: console.print(f"[INFO][MEMORY] Traces params: {traces_vs_params}")
+    if verbose > 0: console.print(f"[INFO][MEMORY] Traces params: {traces_vs_params}")
     traces_vs = VectorStore(traces_vs_params)
+    
     # MANAGERs
-    chat_manager = session_params.get('chat_manager', BaseChatManager(session_dir=session_dir) )
-    memory_manager = session_params.get('memory_manager', MemoryManager(memory_path = os.path.join(session_dir, "memory.json"),
-                                                                        traces_vector_store=traces_vs,
-                                                                        summaries_vector_store=summaries_vs)
-                                        )
-    context_manager = session_params.get('context_manager', ContextManager(max_ctx_tokens=100000,
-                                                                           recent_chat_ratio=0.50,
-                                                                           memory_ratio=0.30,
-                                                                           trace_ratio=0.20,
-                                                                           traces_vector_store=traces_vs)
-                                         )
+    chat_manager = session_params.get('chat_manager', BaseChatManager(session_dir=session_dir))
+    memory_manager = session_params.get('memory_manager', 
+                                       MemoryManager(memory_path=os.path.join(session_dir, "memory.json"),
+                                                    traces_vector_store=traces_vs,
+                                                    summaries_vector_store=summaries_vs))
+    context_manager = session_params.get('context_manager', 
+                                        ContextManager(max_ctx_tokens=100000,
+                                                      recent_chat_ratio=0.50,
+                                                      memory_ratio=0.30,
+                                                      trace_ratio=0.20,
+                                                      traces_vector_store=traces_vs))
+    
     # INFRA
-    INFRA = session_params.get('infra', BaseInfrastructure(agent=main_agent,
-                                                           workers=workers,
-                                                           objects=UNIVs,
-                                                           max_ctx_tokens=session_params.get('max_ctx_tokens',50000),
-                                                           wf_log_dir=session_dir,
-                                                           chat_manager=chat_manager,
-                                                           memory_manager=memory_manager,
-                                                           context_manager=context_manager
-                                                           )
-                               )
-
+    INFRA = session_params.get('infra', 
+                              BaseInfrastructure(agent=main_agent,
+                                               workers=workers,
+                                               objects=UNIVs,
+                                               max_ctx_tokens=session_params.get('max_ctx_tokens', 50000),
+                                               wf_log_dir=session_dir,
+                                               session_dir=session_dir,
+                                               chat_manager=chat_manager,
+                                               memory_manager=memory_manager,
+                                               context_manager=context_manager))
+    
     # WORKFLOW
-    WF = session_params.get('wf', BaseWorkflow(infra=INFRA, 
-                                               actions_union=session_params.get('actions', Actions) )
-                            )
-    session = {"agents":{'main':main_agent, 'workers':workers},
-               'objects':{'universes':UNIVs,
-                          'kbs':KBs,
-                          'tbs':TBs},
-               'managers':{'chat':chat_manager,
-                           'memory':memory_manager,
-                           'context':context_manager},
-               'session_dir': session_dir,
-               'wf': WF
-               }
-    return session
+    WF = session_params.get('wf', BaseWorkflow(infra=INFRA, actions_union=session_params.get('actions', Actions)))
+    
+    return {
+        'agents': {'main': main_agent, 'workers': workers},
+        'objects': {'universes': UNIVs, 'kbs': KBs, 'tbs': TBs},
+        'managers': {'chat': chat_manager, 'memory': memory_manager, 'context': context_manager},
+        'session_dir': session_dir,
+        'wf': WF
+    }

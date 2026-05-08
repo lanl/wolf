@@ -1,4 +1,4 @@
-import os, copy, logging, pickle
+import os, copy, logging, pickle, json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Dict
@@ -74,15 +74,15 @@ class BaseChatManager:
         """Log a message with appropriate level based on keywords."""
         MSG = msg.lower()
         if "[error]" in MSG:
-            self.log.error(MSG)
+            self.log.error(msg)
         elif "[warn]" in MSG:
-            self.log.warning(MSG)
+            self.log.warning(msg)
         elif "[debug]" in MSG:
-            self.log.debug(MSG)
+            self.log.debug(msg)
         elif "[critk]" in MSG:
-            self.log.critical(MSG)
+            self.log.critical(msg)
         else:
-            self.log.info(MSG)
+            self.log.info(msg)
 
     def replace_fillers(self, msg: str, filler_head: str = "<FILL", filler_tail: str = "/>") -> str:
         """Replace placeholder fillers with their actual values."""
@@ -141,3 +141,90 @@ class BaseChatManager:
             self.CHAT_HISTORY_TOKEN_COUNT += num_tokens_chat_entry(chat_entry.model_dump())
             self.LAST_COUNTED_ENTRY_IDX += 1
             self.LAST_CHAT_ENTRY_IDX += 1
+
+    # ------ Snapshot and Restore methods ------
+    def snapshot(self) -> Dict[str, Any]:
+        """Create a snapshot of the current chat manager state.
+        
+        Returns:
+            Dict containing all state information needed to restore the instance.
+        """
+        snapshot_data = {
+            "CHAT_HISTORY": [ entry if isinstance(entry, dict) else entry.model_dump() for entry in self.CHAT_HISTORY],
+            "CHAT_ENTRY": {k: v.model_dump() for k, v in self.CHAT_ENTRY.items()},
+            "CHAT_HEAD_IDX": self.CHAT_HEAD_IDX,
+            "LAST_CHAT_ENTRY_IDX": self.LAST_CHAT_ENTRY_IDX,
+            "LAST_COUNTED_ENTRY_IDX": self.LAST_COUNTED_ENTRY_IDX,
+            "CHAT_HISTORY_TOKEN_COUNT": self.CHAT_HISTORY_TOKEN_COUNT,
+            "timestamp": self.get_timestamp(),
+        }
+        return snapshot_data
+
+    def restore(self, snapshot_data: Dict[str, Any], verbose=0) -> None:
+        """Restore the chat manager state from a snapshot.
+        
+        Args:
+            snapshot_data: Dictionary containing state information from a previous snapshot.
+        """
+        # Restore CHAT_HISTORY
+        self.CHAT_HISTORY = []
+        for entry in snapshot_data.get("CHAT_HISTORY", []): 
+            if isinstance(entry, dict):
+                # Debug output (can remove later)
+                if verbose>0:
+                    print(f"[!!] entry struct = {entry.keys()}")
+                    print(f"[!!] content type = {type(entry.get('content'))}")
+                # FIX: Ensure content is always a string (as ChatEntry expects)
+                content = entry.get('content')
+                if isinstance(content, dict):
+                    if verbose>0: print(f"[!!] content value = {content}")
+                    # Extract the actual message from the nested structure
+                    if 'payload' in content and 'message' in content['payload']:
+                        entry['content'] = content['payload']['message']
+                    else:
+                        # Fallback: serialize the entire dict
+                        entry['content'] = json.dumps(content)
+                    if verbose>0: print(f"[!!] Converted to: {entry['content']}") 
+                if verbose>0: print(f"[!!] ---")
+                self.CHAT_HISTORY.append(ChatEntry(**entry))
+            else:
+                self.CHAT_HISTORY.append(entry)
+         
+        # Restore CHAT_ENTRY
+        self.CHAT_ENTRY = {
+            k: ChatEntry(**v) if isinstance(v, dict) else v
+            for k, v in snapshot_data.get("CHAT_ENTRY", {}).items()
+        }
+        
+        # Restore indexes and counts
+        self.CHAT_HEAD_IDX = snapshot_data.get("CHAT_HEAD_IDX", 0)
+        self.LAST_CHAT_ENTRY_IDX = snapshot_data.get("LAST_CHAT_ENTRY_IDX", 0)
+        self.LAST_COUNTED_ENTRY_IDX = snapshot_data.get("LAST_COUNTED_ENTRY_IDX", 0)
+        self.CHAT_HISTORY_TOKEN_COUNT = snapshot_data.get("CHAT_HISTORY_TOKEN_COUNT", 0)
+        
+        # Save restored state to disk for persistence
+        save_pickle_file(f"{self.session_dir}/{self.chat_history_fname}", self.CHAT_HISTORY)
+        save_pickle_file(f"{self.session_dir}/{self.chat_entries_fname}", self.CHAT_ENTRY)
+
+    def save_snapshot(self, file_path: str) -> None:
+        """Save a snapshot to disk.
+        
+        Args:
+            file_path: Path where the snapshot should be saved.
+        """
+        snapshot_data = self.snapshot()
+        save_pickle_file(file_path, snapshot_data)
+        self.console_log(f"[INFO] Snapshot saved to {file_path}")
+
+    def load_snapshot(self, file_path: str) -> None:
+        """Load and restore from a snapshot file.
+        
+        Args:
+            file_path: Path to the snapshot file to load.
+        """
+        snapshot_data = load_pickle_file(file_path)
+        if snapshot_data is not None:
+            self.restore(snapshot_data)
+            self.console_log(f"[INFO] Snapshot loaded from {file_path}")
+        else:
+            self.console_log(f"[ERROR] Failed to load snapshot from {file_path}")

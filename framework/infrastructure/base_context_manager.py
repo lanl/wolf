@@ -4,6 +4,7 @@ from framework.utils.io_tools import console
 from framework.utils.tokenomics import num_tokens_from_string
 from datetime import datetime
 import json
+import pickle
 
 
 class ContextManager:
@@ -337,6 +338,101 @@ class ContextManager:
             return False
         except Exception as e:
             console.print(f"[CONTEXT] Failed to load state: {e}")
+            return False
+
+    # ------ Snapshot and Restore methods ------
+    def snapshot(self) -> Dict[str, Any]:
+        """Create a snapshot of the current context manager state.
+        
+        Returns:
+            Dict containing all state information needed to restore the instance.
+        """
+        snapshot_data = {
+            "current_ctx": self.current_ctx,
+            "current_ctx_tokens": self.current_ctx_tokens,
+            "context_version": self.context_version,
+            "rebuild_count": self.rebuild_count,
+            "total_appends": self.total_appends,
+            "context_history": self.context_history,
+            "last_rebuild_timestamp": self.last_rebuild_timestamp,
+            "max_ctx_tokens": self.max_ctx_tokens,
+            "recent_chat_ratio": self.recent_chat_ratio,
+            "memory_ratio": self.memory_ratio,
+            "trace_ratio": self.trace_ratio,
+            "rebuild_threshold": self.rebuild_threshold,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return snapshot_data
+
+    def restore(self, snapshot_data: Dict[str, Any]) -> None:
+        """Restore the context manager state from a snapshot.
+        
+        Args:
+            snapshot_data: Dictionary containing state information from a previous snapshot.
+        """
+        # Restore context buffer and metrics
+        self.current_ctx = snapshot_data.get("current_ctx", [])
+        self.current_ctx_tokens = snapshot_data.get("current_ctx_tokens", 0)
+        self.context_version = snapshot_data.get("context_version", 0)
+        self.rebuild_count = snapshot_data.get("rebuild_count", 0)
+        self.total_appends = snapshot_data.get("total_appends", 0)
+        self.context_history = snapshot_data.get("context_history", [])
+        self.last_rebuild_timestamp = snapshot_data.get("last_rebuild_timestamp")
+        
+        # Restore configuration (if present)
+        if "max_ctx_tokens" in snapshot_data:
+            self.max_ctx_tokens = snapshot_data["max_ctx_tokens"]
+        if "recent_chat_ratio" in snapshot_data:
+            self.recent_chat_ratio = snapshot_data["recent_chat_ratio"]
+        if "memory_ratio" in snapshot_data:
+            self.memory_ratio = snapshot_data["memory_ratio"]
+        if "trace_ratio" in snapshot_data:
+            self.trace_ratio = snapshot_data["trace_ratio"]
+        if "rebuild_threshold" in snapshot_data:
+            self.rebuild_threshold = snapshot_data["rebuild_threshold"]
+        
+        # Save restored state to disk for persistence
+        self.save_context()
+
+    def save_snapshot(self, file_path: str) -> None:
+        """Save a snapshot to disk.
+        
+        Args:
+            file_path: Path where the snapshot should be saved.
+        """
+        snapshot_data = self.snapshot()
+        
+        # Use pickle for backward compatibility with other components
+        with open(file_path, 'wb') as f:
+            pickle.dump(snapshot_data, f)
+        
+        console.print(f"[CONTEXT] Snapshot saved to {file_path}")
+
+    def load_snapshot(self, file_path: str) -> bool:
+        """Load and restore from a snapshot file.
+        
+        Args:
+            file_path: Path to the snapshot file to load.
+            
+        Returns:
+            True if load successful, False otherwise
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                snapshot_data = pickle.load(f)
+            
+            if snapshot_data is not None:
+                self.restore(snapshot_data)
+                console.print(f"[CONTEXT] Snapshot loaded from {file_path}")
+                return True
+            else:
+                console.print(f"[CONTEXT] Failed to load snapshot from {file_path}")
+                return False
+        except FileNotFoundError:
+            console.print(f"[CONTEXT] Snapshot file not found: {file_path}")
+            return False
+        except Exception as e:
+            console.print(f"[CONTEXT] Error loading snapshot: {e}")
             return False
 
     # ---------------------------------------------------------------------

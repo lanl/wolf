@@ -1,6 +1,7 @@
 import copy
 import os
 import logging
+import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -381,3 +382,142 @@ class BaseInfrastructure:
         else:
             PROMPT = user_prompt.strip()
         return BREAK, IS_CMD, ERROR, INTERLOCUTOR, PROMPT
+
+    # ------ Snapshot and Restore methods ------
+    def snapshot(self) -> Dict[str, Any]:
+        """Create a snapshot of the current infrastructure state.
+        
+        Returns:
+            Dict containing all state information needed to restore the instance.
+        """
+        snapshot_data = {
+            # Manager snapshots
+            "chat_manager": self.chat_manager.snapshot(),
+            "context_manager": self.context_manager.snapshot(),
+            "memory_manager": self.memory_manager.snapshot(),
+            
+            # Infrastructure-specific state
+            "FULL_CTX": self.FULL_CTX,
+            "FULL_CTX_TOKENS": self.FULL_CTX_TOKENS,
+            "chat_history": self.chat_history,
+            "CTX": self.CTX,
+            "HEADER": self.HEADER,
+            "HEADER_IDX": self.HEADER_IDX,
+            "CONSOLE_HEAD": self.CONSOLE_HEAD,
+            
+            # Configuration state
+            "max_ctx_tokens": self.max_ctx_tokens,
+            "chat_block_divider": self.chat_block_divider,
+            "session_dir": self.session_dir,
+            "log_dir": self.log_dir,
+            
+            # Role and member tracking
+            "ROLEs": self.ROLEs,
+            "WF_MEMBERS": self.WF_MEMBERS,
+            "WF_ASSISTANTS": self.WF_ASSISTANTS,
+            "workers_names": self.workers_names,
+            "NON_SYS_ROLES": self.NON_SYS_ROLES,
+            
+            # Metadata
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "infra_description_file": self.infra_description_file,
+        }
+        return snapshot_data
+
+    def restore(self, snapshot_data: Dict[str, Any]) -> None:
+        """Restore the infrastructure state from a snapshot.
+        
+        Args:
+            snapshot_data: Dictionary containing state information from a previous snapshot.
+        """
+        # Restore manager states
+        if "chat_manager" in snapshot_data:
+            self.chat_manager.restore(snapshot_data["chat_manager"])
+        if "context_manager" in snapshot_data:
+            self.context_manager.restore(snapshot_data["context_manager"])
+        if "memory_manager" in snapshot_data:
+            self.memory_manager.restore(snapshot_data["memory_manager"])
+        
+        # Restore infrastructure-specific state
+        self.FULL_CTX = snapshot_data.get("FULL_CTX", [])
+        self.FULL_CTX_TOKENS = snapshot_data.get("FULL_CTX_TOKENS", 0)
+        self.chat_history = snapshot_data.get("chat_history", [])
+        self.CTX = snapshot_data.get("CTX", "")
+        self.HEADER = snapshot_data.get("HEADER", "")
+        self.HEADER_IDX = snapshot_data.get("HEADER_IDX", 0)
+        self.CONSOLE_HEAD = snapshot_data.get("CONSOLE_HEAD", 0)
+        
+        # Restore configuration (if present)
+        if "max_ctx_tokens" in snapshot_data:
+            self.max_ctx_tokens = snapshot_data["max_ctx_tokens"]
+        if "chat_block_divider" in snapshot_data:
+            self.chat_block_divider = snapshot_data["chat_block_divider"]
+        if "session_dir" in snapshot_data:
+            self.session_dir = snapshot_data["session_dir"]
+        if "log_dir" in snapshot_data:
+            self.log_dir = snapshot_data["log_dir"]
+        
+        # Restore role and member tracking
+        if "ROLEs" in snapshot_data:
+            self.ROLEs = snapshot_data["ROLEs"]
+        if "WF_MEMBERS" in snapshot_data:
+            self.WF_MEMBERS = snapshot_data["WF_MEMBERS"]
+        if "WF_ASSISTANTS" in snapshot_data:
+            self.WF_ASSISTANTS = snapshot_data["WF_ASSISTANTS"]
+        if "workers_names" in snapshot_data:
+            self.workers_names = snapshot_data["workers_names"]
+        if "NON_SYS_ROLES" in snapshot_data:
+            self.NON_SYS_ROLES = snapshot_data["NON_SYS_ROLES"]
+        
+        # Restore metadata
+        if "infra_description_file" in snapshot_data:
+            self.infra_description_file = snapshot_data["infra_description_file"]
+            self.update_infra_description()
+        
+        console.print("[INFRASTRUCTURE] State restored from snapshot")
+
+    def save_snapshot(self, file_path: str) -> None:
+        """Save a snapshot to disk.
+        
+        Args:
+            file_path: Path where the snapshot should be saved.
+        """
+        snapshot_data = self.snapshot()
+        
+        # Use pickle for backward compatibility with other components
+        with open(file_path, 'wb') as f:
+            pickle.dump(snapshot_data, f)
+        
+        console.print(f"[INFRASTRUCTURE] Snapshot saved to {file_path}")
+        self.console_log(f"[INFO] Infrastructure snapshot saved to {file_path}")
+
+    def load_snapshot(self, file_path: str) -> bool:
+        """Load and restore from a snapshot file.
+        
+        Args:
+            file_path: Path to the snapshot file to load.
+            
+        Returns:
+            True if load successful, False otherwise
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                snapshot_data = pickle.load(f)
+            
+            if snapshot_data is not None:
+                self.restore(snapshot_data)
+                console.print(f"[INFRASTRUCTURE] Snapshot loaded from {file_path}")
+                self.console_log(f"[INFO] Infrastructure snapshot loaded from {file_path}")
+                return True
+            else:
+                console.print(f"[INFRASTRUCTURE] Failed to load snapshot from {file_path}")
+                self.console_log(f"[ERROR] Failed to load infrastructure snapshot from {file_path}")
+                return False
+        except FileNotFoundError:
+            console.print(f"[INFRASTRUCTURE] Snapshot file not found: {file_path}")
+            self.console_log(f"[ERROR] Infrastructure snapshot file not found: {file_path}")
+            return False
+        except Exception as e:
+            console.print(f"[INFRASTRUCTURE] Error loading snapshot: {e}")
+            self.console_log(f"[ERROR] Error loading infrastructure snapshot: {e}")
+            return False

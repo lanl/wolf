@@ -3,8 +3,10 @@ import copy
 import json
 import gc
 import asyncio
+import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from framework.utils.io_tools import console
 
@@ -327,3 +329,88 @@ class MemoryManager:
         if parts:
             return prompt + "\n\n[MEMORY CONTEXT]\n" + "\n".join(parts)
         return prompt
+
+    # ------ Snapshot and Restore methods ------
+    def snapshot(self) -> Dict[str, Any]:
+        """Create a snapshot of the current memory manager state.
+        
+        Returns:
+            Dict containing all state information needed to restore the instance.
+        """
+        snapshot_data = {
+            "memory_fragment_types": self.memory_fragment_types,
+            "memory_fragments": self.memory_fragments,
+            "summaries": self.summaries,
+            "_last_indexed_entry_idx": self._last_indexed_entry_idx,
+            "max_summary_tokens": self.max_summary_tokens,
+            "max_ctx_tokens": self.max_ctx_tokens,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return snapshot_data
+
+    def restore(self, snapshot_data: Dict[str, Any]) -> None:
+        """Restore the memory manager state from a snapshot.
+        
+        Args:
+            snapshot_data: Dictionary containing state information from a previous snapshot.
+        """
+        # Restore memory fragments and types
+        self.memory_fragment_types = snapshot_data.get("memory_fragment_types", self.memory_fragment_types)
+        self.memory_fragments = snapshot_data.get("memory_fragments", self.memory_fragments)
+        self.summaries = snapshot_data.get("summaries", [])
+        self._last_indexed_entry_idx = snapshot_data.get("_last_indexed_entry_idx", 0)
+        
+        # Restore configuration (if present)
+        if "max_summary_tokens" in snapshot_data:
+            self.max_summary_tokens = snapshot_data["max_summary_tokens"]
+        if "max_ctx_tokens" in snapshot_data:
+            self.max_ctx_tokens = snapshot_data["max_ctx_tokens"]
+        
+        # Update convenience shortcuts
+        self.facts = self.memory_fragments.get("facts", {})
+        self.user_prefs = self.memory_fragments.get("user_prefs", {})
+        self.task_state = self.memory_fragments.get("task_state", {})
+        
+        # Save restored state to disk for persistence
+        self._save()
+
+    def save_snapshot(self, file_path: str) -> None:
+        """Save a snapshot to disk.
+        
+        Args:
+            file_path: Path where the snapshot should be saved.
+        """
+        snapshot_data = self.snapshot()
+        
+        # Use pickle for backward compatibility with other components
+        with open(file_path, 'wb') as f:
+            pickle.dump(snapshot_data, f)
+        
+        console.print(f"[MEMORY] Snapshot saved to {file_path}")
+
+    def load_snapshot(self, file_path: str) -> bool:
+        """Load and restore from a snapshot file.
+        
+        Args:
+            file_path: Path to the snapshot file to load.
+            
+        Returns:
+            True if load successful, False otherwise
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                snapshot_data = pickle.load(f)
+            
+            if snapshot_data is not None:
+                self.restore(snapshot_data)
+                console.print(f"[MEMORY] Snapshot loaded from {file_path}")
+                return True
+            else:
+                console.print(f"[MEMORY] Failed to load snapshot from {file_path}")
+                return False
+        except FileNotFoundError:
+            console.print(f"[MEMORY] Snapshot file not found: {file_path}")
+            return False
+        except Exception as e:
+            console.print(f"[MEMORY] Error loading snapshot: {e}")
+            return False
