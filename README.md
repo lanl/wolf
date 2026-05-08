@@ -70,7 +70,7 @@ into the appropriate variable.
 inside your RC-file
 ### 2.3.1 On linux (i.e rocinante)
 ```sh
-vi ~/.bashrcs
+vi ~/.bashrc
 ```
 add the following lines (at the bottom or whereever works better for you):
 export CURL_CA_BUNDLE="/etc/ssl/ca-bundle.pem"
@@ -80,13 +80,13 @@ export SSL_CERT_FILE="/etc/ssl/ca-bundle.pem"
 vi ~/.zshrc
 ```
 #### For Standard macOS System Certificates add the following lines:
-export CURL_CA_BUNDLE="/etc/ssl/cert.pem"
+export CURL_CA_BUNDLE="/etc/ssl/cert.pem" \
 export SSL_CERT_FILE="/etc/ssl/cert.pem"
 #### For OpenSSL installed via Homebrew add the following lines:
-export CURL_CA_BUNDLE="/usr/local/etc/openssl@3/cert.pem"
+export CURL_CA_BUNDLE="/usr/local/etc/openssl@3/cert.pem" \
 export SSL_CERT_FILE="/usr/local/etc/openssl@3/cert.pem"
 #### Or for older OpenSSL versions installed via Homebrew add the following lines:
-export CURL_CA_BUNDLE="/usr/local/etc/openssl/cert.pem"
+export CURL_CA_BUNDLE="/usr/local/etc/openssl/cert.pem" \
 export SSL_CERT_FILE="/usr/local/etc/openssl/cert.pem"
 
 # 3. Run WOLF interactively
