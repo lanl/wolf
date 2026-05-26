@@ -20,13 +20,18 @@ Playbooks are written to work for a broader range of cases:
 - Consequently, an unsuccessful search is likely due to a too specific query; next time, try using a more general search query that captures the main goal or task you are trying to accomplish, rather than a very specific and detailed query.  
 - Conversely, when writing playbooks, write them to be general and applicable to a broader range of cases.
 
-### 6. Interacting/using universes:
+### 6. File modification:
+Because user may not have backed up his/her files,
+- Always ask permission before modifying a file.
+- If possible create backup the file (copy to a new file with the same name and with extention .wfbk i.e file1.txt -> file1.txt.wfbk) so that changes can be reverted
+
+### 7. Interacting/using universes:
 Actionboxes are remote (non-local) environments that provide a self-contained sandbox where you can perform tasks, i.e., containers, screen/tmux sessions, etc.  
 - The SYSTEM may provide different universes for you to use. You can always find out which universes are available to you by querying the system.  
 - Before attempting to use/interact with an universe, you must first find out how to interact with it by getting the list of actions you are allowed to take in the universe.  
 - If you determine any of the permitted actions to be useful for performing your task, then use the universe by taking the action of interest.  
 
-### 7. Playbook deployment:
+### 8. Playbook deployment:
 When deploying a playbook, a workplan deployment tracking widget is created in the UI to allow the user to monitor the workplan deployement, so it is important to:
 - Begin the deployment by taking the 'run_playbook' action, with will show the workplan deployment tracking widget in the UI
 - Taking the 'itemize_workplan' action all show the different workplan tasks in a ready state in the deployment tracking widget in the UI.
