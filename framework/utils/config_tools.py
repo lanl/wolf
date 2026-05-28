@@ -34,7 +34,7 @@ from framework.infrastructure.base_chat_manager import BaseChatManager
 from framework.infrastructure.base_memory_manager import MemoryManager
 from framework.infrastructure.base_context_manager import ContextManager
 from framework.infrastructure.base_infrastructure import BaseInfrastructure 
-from framework.workflows.agentic_workflows import BaseWorkflow
+from framework.workflows.base_workflow import BaseWorkflow
 
 
 def create_session_dir():

@@ -1,7 +1,7 @@
 user_name = "user"
 params = {'banner_image_width': 100,
           'banner_image_color': 'purple', #'red', 'america', raimbow
-          'universes': [{"host":"0.0.0.0", "port":8115, "scheme":"http"}],
+          #'universes': [{"host":"0.0.0.0", "port":8115, "scheme":"http"}],
           'verbose': 0
           }
 
