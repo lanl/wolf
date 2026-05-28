@@ -77,6 +77,10 @@ class BaseInfrastructure:
             self.workers[ag.name] = ag
             self.ROLEs[ag.name] = "assistant"
         self.KBs, self.TBs, self.UNIVs = {},{},{}
+        # Initialize managed_deployments to track universe, KB, TB deployments
+        self.managed_deployments = {}
+
+        # Initialize Objects
         for obj in self.objects:
             obj_type = None
             if isinstance(obj, BaseUniverse):

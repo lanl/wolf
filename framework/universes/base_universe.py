@@ -591,7 +591,11 @@ def run_app(
     host: str = "127.0.0.1",
     port: int = 0,
     cors: Optional[List[str]] = None,
+    status_file: Optional[str] = None,
 ) -> None:
+    import json
+    from pathlib import Path
+    
     host = host.strip()
 
     if params is None:
@@ -622,8 +626,22 @@ def run_app(
     actual_port = sock.getsockname()[1]
 
     _params.info.port = actual_port
+    base_url = _params.info.get_base_url()
 
-    print(f"Universe available at {_params.info.get_base_url()}")
+    # Write status file with complete information after socket binding
+    if status_file:
+        try:
+            status_data = {
+                "status": "ready",
+                "host": host,
+                "port": actual_port,
+                "url": base_url
+            }
+            Path(status_file).write_text(json.dumps(status_data), encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to write status file: {e}")
+
+    print(f"Universe available at {base_url}")
 
     config = uvicorn.Config(app=app, host=host, port=actual_port)
     server = uvicorn.Server(config)

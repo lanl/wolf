@@ -50,6 +50,6 @@ if __name__ == "__main__":
             raise Exception("[!] {k} is not a recognised session input")
     session_inputs['LLMs'] = LLMs # Not well implemented. Need to do better
     session = setup_cli_session(session_inputs, resume_session=None)
-    #session = setup_cli_session(session_inputs, resume_session="20260507_235058")
+    #session = setup_cli_session(session_inputs, resume_session="20260528_124756")
     #session = setup_cli_session(session_inputs, resume_session="last")
     session['wf'].run(user_name=user_name)

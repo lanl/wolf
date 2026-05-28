@@ -16,6 +16,7 @@ from framework.universes.data_models import BaseUniverseModel, BaseUniverseParam
 from framework.knowledgebase.knowledge_base import KnowledgeBase
 from framework.tooling.toolbox import ToolBox
 from framework.universes.base_universe import run_app
+from framework.universes.remote_deployment import RemoteDeploymentManager, RemoteUniverseHandle
 
 #
 # BaseUniver
@@ -39,25 +40,33 @@ class CreateUniverseAction(AgentAction):
     via ``uvicorn`` in a background subprocess. The subprocess handle together with the
     creation parameters and metadata are saved in ``infra.managed_deployments`` for later
     inspection or termination.
+    
+    Supports both local and remote deployment via SSH.
     """
     action: Literal["create_universe"] = "create_universe"
     description: Literal["Create, configure and launch a new universe"] = "Create, configure and launch a new universe"
     payload: CreateUniverseArgs
     payload_schema: str = """{
-        "system": "name of system the universe is connected to, e.g. 'local'",
-        "name": "name of the universe",
-        "info": {
-            "host": "127.0.0.1",
-            "port": 0,
-            "description": "...",
-            "api_version": null,
-            "api_token": null
+    "system": "name of system the universe is connected to, e.g. 'local'",
+    "name": "name of the universe",
+    "info": {
+        "host": "127.0.0.1",
+        "port": 0,
+        "description": "...",
+        "api_version": null,
+        "api_token": null,
+        "ssh_config": {
+            "user": "username",
+            "key_path": "/path/to/ssh/key",
+            "remote_python_path": "python3",
+            "remote_work_dir": "/tmp"
         }
-    }"""
+    }
+}"""
 
     def execute(self, infra) -> None:
         deployments: Dict[str, Dict[str, Any]] = getattr(infra, "managed_deployments", {})
-            
+        
         if self.payload.name in deployments:
             infra.append_chat_history(
                 actor="system",
@@ -71,7 +80,7 @@ class CreateUniverseAction(AgentAction):
         info_data.setdefault("name", self.payload.name)
         info_data.setdefault("host", "127.0.0.1")
         info_data.setdefault("port", 0)
-            
+        
         try:
             info_instance = BaseUniverseModel(**info_data)
             params = BaseUniverseParams(info=info_instance, kbs=None, tbs=None)
@@ -81,11 +90,31 @@ class CreateUniverseAction(AgentAction):
                 content=f"Failed to validate universe parameters for '{self.payload.name}': {e}",
                 action={"action": "create_universe"},
                 log_console=True,
-            )       
+            ) 
             return
-                
+        
+        # Validate remote configuration if needed
+        try:
+            info_instance.validate_remote_config()
+        except ValueError as e:
+            infra.append_chat_history(
+                actor="system",
+                content=f"Invalid remote configuration for '{self.payload.name}': {e}",
+                action={"action": "create_universe"},
+                log_console=True,
+            )
+            return
+        
         infra.UNIVs[self.payload.name] = params
 
+        # Check if remote deployment
+        if info_instance.is_remote():
+            self._execute_remote_deployment(infra, params, deployments)
+        else:
+            self._execute_local_deployment(infra, params, deployments)
+
+    def _execute_local_deployment(self, infra, params: BaseUniverseParams, deployments: Dict[str, Dict[str, Any]]) -> None:
+        """Execute local universe deployment."""
         runtime_dir = Path(tempfile.gettempdir()) / "wolf_universes"
         runtime_dir.mkdir(parents=True, exist_ok=True)
 
@@ -135,19 +164,102 @@ class CreateUniverseAction(AgentAction):
             )
             return
 
+        # Wait for process to start and poll status file for ready state
         time.sleep(1.0)
         return_code = proc.poll()
+
+        if return_code is not None:
+            # Process failed immediately
+            stdout_handle.close()
+            stderr_handle.close()
+            infra.append_chat_history(
+                actor="system",
+                content=(
+                    f"Universe '{self.payload.name}' failed to launch "
+                    f"(PID {proc.pid}, return code {return_code}). "
+                    f"See stderr log: {stderr_file}"
+                ),
+                action={"action": "create_universe"},
+                log_console=True,
+            )
+            return
+
+        # Poll status file for ready state with timeout
+        max_wait = 30.0  # 30 seconds timeout
+        poll_interval = 0.5
+        elapsed = 0.0
+        status_data = None
+
+        while elapsed < max_wait:
+            if proc.poll() is not None:
+                # Process died
+                break
+            
+            if status_file.exists():
+                try:
+                    with status_file.open("r", encoding="utf-8") as f:
+                        status_data = json.load(f)
+                    
+                    if status_data.get("status") == "ready":
+                        # Universe is ready
+                        break
+                except (json.JSONDecodeError, IOError):
+                    # File not ready yet, continue polling
+                    pass
+            
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        # Check final state
+        return_code = proc.poll()
+        
+        if return_code is not None:
+            # Process failed during startup
+            stdout_handle.close()
+            stderr_handle.close()
+            infra.append_chat_history(
+                actor="system",
+                content=(
+                    f"Universe '{self.payload.name}' failed during startup "
+                    f"(PID {proc.pid}, return code {return_code}). "
+                    f"See stderr log: {stderr_file}"
+                ),
+                action={"action": "create_universe"},
+                log_console=True,
+            )
+            return
+
+        # Extract port and URL from status file
+        actual_host = None
+        actual_port = None
+        actual_url = None
+        
+        if status_data and status_data.get("status") == "ready":
+            actual_host = status_data.get("host")
+            actual_port = status_data.get("port")
+            actual_url = status_data.get("url")
+
+        # **FIX: Update infra.UNIVs with actual port information**
+        if actual_port is not None:
+            infra.UNIVs[self.payload.name].info.port = actual_port
+        if actual_host is not None:
+            infra.UNIVs[self.payload.name].info.host = actual_host
 
         meta_data = {
             "type": "universe",
             "system": self.payload.system,
-            "status": "running" if return_code is None else "failed",
+            "status": "running",
             "created_at": datetime.utcnow().isoformat(),
             "subprocess_pid": proc.pid,
+            "deployment_type": "local",
         }
 
-        if return_code is not None:
-            meta_data["return_code"] = return_code
+        if actual_host:
+            meta_data["host"] = actual_host
+        if actual_port is not None:
+            meta_data["port"] = actual_port
+        if actual_url:
+            meta_data["url"] = actual_url
 
         deployments[self.payload.name] = {
             "handle": proc,
@@ -159,28 +271,89 @@ class CreateUniverseAction(AgentAction):
             "meta_data": meta_data,
         }
 
-        if return_code is None:
-            infra.append_chat_history(
-                actor="system",
-                content=(
-                    f"Universe '{self.payload.name}' launched "
-                    f"(PID {proc.pid}) and registered."
-                ),
-                action={"action": "create_universe"},
-                log_console=True,
+        # Build informative message
+        if actual_port is not None:
+            msg = (
+                f"Universe '{self.payload.name}' launched and registered successfully.\n"
+                f"PID: {proc.pid}\n"
+                f"Host: {actual_host or 'unknown'}\n"
+                f"Port: {actual_port}\n"
+                f"URL: {actual_url or 'unknown'}"
             )
         else:
+            msg = (
+                f"Universe '{self.payload.name}' launched (PID {proc.pid}) but port information not yet available. "
+                f"Status file: {status_file}"
+            )
+
+        infra.append_chat_history(
+            actor="system",
+            content=msg,
+            action={"action": "create_universe"},
+            log_console=True,
+        )
+
+    def _execute_remote_deployment(self, infra, params: BaseUniverseParams, deployments: Dict[str, Dict[str, Any]]) -> None:
+        """Execute remote universe deployment via SSH."""
+        try:
+            ssh_config = params.info.ssh_config
+            cors = "*"
+            
+            # Deploy remote universe
+            handle = RemoteDeploymentManager.deploy_universe_remote(
+                params=params,
+                ssh_config=ssh_config,
+                cors=cors
+            )
+            
+            # **FIX: Update infra.UNIVs with actual port information for remote deployment**
+            if handle.actual_port is not None:
+                infra.UNIVs[self.payload.name].info.port = handle.actual_port
+            
+            serializable = params.model_dump(mode="json") if hasattr(params, "model_dump") else params.dict()
+            
+            meta_data = {
+                "type": "universe",
+                "system": self.payload.system,
+                "status": "running",
+                "created_at": datetime.utcnow().isoformat(),
+                "subprocess_pid": handle.remote_pid,
+                "deployment_type": "remote",
+                "remote_host": handle.remote_host,
+                "remote_user": handle.remote_user,
+                "remote_work_dir": handle.remote_work_dir,
+                "actual_port": handle.actual_port,
+            }
+            
+            deployments[self.payload.name] = {
+                "handle": handle,
+                "params": serializable,
+                "params_file": handle.remote_params_file,
+                "status_file": handle.remote_status_file,
+                "stdout_file": handle.local_stdout_file,
+                "stderr_file": handle.local_stderr_file,
+                "meta_data": meta_data,
+            }
+            
             infra.append_chat_history(
                 actor="system",
                 content=(
-                    f"Universe '{self.payload.name}' failed to launch "
-                    f"(PID {proc.pid}, return code {return_code}). "
-                    f"See stderr log: {stderr_file}"
+                    f"Universe '{self.payload.name}' remotely deployed to "
+                    f"{handle.remote_user}@{handle.remote_host} "
+                    f"(Remote PID {handle.remote_pid}, Port {handle.actual_port}) "
+                    f"and registered."
                 ),
                 action={"action": "create_universe"},
                 log_console=True,
             )
-
+            
+        except Exception as e:
+            infra.append_chat_history(
+                actor="system",
+                content=f"Failed to deploy remote universe '{self.payload.name}': {e}",
+                action={"action": "create_universe"},
+                log_console=True,
+            )
 
 
 # ---------------------------
@@ -198,7 +371,7 @@ class ListDeploymentsAction(AgentAction):
     action: Literal["list_deployments"] = "list_deployments"
     description: Literal["List all managed deployments (universes, TBs, KBs, etc.)"] = "List all managed deployments (universes, TBs, KBs, etc.)"
     payload: ListDeploymentsArgs
-    payload_schema: str = """{"system": "string"}"""
+    payload_schema: str = """ {"system": "string"}""" 
 
     def execute(self, infra) -> None:
         deployments: Dict[str, Dict[str, Any]] = getattr(infra, "managed_deployments", {})
@@ -213,9 +386,12 @@ class ListDeploymentsAction(AgentAction):
                 typ = meta.get("type", "unknown")
                 status = meta.get("status", "unknown")
                 pid = meta.get("subprocess_pid")
-                extra = []
+                deployment_type = meta.get("deployment_type", "unknown")
+                extra = [f"deployment_type={deployment_type}"]
 
                 handle = info.get("handle")
+                
+                # Handle local subprocess
                 if isinstance(handle, subprocess.Popen):
                     rc = handle.poll()
                     if rc is None:
@@ -223,9 +399,23 @@ class ListDeploymentsAction(AgentAction):
                     else:
                         status = f"exited({rc})"
                     meta["status"] = status
+                
+                # Handle remote universe
+                elif isinstance(handle, RemoteUniverseHandle):
+                    rc = handle.poll()
+                    if rc is None:
+                        status = "running"
+                    else:
+                        status = f"exited({rc})"
+                    meta["status"] = status
+                
+                    extra.append(f"remote_host={handle.remote_host}")
+                    extra.append(f"remote_user={handle.remote_user}")
+                    if handle.actual_port:
+                        extra.append(f"port={handle.actual_port}")
 
                 status_file = info.get("status_file")
-                if status_file:
+                if status_file and deployment_type == "local":
                     try:
                         with open(status_file, "r", encoding="utf-8") as f:
                             runtime_status = json.load(f)
@@ -266,25 +456,27 @@ class ListDeploymentsAction(AgentAction):
 class TerminateDeploymentArgs(BaseModel):
     system: str = Field(description="System identifier, e.g., 'local'")
     name: str = Field(description="Name of the deployment to terminate")
-    force: bool = Field(default=False, description="If True, kill the process immediately")
-    remove_files: bool = Field(default=True, description="If True, delete params/status/log files")
+    force: bool = Field(default=False, description="If true, kill the process immediately")
+    remove_files: bool = Field(default=True, description="If true, delete params/status/log files")
 
 class TerminateDeploymentAction(AgentAction):
     """Terminate a managed deployment.
 
     For subprocess handles the action sends ``terminate`` (or ``kill`` when ``force``
-    is True) and removes the entry from ``infra.managed_deployments``. For other
+    is true) and removes the entry from ``infra.managed_deployments``. For other
     object types the entry is simply removed.
-    """         
+    
+    Supports both local and remote universe termination.
+    """ 
     action: Literal["terminate_deployment"] = "terminate_deployment"
     description: Literal["Terminate a managed deployment (universe, TB, KB, etc.)"] = "Terminate a managed deployment (universe, TB, KB, etc.)"
     payload: TerminateDeploymentArgs
     payload_schema: str = """{
-        "system": "string",
-        "name": "string",
-        "force": "boolean (optional)",
-        "remove_files": "boolean (optional)"
-    }"""
+    "system": "string",
+    "name": "string",
+    "force": "boolean (optional)",
+    "remove_files": "boolean (optional)"
+}"""
 
     def execute(self, infra) -> None:
         name = self.payload.name.strip()
@@ -302,8 +494,10 @@ class TerminateDeploymentAction(AgentAction):
 
         handle = entry.get("handle")
         meta = entry.get("meta_data", {})
+        deployment_type = meta.get("deployment_type", "unknown")
         messages = []
 
+        # Handle local subprocess
         if isinstance(handle, subprocess.Popen):
             try:
                 if handle.poll() is None:
@@ -333,11 +527,25 @@ class TerminateDeploymentAction(AgentAction):
                         messages.append(f"Failed to kill subprocess for '{name}': {e}")
             except Exception as e:
                 messages.append(f"Error terminating subprocess for '{name}': {e}")
+        
+        # Handle remote universe
+        elif isinstance(handle, RemoteUniverseHandle):
+            try:
+                RemoteDeploymentManager.terminate_remote_universe(
+                    handle, force=self.payload.force, timeout=10.0
+                )
+                meta["status"] = "terminated"
+                messages.append(
+                    f"Remote universe '{name}' at {handle.remote_user}@{handle.remote_host} "
+                    f"terminated (force={self.payload.force})."
+                )
+            except Exception as e:
+                messages.append(f"Error terminating remote universe '{name}': {e}")
 
         if self.payload.remove_files:
             for key in ("params_file", "status_file", "stdout_file", "stderr_file"):
                 path = entry.get(key)
-                if path:
+                if path and deployment_type == "local":
                     try:
                         Path(path).unlink(missing_ok=True)
                     except Exception as e:
