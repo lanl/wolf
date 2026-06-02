@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 import asyncio
 import json
 import time
+import logging
 
 from .action_adapter import DynamicActionAdapter
 from .actions import CompleteTaskAction, CreateSubtasksAction, FailTaskAction, OrchestrationAction, PauseTaskAction, PublishProgressAction, RequestUserInputAction, TaskThreadMessageAction, WaitForTasksAction
@@ -21,6 +22,17 @@ from .models import EngineConfig, SummaryCapsule, TaskNode, TaskResult, TaskSpec
 from .policies import BudgetGuard, ChatWorkflowPolicy, GenericWorkflowPolicy, WorkflowPolicy
 from .repository import TaskRepository
 from .task_infra import TaskInfrastructure, TaskInfrastructureFactory
+from .streaming import StreamingInterface
+
+try:
+    from .websocket_server import WebSocketServer
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    WebSocketServer = None
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,7 +46,30 @@ class RuntimeState:
 
 
 class AsyncWorkflowRuntime:
-    def __init__(self, agent_pool: AgentPool, infra_factory: TaskInfrastructureFactory, workflow_policies: Optional[Dict[str, WorkflowPolicy]] = None, config: Optional[EngineConfig] = None, action_adapter: Optional[DynamicActionAdapter] = None, artifact_store: Optional[ArtifactStore] = None) -> None:
+    def __init__(self, 
+                 agent_pool: AgentPool, 
+                 infra_factory: TaskInfrastructureFactory, 
+                 workflow_policies: Optional[Dict[str, WorkflowPolicy]] = None, 
+                 config: Optional[EngineConfig] = None, 
+                 action_adapter: Optional[DynamicActionAdapter] = None, 
+                 artifact_store: Optional[ArtifactStore] = None,
+                 enable_streaming: bool = True,
+                 enable_websocket: bool = False,
+                 websocket_host: str = '0.0.0.0',
+                 websocket_port: int = 8765) -> None:
+        """
+        Args:
+            agent_pool: Pool of agents for task execution
+            infra_factory: Factory for creating task infrastructures
+            workflow_policies: Workflow policies by type
+            config: Engine configuration
+            action_adapter: Dynamic action adapter
+            artifact_store: Artifact storage
+            enable_streaming: Enable streaming interface (default: True)
+            enable_websocket: Enable WebSocket server (default: False)
+            websocket_host: WebSocket server host (default: '0.0.0.0')
+            websocket_port: WebSocket server port (default: 8765)
+        """
         self.repository = TaskRepository()
         self.graph = TaskGraph()
         self.config = config or EngineConfig()
@@ -50,6 +85,66 @@ class AsyncWorkflowRuntime:
         self.task_infras: Dict[str, TaskInfrastructure] = {}
         self.legacy_executor = LegacyActionExecutor(run_in_thread=self.config.run_sync_actions_in_thread)
         self.artifacts = artifact_store or ArtifactStore(inline_limit=self.config.artifact_inline_limit)
+        
+        # Streaming interface
+        self.streaming: Optional[StreamingInterface] = None
+        if enable_streaming:
+            self.streaming = StreamingInterface(self.event_bus)
+            logger.info("StreamingInterface initialized")
+        
+        # WebSocket server
+        self.websocket_server: Optional[WebSocketServer] = None
+        if enable_websocket:
+            if not WEBSOCKET_AVAILABLE:
+                logger.warning("WebSocket server requested but websockets package not installed")
+            elif not self.streaming:
+                logger.warning("WebSocket server requires streaming to be enabled")
+            else:
+                self.websocket_server = WebSocketServer(
+                    streaming=self.streaming,
+                    runtime=self,
+                    host=websocket_host,
+                    port=websocket_port
+                )
+                logger.info(f"WebSocketServer initialized on {websocket_host}:{websocket_port}")
+        
+        self._started = False
+
+    async def start(self) -> None:
+        """Start the runtime and all background services."""
+        if self._started:
+            return
+        
+        # Start streaming interface
+        if self.streaming:
+            await self.streaming.start()
+            logger.info("StreamingInterface started")
+        
+        # Start WebSocket server
+        if self.websocket_server:
+            await self.websocket_server.start()
+            logger.info("WebSocketServer started")
+        
+        self._started = True
+        logger.info("AsyncWorkflowRuntime started")
+
+    async def stop(self) -> None:
+        """Stop the runtime and cleanup all services."""
+        if not self._started:
+            return
+        
+        # Stop WebSocket server
+        if self.websocket_server:
+            await self.websocket_server.stop()
+            logger.info("WebSocketServer stopped")
+        
+        # Stop streaming interface
+        if self.streaming:
+            await self.streaming.stop()
+            logger.info("StreamingInterface stopped")
+        
+        self._started = False
+        logger.info("AsyncWorkflowRuntime stopped")
 
     def policy_for(self, workflow_type: str) -> WorkflowPolicy:
         return self.workflow_policies.get(workflow_type, self.workflow_policies['generic'])
@@ -67,8 +162,35 @@ class AsyncWorkflowRuntime:
         if task is None:
             raise KeyError(task_id)
         capsule = await self.memory.get_context(task_id)
+        
+        # Serialize task node for JSON compatibility
+        task_dict = {
+            'id': task.id,
+            'status': task.status.value,
+            'spec': {
+                'name': task.spec.name,
+                'objective': task.spec.objective,
+                'workflow_type': task.spec.workflow_type,
+                'inputs': task.spec.inputs,
+                'parent_id': task.spec.parent_id,
+                'dependencies': task.spec.dependencies,
+                'priority': task.spec.priority,
+                'tags': task.spec.tags,
+            },
+            'retries': task.retries,
+            'error': task.error,
+            'owner_agent_name': task.owner_agent_name,
+            'leased_agent_name': task.leased_agent_name,
+            'created_at': task.created_at,
+            'updated_at': task.updated_at,
+            'started_at': task.started_at,
+            'finished_at': task.finished_at,
+            'depth': task.depth,
+            'lineage': task.lineage,
+        }
+        
         return {
-            'task': task,
+            'task': task_dict,
             'local_messages': list(capsule.local_messages),
             'local_facts': list(capsule.local_facts),
             'child_summaries': dict(capsule.child_summaries),
@@ -164,6 +286,10 @@ class AsyncWorkflowRuntime:
         await self.event_bus.publish(Event(type='task_ready', task_id=task.id, actor='runtime', payload={'reason': 'registered'}))
 
     async def run_until_complete(self, root_task_id: str) -> TaskNode:
+        # Ensure runtime is started
+        if not self._started:
+            await self.start()
+        
         while True:
             await self.step()
             root = await self.repository.get(root_task_id)
@@ -176,6 +302,10 @@ class AsyncWorkflowRuntime:
         await self.event_bus.drain()
 
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:
+        # Ensure runtime is started
+        if not self._started:
+            await self.start()
+        
         stop_event = stop_event or asyncio.Event()
         while not stop_event.is_set():
             await self.step()
@@ -461,8 +591,25 @@ class AsyncWorkflowRuntime:
 
     async def snapshot(self) -> Dict[str, Any]:
         tasks = list(await self.repository.list())
-        return {
-            'tasks': tasks,
+        snapshot = {
+            'tasks': [{
+                'id': t.id,
+                'status': t.status.value,
+                'spec': {'name': t.spec.name, 'objective': t.spec.objective},
+                'owner_agent': t.owner_agent_name,
+                'created_at': t.created_at,
+                'updated_at': t.updated_at,
+            } for t in tasks],
             'agent_pool': await self.agent_pool.stats(),
             'artifacts': {task.id: [{'artifact_id': r.artifact_id, 'task_id': r.task_id, 'path': r.path, 'kind': r.kind, 'created_at': r.created_at, 'metadata': r.metadata} for r in self.artifacts.list_task_artifacts(task.id)] for task in tasks},
         }
+        
+        # Add streaming stats if available
+        if self.streaming:
+            snapshot['streaming'] = self.streaming.get_subscription_stats()
+        
+        # Add WebSocket stats if available
+        if self.websocket_server:
+            snapshot['websocket'] = self.websocket_server.get_stats()
+        
+        return snapshot
