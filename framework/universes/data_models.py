@@ -119,7 +119,7 @@ class BaseUniverseParams(BaseModel):
     )
     info: BaseUniverseModel | None = Field(
         default=None,
-        description="Info about the universe, see BaseUniverseModel",
+        description=f"Info about the universe: {BaseUniverseModel.model_fields}",
     )
 
     def get_base_url(self):

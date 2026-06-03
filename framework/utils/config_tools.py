@@ -5,6 +5,9 @@ from pathlib import Path
 import tiktoken
 import json
 import glob
+from typing import Optional
+import chromadb
+from chromadb.config import Settings
 
 # UTILs
 from framework.utils.io_tools import console, load_env_vars, image_to_ascii
@@ -198,16 +201,18 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
     
     # Reconstruct universes
     UNIVs = build_list_universes(session_params)
-    
+
     # Setup vector stores
     memory_db_persist_sub_dir = session_params.get('memory_db_persist_sub_dir', 'memory')
     
     summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
-    summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
+    #summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
+    #summaries_vs_params.persist_directory =  f"{session_dir}/{memory_db_persist_sub_dir}"
     summaries_vs = VectorStore(summaries_vs_params)
     
     traces_vs_params = copy.deepcopy(TRACES_PARAMS)
-    traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
+    #traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
+    #traces_vs_params.persist_directory = f"{session_dir}/{memory_db_persist_sub_dir}"
     traces_vs = VectorStore(traces_vs_params)
     
     # Reconstruct managers
@@ -271,7 +276,7 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
     }
 
 
-def setup_cli_session(session_params, resume_session: str|None = None):
+def setup_cli_session(session_params, resume_session: Optional[str] = None, db_client: Optional[chromadb.Client] = None):
     """Setup CLI session - either new or resumed.
     
     Args:
@@ -291,7 +296,17 @@ def setup_cli_session(session_params, resume_session: str|None = None):
     # Check if resuming existing session
     if resume_session:
         return load_existing_session(resume_session, session_params)
-    
+
+    # SESSION
+    session_dir = session_params.get('session_dir', create_session_dir())
+    console.print(f"[INFO] Session directory: {session_dir}")
+
+    # Initialize ChromaDB client
+    vs_persist_dir = f"{session_dir}/VStore"
+    if db_client is None: 
+        db_client = chromadb.Client( Settings(persist_directory=vs_persist_dir, 
+                                                     anonymized_telemetry=False) 
+                                           )
     # Otherwise create new session
     LLMs = session_params['LLMs']
     verbose = session_params.get('verbose', 0)
@@ -309,10 +324,6 @@ def setup_cli_session(session_params, resume_session: str|None = None):
     # UNIVERSES
     UNIVs = build_list_universes(session_params)
     
-    # SESSION
-    session_dir = session_params.get('session_dir', create_session_dir())
-    console.print(f"[INFO] Session directory: {session_dir}")
-    
     ## Memory VS persist subdirectory
     memory_db_persist_sub_dir = session_params.get('memory_db_persist_sub_dir', 'memory')
     
@@ -320,17 +331,19 @@ def setup_cli_session(session_params, resume_session: str|None = None):
     summaries_vs_params = session_params.get('summaries_params', None)
     if summaries_vs_params is None:
         summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
-        summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
+        #summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
+        #summaries_vs_params.persist_directory = vs_persist_dir #f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
     if verbose > 0: console.print(f"[INFO][MEMORY] Summaries params: {summaries_vs_params}")
-    summaries_vs = VectorStore(summaries_vs_params)
+    summaries_vs = VectorStore(summaries_vs_params, client=db_client)
     
     ## Traces
     traces_vs_params = session_params.get('traces_params', None)
     if traces_vs_params is None:
         traces_vs_params = copy.deepcopy(TRACES_PARAMS)
-        traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
+        #traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
+        #traces_vs_params.persist_directory = vs_persist_dir #f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
     if verbose > 0: console.print(f"[INFO][MEMORY] Traces params: {traces_vs_params}")
-    traces_vs = VectorStore(traces_vs_params)
+    traces_vs = VectorStore(traces_vs_params, client=db_client)
     
     # MANAGERs
     chat_manager = session_params.get('chat_manager', BaseChatManager(session_dir=session_dir))
@@ -355,7 +368,9 @@ def setup_cli_session(session_params, resume_session: str|None = None):
                                                session_dir=session_dir,
                                                chat_manager=chat_manager,
                                                memory_manager=memory_manager,
-                                               context_manager=context_manager))
+                                               context_manager=context_manager,
+                                               db_client=db_client)
+                               )
     
     # WORKFLOW
     WF = session_params.get('wf', BaseWorkflow(infra=INFRA, actions_union=session_params.get('actions', Actions)))
@@ -365,5 +380,29 @@ def setup_cli_session(session_params, resume_session: str|None = None):
         'objects': {'universes': UNIVs, 'kbs': KBs, 'tbs': TBs},
         'managers': {'chat': chat_manager, 'memory': memory_manager, 'context': context_manager},
         'session_dir': session_dir,
+        'db_client': db_client,
         'wf': WF
     }
+
+
+class BaseSession:
+    """A Basic class to manage a wolf session.
+    """
+    def __init__(self, session_params, db_client: Optional[chromadb.Client] = None):
+        """Initialize the Session with configuration parameters."""
+        self.session_params = session_params
+        self.db_client = db_client
+    def create_session(self, resume_session: Optional[str] = None, db_client=None):
+        """Initialize the Session with configuration parameters."""
+        self.session = None
+
+class CliSession(BaseSession):
+    def __init__(self, session_params, db_client: Optional[chromadb.Client] = None):
+        super().__init__(session_params=session_params, db_client=db_client)
+    def create_session(self, resume_session: Optional[str] = None, db_client=None):
+        if db_client is None: db_client = self.db_client
+        self.session = setup_cli_session(session_params=self.session_params, 
+                                         resume_session=resume_session, 
+                                         db_client=db_client)
+
+

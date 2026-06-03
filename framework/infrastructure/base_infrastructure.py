@@ -14,7 +14,8 @@ from framework.utils.tokenomics import (
 
 from framework.data_store.data_models import BaseVectorStoreParams 
 from framework.knowledgebase.data_models import KnowledgeBaseParams
-from framework.knowledgebase.knowledge_base import  KBParams, KnowledgeBase
+#from framework.knowledgebase.knowledge_base import  KBParams, KnowledgeBase
+from framework.knowledgebase.knowledge_base import  KnowledgeBase
 from framework.tooling.toolbox import ToolBox
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
 from framework.universes.base_universe import BaseUniverse
@@ -37,11 +38,13 @@ class BaseInfrastructure:
         context_manager: Any = None,
         traces_vector_store: Any = None,
         summaries_vector_store: Any = None,
+        db_client: Any = None,
         infra_description_file = "framework/infrastructure/config/base_infra_description.md"
     ):
         # Support session_dir as primary, fall back to wf_log_dir for backwards compatibility
         self.session_dir = session_dir.strip().rstrip("/")
         self.log_dir = f"{self.session_dir}/{wf_log_dir.strip().rstrip('/')}"
+        self.db_client = db_client
         # Store basic parameters
         self.agent = agent
         self.max_ctx_tokens = max_ctx_tokens
@@ -93,10 +96,10 @@ class BaseInfrastructure:
             elif isinstance(obj, KnowledgeBase):
                 self.KBs[obj.name] = obj
                 obj_type = "knowledgebase"
-            elif isinstance(obj, KBParams):
-                self.KBs[obj.name] = KnowledgeBase(obj)
-                obj_type = "knowledgebase"
-            elif isinstance(obj, KnowledgeBase):
+            #elif isinstance(obj, KBParams):
+            #    self.KBs[obj.name] = KnowledgeBase(obj)
+            #    obj_type = "knowledgebase"
+            elif isinstance(obj, KnowledgeBaseParams):
                 self.KBs[obj.name] = KnowledgeBase(obj)
                 obj_type = "knowledgebase"
             elif isinstance(obj, ToolBox):
@@ -168,7 +171,7 @@ class BaseInfrastructure:
             )
 
         # Logging setup
-        self.log = self.chat_manager.log
+        #self.log = self.chat_manager.log
 
         # Internal state
         self.FULL_CTX: List[dict] = []
@@ -238,17 +241,18 @@ class BaseInfrastructure:
         self.HEADER_IDX = len(self.chat_history)
 
     def console_log(self, msg: str):
-        MSG = msg.lower()
-        if "[error]" in MSG:
-            self.log.error(MSG)
-        elif "[warn]" in MSG:
-            self.log.warning(MSG)
-        elif "[debug]" in MSG:
-            self.log.debug(MSG)
-        elif "[critk]" in MSG:
-            self.log.critical(MSG)
-        else:
-            self.log.info(MSG)
+        self.chat_manager.console_log(msg)
+        #MSG = msg.lower()
+        #if "[error]" in MSG:
+        #    self.log.error(MSG)
+        #elif "[warn]" in MSG:
+        #    self.log.warning(MSG)
+        #elif "[debug]" in MSG:
+        #    self.log.debug(MSG)
+        #elif "[critk]" in MSG:
+        #    self.log.critical(MSG)
+        #else:
+        #    self.log.info(MSG)
 
     def get_true_role_and_alias(self, actor: str, content: str) -> Tuple[str, str]:
         role = self.ROLEs.get(actor, "system")

@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 from rich.console import Console
 
 # Import the VectorStore wrapper
+import chromadb
+from chromadb.config import Settings
+from framework.data_store.data_models import EmbeddingParams, VectorStoreParams
 from framework.data_store.vstore import VectorStore
 from framework.knowledgebase.data_models import KnowledgeBaseParams
 
@@ -61,7 +64,7 @@ def _count_tokens(text: str) -> int:
     # Conservative token proxy (whitespace split); replace with tiktoken if available.
     return len(str(text).split())
 
-
+'''
 @dataclass
 class KBParams:
     """Configuration for KnowledgeBase."""
@@ -75,6 +78,7 @@ class KBParams:
     vrbz: int = 0
 
 #kbparams_type = NewType('kbparams_type', Type[KBParams])
+'''
 
 @dataclass
 class IngestResult:
@@ -83,7 +87,6 @@ class IngestResult:
     n_chunks: int
     n_tokens: int
     v_ids: List[str] = field(default_factory=list)
-
 
 class KnowledgeBase:
     """
@@ -102,17 +105,18 @@ class KnowledgeBase:
     - Document retrieval by ID
     """
 
-    def __init__(self, params: Dict[str, Any] | KBParams):
-        if isinstance(params, dict):
-            params = KBParams(**params)
-        elif isinstance(params, KnowledgeBaseParams):
-            params = params.model_dump()
-
+    def __init__(self, params: KnowledgeBaseParams, db_client: chromadb.Client):
+        self.params = params
         self.name = params.name
         self.VRBZ = int(params.vrbz)
-
         # Initialize VectorStore
-        self.vstore = VectorStore(params.vstore_params)
+        vs_params = VectorStoreParams(collection_name=f"kb_{params.name}_collection",
+                                      chunk_size = params.chunk_size,
+                                      chunk_overlap = params.chunk_overlap,
+                                      embedding= params.text_embedding,
+                                      rebuild_vstore = params.rebuild_text_vstore,
+                                      vs_VRBZ = params.vrbz)
+        self.vstore = VectorStore(vs_params, client=db_client)
 
         # Inventory location
         inv_path = params.inventory_path or os.path.join(

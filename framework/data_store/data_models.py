@@ -27,13 +27,14 @@ class VectorStoreParams(BaseModel):
     This model is used for data validation and schema generation
     related to vector stores
     """
-    db_name: str = Field(..., description='Name of the db file inside whitch the vectore is stored')
-    persist_directory: str = Field(..., description='Path/where/to/store/the/db/file')
-    n_gpu_layers: int = Field(-1, description='Number of layers to put on GPU, -1 for all layers')
-    n_batch: int = Field(21, description='Batch size to GPU')
+    #db_name: str = Field(..., description='Name of the db file inside whitch the vectore is stored')
+    #persist_directory: str = Field(..., description='Path/where/to/store/the/db/file')
+    collection_name: str = Field(..., description="Name of initial data collection")
     chunk_size: int = Field(256, description='Number of tokens per chunk')
     chunk_overlap: int = Field(16, description='Number of tokens over which consecutive chinks overlap')
-    embedding: embedding_params_type = Field(ALL_MINILM_L6_V2_Embedding_Params,description='Parameters of the embedding to use')
+    embedding: EmbeddingParams = Field(default=ALL_MINILM_L6_V2_Embedding_Params,
+                                             description=f""" Parameters of the embedding to use:
+                                             {EmbeddingParams.model_fields}""")
     rebuild_vstore: bool = Field(False, description='Flag for rebuilding the vector store by purging the db file and reuploading the files')
     vs_VRBZ: int = Field(0, description='Level of verbosity when operating on the vector store')
     class Config:
@@ -43,9 +44,7 @@ class VectorStoreParams(BaseModel):
             "description": "Main models are the models we use the most"
         }
 vs_params_type = NewType('vs_params_type', Type[VectorStoreParams])
-DEFAULT_VS_PARAMS = VectorStoreParams(db_name='default_vs', persist_directory='./')
-
-
+DEFAULT_VS_PARAMS = VectorStoreParams(db_name='default_vs', persist_directory='./', collection_name="main_collection")
 
 # --------------
 # Vector Store parameters data models

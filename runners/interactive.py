@@ -10,7 +10,7 @@ import os, copy, time, gc
 import tiktoken
 
 from config.session.default.params.inputs import session_params
-from framework.utils.config_tools import setup_cli_session
+from framework.utils.config_tools import CliSession #setup_cli_session
 from framework.agentic.default.params.llm_params import LANL_AIPORTAL_LLMs as LLMs
 
 """ Seesion inputus can be found in  config/session/default/params/inputs.py: make sure params:
@@ -37,7 +37,6 @@ session_params = {"tiktoken_cache_dir": (Path.cwd() / ".tiktoken_cache").resolve
                   }
 
 """
-
 if __name__ == "__main__":
 
     # Run workflow
@@ -49,7 +48,9 @@ if __name__ == "__main__":
         else:
             raise Exception("[!] {k} is not a recognised session input")
     session_inputs['LLMs'] = LLMs # Not well implemented. Need to do better
-    session = setup_cli_session(session_inputs, resume_session=None)
+    #session = setup_cli_session(session_inputs, resume_session=None)
     #session = setup_cli_session(session_inputs, resume_session="20260528_124756")
     #session = setup_cli_session(session_inputs, resume_session="last")
-    session['wf'].run(user_name=user_name)
+    cli_session = CliSession(session_params=session_inputs, db_client=None)
+    cli_session.create_session(resume_session=None)
+    cli_session.session['wf'].run(user_name=user_name)

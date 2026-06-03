@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from alive_progress import alive_bar
 import chromadb
 from chromadb.config import Settings
-
+from framework.data_store.data_models import EmbeddingParams, VectorStoreParams
 
 class VectorStore:
     """An enhanced asynchronous vector store using ChromaDB for document management.
@@ -20,14 +20,17 @@ class VectorStore:
     - Multiple embedding model support
     """
 
-    def __init__(self, params: Dict[str, Any]):
+    def __init__(self, params: VectorStoreParams, client):
         """Initialize the VectorStore with configuration parameters."""
-        self.embedding_model = params.get("embedding_model", "all-MiniLM-L6-v2")
-        self.chunk_size = params.get("chunk_size", 512)
-        self.chunk_overlap = params.get("chunk_overlap", 64)
-        self.collection_name = params.get("collection_name", "default_collection")
-        self.persist_directory = params.get("persist_directory", "./chroma_db")
-        self.rebuild_vstore = params.get("rebuild_vstore", False)
+        vs_params = params.model_dump()
+        self.embedding = vs_params.get("embedding_model", EmbeddingParams())
+        embedding = self.embedding.model_dump()
+        self.embedding_model = embedding.get("model", "all-MiniLM-L6-v2")
+        self.chunk_size = vs_params.get("chunk_size", 512)
+        self.chunk_overlap = vs_params.get("chunk_overlap", 64)
+        self.collection_name = vs_params.get("collection_name", "default_collection")
+        self.persist_directory = vs_params.get("persist_directory", "./chroma_db")
+        self.rebuild_vstore = vs_params.get("rebuild_vstore", False)
 
         # Supported file extensions
         self.supported_extensions = {
@@ -39,9 +42,11 @@ class VectorStore:
         self._load_custom_extensions()
 
         # Initialize ChromaDB client
-        self.client = chromadb.Client(
-            Settings(persist_directory=self.persist_directory, anonymized_telemetry=False)
-        )
+        #self.client = chromadb.Client(
+        #    Settings(persist_directory=self.persist_directory, anonymized_telemetry=False)
+        #)
+        self.client = client
+        #print(f"[+] VS[{self.collection_name}] created OK: path = {self.persist_directory}")
 
         # Handle rebuild flag
         if self.rebuild_vstore:

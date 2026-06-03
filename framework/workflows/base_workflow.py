@@ -327,7 +327,7 @@ class BaseWorkflow:
         self.memory_manager = infra.memory_manager
         self.context_manager = infra.context_manager
         self.chat_block_divider = infra.chat_block_divider
-        self.log = infra.log
+        #self.log = infra.log
         
         # Workflow‑specific state
         self.WF_USER = self.session.WORKFLOW_USER
@@ -356,7 +356,8 @@ class BaseWorkflow:
         self.wf_agent_sys_prompt_file = self.session.wf_agent_sys_prompt_file
 
     def console_log(self, msg: str):
-        self.infra.console_log(msg)
+        #self.infra.console_log(msg)
+        self.infra.chat_manager.console_log(msg)
 
     def update_workflow_rules(self, wf_rules_file: str|None =None):
         if wf_rules_file is not None:

@@ -8,6 +8,48 @@ from framework.workflows.base_agent_action import AgentAction
 # Default timeout for all HTTP requests
 DEFAULT_TIMEOUT = 30
 
+# ---------------------------
+# Create ToolBox Action
+# ---------------------------
+from framework.tooling.toolbox import ToolBox
+
+class CreateToolBoxArgs(BaseModel):
+    system: str = Field(description="System where the toolbox will be created, e.g., 'local'")
+    name: str = Field(description="Name for the new ToolBox")
+    params: dict = Field(default_factory=dict, description="Optional dict of parameters for ToolBox constructor")
+
+class CreateToolBoxAction(AgentAction):
+    """Create a ToolBox instance and register it in ``infra.managed_deployments``.
+
+    The created ``ToolBox`` object is stored under the provided ``name``.
+    """
+    action: Literal["create_toolbox"] = "create_toolbox"
+    description: Literal["Create and register a ToolBox"] = "Create and register a ToolBox"
+    payload: CreateToolBoxArgs
+    payload_schema: str = "{\n    \"system\": \"string\",\n    \"name\": \"string\",\n    \"params\": \"optional dict of ToolBox init args\"\n}"
+
+    def execute(self, infra) -> None:
+        # Instantiate ToolBox with given params (if any)
+        tb = ToolBox(**self.payload.params)
+        # Store in managed_deployments
+        infra.managed_deployments[self.payload.name] = {
+            "handle": tb,
+            "params": self.payload.params,
+            "meta_data": {
+                "type": "toolbox",
+                "status": "ready",
+                "created_at": datetime.utcnow().isoformat(),
+            },
+        }
+        infra.append_chat_history(
+            actor="system",
+            content=f"ToolBox '{self.payload.name}' created and registered.",
+            action={"action": "create_toolbox"},
+            log_console=True,
+        )
+        return
+
+
 # ===========================
 # ToolBox Interactions
 # ===========================

@@ -3,10 +3,83 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 import requests
+from framework.data_store.data_models import EmbeddingParams #, VectorStoreParams
+from framework.knowledgebase.data_models import KnowledgeBaseParams
+from framework.knowledgebase.knowledge_base import  KnowledgeBase
+
 from framework.workflows.base_agent_action import AgentAction
 
 # Default timeout for all HTTP requests
 DEFAULT_TIMEOUT = 30
+
+# ---------------------------
+# Create KnowledgeBase Action
+# ---------------------------
+from typing import Literal, Dict, Any
+from pydantic import BaseModel, Field
+from framework.knowledgebase.knowledge_base import KnowledgeBase
+
+
+
+class KnowledgeBaseParams(BaseModel):
+    name: str = Field(..., description="Name of the KnowledgeBase")
+    chunk_size: int = Field(256, description='Number of tokens per chunk')
+    chunk_overlap: int = Field(16, description='Number of tokens over which consecutive chinks overlap')
+    text_embedding: EmbeddingParams = Field(default=EmbeddingParams(),
+                                             description=f""" Parameters of the embedding to use:
+                                             {EmbeddingParams.model_fields}""")
+    inventory_path: str|None = Field(..., description='(Optional) Path/to/root/documentation/files')
+    rebuild_text_vstore: bool = Field(False, description='Flag for rebuilding the vector store by recreating the collection and reuploading the files')
+    vrbz: int = Field(default=0, description="KB Level of verbosity")
+
+
+class CreateKBArgs(BaseModel):
+    system: str = Field(description="System where the KB will be created, e.g., 'local'")
+    univ_name: str = Field(description="Name for the Universe the KB belongs to")
+    kb_params: KnowledgeBaseParams = Field(description=f"Parameter of the KB: {KnowledgeBaseParams.model_fields}")
+    #kb_name: str = Field(description="Name for the new KnowledgeBase")
+    #inventory_path: str|None = Field(description="(Optional) Path/to/root/documentation/files")
+    #vstore_params: VectorStoreParams = Field(default_factory=VectorStoreParams, description="(Optional) parameters of the vectorstore")
+
+class CreateKBAction(AgentAction):
+    """Create a KnowledgeBase instance and register it in ``infra.managed_deployments``.
+
+    The created ``KnowledgeBase`` object is stored under the provided ``name``.
+    No external process is started; the object lives in‑process.
+    """
+    action: Literal["create_kb"] = "create_kb"
+    description: Literal["Create and register a KnowledgeBase"] = "Create and register a KnowledgeBase"
+    payload: CreateKBArgs
+    #payload_schema: str = """{"system": <string>: "Name of the system the universe containg the KB is connected to i.e. 'local' for the local system",
+    #                          "univ_name": <string>: "Name of the universe containg the KB",
+    #                          "kb_name": <string>: "Name of the KB",
+    #                          "inventory_path": <string> : "(Optional) Path/to/root/documentation/files",""" + f'"vstore_params": <Dict> : "(Optiona) parameters of the vectorstore: {VectorStoreParams.model_fields}"'+'}'
+    payload_schema: str = f"{CreateKBArgs.model_fields}"
+
+
+    def execute(self, infra) -> None:
+        # Instantiate KnowledgeBase with given params (if any)
+        #kb_params = KnowledgeBaseParams(name=self.payload.kb_name,
+        #                                vstore_params = VectorStoreParams(**self.payload.vstore_params),
+        #                                inventory_path = self.payload.inventory_path
+        #                                )
+        #kb = KnowledgeBase(**self.payload.params)
+        kb = KnowledgeBase(self.payload.kb_params, db_client=infra.db_client)
+        deployments: Dict[str, Dict[str, Any]] = getattr(infra, "managed_deployments", {})
+        if self.payload.univ_name in deployments:
+            infra.UNIVs[self.payload.univ_name].KBs[self.payload.kb_name] = kb
+            infra.append_chat_history(
+                actor="system",
+                content=f" KB[{self.payload.kb_name}] sucessfully added to UNIV[{self.payload.univ_name}]",
+                action={"action": "create_universe"},
+                log_console=True,
+            )
+        else:
+            ERROR_MSG = f"""Unable to find UNIV[{self.payload.univ_name}] in the managed deployments. \n 
+                                   Try to create UNIV[{self.payload.univ_name}] first.""" 
+            infra.append_chat_history(actor="system", content=ERROR_MSG, action={"action": "system_info"}, log_console=True,)
+        return
+
 
 # ===========================
 # Knowledge Base Interactions

@@ -28,12 +28,15 @@ class BaseUniverse:
     # -----------------------------
     # Construction & registries
     # -----------------------------
-    def __init__(self, info: Optional[BaseUniverseModel] = None,  
-                       kbs:  Optional[Dict[str, KnowledgeBase]] = None, 
-                       tbs:  Optional[Dict[str, ToolBox]] = None):
+    #def __init__(self, info: Optional[BaseUniverseModel] = None,  
+    #                   kbs:  Optional[Dict[str, KnowledgeBase]] = None, 
+    #                   tbs:  Optional[Dict[str, ToolBox]] = None):
+    def __init__(self, params: BaseUniverseParams):
+        self.params = params
+        info, kbs, tbs = self.params.info, self.params.kbs, self.params.tbs
         self.KBs: Dict[str, KnowledgeBase] = dict(kbs or {})
         self.TBs: Dict[str, ToolBox] = dict(tbs or {})
-        self.info = info
+        self.info = infoo
         self.name = "NAMELESS"
         if info is not None:
             self.name = info.name

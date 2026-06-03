@@ -13,8 +13,8 @@ from pydantic import BaseModel, Field
 from framework.workflows.base_agent_action import AgentAction
 from framework.universes.universe_tools import build_params_from_info, get_base_universe_params
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
-from framework.knowledgebase.knowledge_base import KnowledgeBase
-from framework.tooling.toolbox import ToolBox
+#from framework.knowledgebase.knowledge_base import KnowledgeBase
+#from framework.tooling.toolbox import ToolBox
 from framework.universes.base_universe import run_app
 from framework.universes.remote_deployment import RemoteDeploymentManager, RemoteUniverseHandle
 
@@ -70,7 +70,7 @@ class CreateUniverseAction(AgentAction):
         if self.payload.name in deployments:
             infra.append_chat_history(
                 actor="system",
-                content=f"Deployment '{self.payload.name}' already exists.",
+                content=f"Deployment '{self.payload.name}' already exists:\n  -> Info( Universe [{self.payload.name}] ) = {infra.UNIVs[self.payload.name]}",
                 action={"action": "create_universe"},
                 log_console=True,
             )
@@ -562,88 +562,3 @@ class TerminateDeploymentAction(AgentAction):
             action={"action": "terminate_deployment"},
             log_console=True,
         )
-
-# ---------------------------
-# Create KnowledgeBase Action
-# ---------------------------
-from typing import Literal, Dict, Any
-from pydantic import BaseModel, Field
-from framework.knowledgebase.knowledge_base import KnowledgeBase
-
-class CreateKBArgs(BaseModel):
-    system: str = Field(description="System where the KB will be created, e.g., 'local'")
-    name: str = Field(description="Name for the new KnowledgeBase")
-    params: dict = Field(default_factory=dict, description="Optional dict of parameters for KnowledgeBase constructor")
-
-class CreateKBAction(AgentAction):
-    """Create a KnowledgeBase instance and register it in ``infra.managed_deployments``.
-
-    The created ``KnowledgeBase`` object is stored under the provided ``name``.
-    No external process is started; the object lives in‑process.
-    """
-    action: Literal["create_kb"] = "create_kb"
-    description: Literal["Create and register a KnowledgeBase"] = "Create and register a KnowledgeBase"
-    payload: CreateKBArgs
-    payload_schema: str = "{\n    \"system\": \"string\",\n    \"name\": \"string\",\n    \"params\": \"optional dict of KnowledgeBase init args\"\n}"
-
-    def execute(self, infra) -> None:
-        # Instantiate KnowledgeBase with given params (if any)
-        kb = KnowledgeBase(**self.payload.params)
-        # Store in managed_deployments
-        infra.managed_deployments[self.payload.name] = {
-            "handle": kb,
-            "params": self.payload.params,
-            "meta_data": {
-                "type": "knowledge_base",
-                "status": "ready",
-                "created_at": datetime.utcnow().isoformat(),
-            },
-        }
-        infra.append_chat_history(
-            actor="system",
-            content=f"KnowledgeBase '{self.payload.name}' created and registered.",
-            action={"action": "create_kb"},
-            log_console=True,
-        )
-        return
-
-# ---------------------------
-# Create ToolBox Action
-# ---------------------------
-from framework.tooling.toolbox import ToolBox
-
-class CreateToolBoxArgs(BaseModel):
-    system: str = Field(description="System where the toolbox will be created, e.g., 'local'")
-    name: str = Field(description="Name for the new ToolBox")
-    params: dict = Field(default_factory=dict, description="Optional dict of parameters for ToolBox constructor")
-
-class CreateToolBoxAction(AgentAction):
-    """Create a ToolBox instance and register it in ``infra.managed_deployments``.
-
-    The created ``ToolBox`` object is stored under the provided ``name``.
-    """
-    action: Literal["create_toolbox"] = "create_toolbox"
-    description: Literal["Create and register a ToolBox"] = "Create and register a ToolBox"
-    payload: CreateToolBoxArgs
-    payload_schema: str = "{\n    \"system\": \"string\",\n    \"name\": \"string\",\n    \"params\": \"optional dict of ToolBox init args\"\n}"
-
-    def execute(self, infra) -> None:
-        # Instantiate ToolBox with given params (if any)
-        tb = ToolBox(**self.payload.params)
-        # Store in managed_deployments
-        infra.managed_deployments[self.payload.name] = {
-            "handle": tb,
-            "params": self.payload.params,
-            "meta_data": {
-                "type": "toolbox",
-                "status": "ready",
-                "created_at": datetime.utcnow().isoformat(),
-            },
-        }
-        infra.append_chat_history(
-            actor="system",
-            content=f"ToolBox '{self.payload.name}' created and registered.",
-            action={"action": "create_toolbox"},
-            log_console=True,
-        )
-        return
