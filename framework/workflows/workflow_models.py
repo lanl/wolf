@@ -225,4 +225,4 @@ AGENT_ROLE_PROMPT = """You are a helpful assistant. You exist in the "system", a
 #)
 SYS_PROMPT = ( AGENT_ROLE_PROMPT + SCHEMA_STRING )
 
-#print(f"[!!!!] SYS_PROMPT = {SYS_PROMPT}")
+print(f"[!!!!] SYS_PROMPT = {SYS_PROMPT}")

@@ -36,7 +36,7 @@ class BaseUniverse:
         info, kbs, tbs = self.params.info, self.params.kbs, self.params.tbs
         self.KBs: Dict[str, KnowledgeBase] = dict(kbs or {})
         self.TBs: Dict[str, ToolBox] = dict(tbs or {})
-        self.info = infoo
+        self.info = info
         self.name = "NAMELESS"
         if info is not None:
             self.name = info.name
@@ -577,11 +577,12 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
 def build_default_universe(params: base_universe_params_type|None = None) -> BaseUniverse:
     """Create an base Universe. Extend this in your app bootstrap."""
     if params is not None: 
-        return BaseUniverse(info=params.info,
-                            kbs=params.kbs,
-                            tbs=params.tbs)
+        return BaseUniverse(params=params)
     else:
-        return BaseUniverse()
+        name_generator = NameGenerator()
+        info = BaseUniverseModel(name=name_generator.get_name())
+        _params = BaseUniverseParams(info=info)
+        return BaseUniverse(params=_params)
 
 def create_app_default() -> FastAPI:
     """Zero-argument ASGI factory for uvicorn --factory."""

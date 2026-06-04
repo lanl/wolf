@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Literal, Dict, Any
 from pydantic import BaseModel, Field
+import copy
 
 from framework.workflows.base_agent_action import AgentAction
 from framework.universes.universe_tools import build_params_from_info, get_base_universe_params
@@ -28,10 +29,11 @@ from framework.universes.remote_deployment import RemoteDeploymentManager, Remot
 class CreateUniverseArgs(BaseModel):
     system: str = Field(description="System where the universe will be created, e.g., 'local'")
     name: str = Field(description="Name for the new universe")
-    info: dict = Field(
-        default_factory=dict,
-        description="Optional BaseUniverseModel fields (host, port, name, etc.)",
-    )
+    #info: dict = Field(
+    #    default_factory=dict,
+    #    description="Optional BaseUniverseModel fields (host, port, name, etc.)",
+    #)
+    univ_params: BaseUniverseParams = Field(description=f"Parameters of the universe, {BaseUniverseParams.model_fields}")
 
 class CreateUniverseAction(AgentAction):
     """Create, configure and launch a new universe in a separate process, then register it.
@@ -46,23 +48,24 @@ class CreateUniverseAction(AgentAction):
     action: Literal["create_universe"] = "create_universe"
     description: Literal["Create, configure and launch a new universe"] = "Create, configure and launch a new universe"
     payload: CreateUniverseArgs
-    payload_schema: str = """{
-    "system": "name of system the universe is connected to, e.g. 'local'",
-    "name": "name of the universe",
-    "info": {
-        "host": "127.0.0.1",
-        "port": 0,
-        "description": "...",
-        "api_version": null,
-        "api_token": null,
-        "ssh_config": {
-            "user": "username",
-            "key_path": "/path/to/ssh/key",
-            "remote_python_path": "python3",
-            "remote_work_dir": "/tmp"
-        }
-    }
-}"""
+    #payload_schema: str = """{
+    #"system": "name of system the universe is connected to, e.g. 'local'",
+    #"name": "name of the universe",
+    #"info": {
+    #    "host": "127.0.0.1",
+    #    "port": 0,
+    #    "description": "...",
+    #    "api_version": null,
+    #    "api_token": null,
+    #    "ssh_config": {
+    #        "user": "username",
+    #        "key_path": "/path/to/ssh/key",
+    #        "remote_python_path": "python3",
+    #        "remote_work_dir": "/tmp"
+    #    }
+    # }
+    #}"""
+    payload_schema: str = f"{CreateUniverseArgs.model_fields}"
 
     def execute(self, infra) -> None:
         deployments: Dict[str, Dict[str, Any]] = getattr(infra, "managed_deployments", {})
@@ -75,15 +78,31 @@ class CreateUniverseAction(AgentAction):
                 log_console=True,
             )
             return
-        
-        info_data = dict(self.payload.info or {})
+        #info_data = dict(self.payload.info or {})
+        if isinstance(self.payload.univ_params, BaseUniverseParams):
+            params = self.payload.univ_params
+        elif isinstance(self.payload.univ_params, dict):
+           params = BaseUniverseParams.model_validate(self.payload.univ_params)
+        elif isinstance(self.payload.univ_params, (str, bytes)):
+           params = BaseUniverseParams.model_validate_json(self.payload.univ_params)
+        else:
+            infra.append_chat_history(
+                actor="system",
+                content=f"Unsupported type for univ_params: {type(self.payload.univ_params)}",
+                action={"action": "create_universe"},
+                log_console=True,
+            )
+            return
+        info_data = dict(params.info or {})
         info_data.setdefault("name", self.payload.name)
         info_data.setdefault("host", "127.0.0.1")
         info_data.setdefault("port", 0)
         
         try:
             info_instance = BaseUniverseModel(**info_data)
-            params = BaseUniverseParams(info=info_instance, kbs=None, tbs=None)
+            #params = BaseUniverseParams(info=info_instance, kbs=None, tbs=None)
+            params.info = info_instance
+            self.payload.univ_params = params
         except Exception as e:
             infra.append_chat_history(
                 actor="system",
