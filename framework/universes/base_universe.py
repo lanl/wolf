@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import os
+from pathlib import Path
+
+import chromadb
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from framework.agentic.agentic_tools import NameGenerator
+from framework.knowledgebase.data_models import KnowledgeBaseParams
 from framework.knowledgebase.knowledge_base import KnowledgeBase
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams, base_universe_params_type
 from framework.tooling.toolbox import ToolBox
@@ -28,9 +33,6 @@ class BaseUniverse:
     # -----------------------------
     # Construction & registries
     # -----------------------------
-    #def __init__(self, info: Optional[BaseUniverseModel] = None,  
-    #                   kbs:  Optional[Dict[str, KnowledgeBase]] = None, 
-    #                   tbs:  Optional[Dict[str, ToolBox]] = None):
     def __init__(self, params: BaseUniverseParams):
         self.params = params
         info, kbs, tbs = self.params.info, self.params.kbs, self.params.tbs
@@ -40,6 +42,8 @@ class BaseUniverse:
         self.name = "NAMELESS"
         if info is not None:
             self.name = info.name
+        # Initialize db_client for the universe
+        self.db_client = chromadb.Client()
 
     # -----------------------------
     # Allowed actions & discovery
@@ -279,11 +283,7 @@ class BaseUniverse:
 # FastAPI models
 # --------------------
 class CreateKBRequest(BaseModel):
-    name: str
-    vstore_params: Dict[str, Any]
-    inventory_path: Optional[str] = None
-    vrbz: int = 0
-
+     kb_params: KnowledgeBaseParams = Field(..., description=f"Parameters of the KB {KnowledgeBaseParams.model_fields}")
 
 class CreateTBRequest(BaseModel):
     name: str
@@ -303,6 +303,11 @@ class SearchRequest(BaseModel):
 class AppendTextsRequest(BaseModel):
     texts: List[str]
     doc_source: str = "universe"
+
+
+class UploadDirRequest(BaseModel):
+    dir_path: str
+    target_ext: Optional[List[str]] = None
 
 
 class AddURLRequest(BaseModel):
@@ -379,12 +384,12 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
 
     @app.post("/kbs")
     def create_kb(req: CreateKBRequest):
-        if req.name in universe.KBs:
-            raise HTTPException(status_code=409, detail="KB already exists")
-        params = {"name": req.name, "vstore_params": req.vstore_params, "inventory_path": req.inventory_path, "vrbz": req.vrbz}
-        kb = KnowledgeBase(params)
-        universe.add_kb(req.name, kb)
-        return {"ok": True, "name": req.name}
+        if req.kb_params.name in universe.KBs:
+            raise HTTPException(status_code=409, detail=f"KB {req.kb_params.name} already exists")
+        # Use the universe's db_client instead of expecting it in the request
+        kb = KnowledgeBase(req.kb_params, universe.db_client)
+        universe.add_kb(req.kb_params.name, kb)
+        return {"ok": True, "name": req.kb_params.name}
 
     @app.delete("/kbs/{name}")
     def delete_kb(name: str):
@@ -419,6 +424,52 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
             return await universe.akb_append_texts(name, req.texts, doc_source=req.doc_source)
         except KeyError:
             raise HTTPException(status_code=404, detail="KB not found")
+
+    @app.post("/kbs/{name}/upload_dir")
+    async def kb_upload_dir(name: str, req: UploadDirRequest):
+        """Upload directory contents to a knowledge base."""
+        try:
+            # Get KB to check it exists
+            kb = universe.get_kb(name)
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"KB '{name}' not found. Universe is running on host: {universe.info.host if universe.info else 'unknown'}"
+            )
+        
+        # Expand user path and validate directory exists
+        dir_path = os.path.expanduser(req.dir_path)
+        if not os.path.exists(dir_path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Directory '{req.dir_path}' does not exist on universe host {universe.info.host if universe.info else 'unknown'}:{universe.info.port if universe.info else 'unknown'}. Please verify the path is accessible from the universe's runtime environment."
+            )
+        
+        if not os.path.isdir(dir_path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Path '{req.dir_path}' exists but is not a directory on host {universe.info.host if universe.info else 'unknown'}. Please provide a valid directory path."
+            )
+        
+        try:
+            # Attempt to upload
+            result = await universe.akb_upload_dir(name, dir_path, target_ext=req.target_ext)
+            
+            # Provide detailed feedback
+            return {
+                "ok": True,
+                "kb_name": name,
+                "dir_path": req.dir_path,
+                "host": universe.info.host if universe.info else "unknown",
+                "port": universe.info.port if universe.info else "unknown",
+                "result": result,
+                "message": f"Successfully uploaded contents from '{req.dir_path}' to KB '{name}'"
+            }
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error uploading directory to KB '{name}' on host {universe.info.host if universe.info else 'unknown'}:{universe.info.port if universe.info else 'unknown'}. Error: {str(e)}"
+            )
 
     @app.post("/kbs/{name}/add_url")
     async def kb_add_url(name: str, req: AddURLRequest):

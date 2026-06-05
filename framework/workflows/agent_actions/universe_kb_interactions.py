@@ -3,11 +3,15 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 import requests
-from framework.data_store.data_models import EmbeddingParams #, VectorStoreParams
+import chromadb
+from framework.data_store.data_models import EmbeddingParams
 from framework.knowledgebase.data_models import KnowledgeBaseParams
-from framework.knowledgebase.knowledge_base import  KnowledgeBase
+from framework.knowledgebase.knowledge_base import KnowledgeBase
+
+from framework.universes.base_universe import CreateKBRequest
 
 from framework.workflows.base_agent_action import AgentAction
+
 
 # Default timeout for all HTTP requests
 DEFAULT_TIMEOUT = 30
@@ -15,69 +19,79 @@ DEFAULT_TIMEOUT = 30
 # ---------------------------
 # Create KnowledgeBase Action
 # ---------------------------
-from typing import Literal, Dict, Any
-from pydantic import BaseModel, Field
-from framework.knowledgebase.knowledge_base import KnowledgeBase
-
-
-
-class KnowledgeBaseParams(BaseModel):
-    name: str = Field(..., description="Name of the KnowledgeBase")
-    chunk_size: int = Field(256, description='Number of tokens per chunk')
-    chunk_overlap: int = Field(16, description='Number of tokens over which consecutive chinks overlap')
-    text_embedding: EmbeddingParams = Field(default=EmbeddingParams(),
-                                             description=f""" Parameters of the embedding to use:
-                                             {EmbeddingParams.model_fields}""")
-    inventory_path: str|None = Field(..., description='(Optional) Path/to/root/documentation/files')
-    rebuild_text_vstore: bool = Field(False, description='Flag for rebuilding the vector store by recreating the collection and reuploading the files')
-    vrbz: int = Field(default=0, description="KB Level of verbosity")
-
 
 class CreateKBArgs(BaseModel):
     system: str = Field(description="System where the KB will be created, e.g., 'local'")
     univ_name: str = Field(description="Name for the Universe the KB belongs to")
     kb_params: KnowledgeBaseParams = Field(description=f"Parameter of the KB: {KnowledgeBaseParams.model_fields}")
-    #kb_name: str = Field(description="Name for the new KnowledgeBase")
-    #inventory_path: str|None = Field(description="(Optional) Path/to/root/documentation/files")
-    #vstore_params: VectorStoreParams = Field(default_factory=VectorStoreParams, description="(Optional) parameters of the vectorstore")
+
 
 class CreateKBAction(AgentAction):
-    """Create a KnowledgeBase instance and register it in ``infra.managed_deployments``.
+    """Create a KnowledgeBase by calling the universe's API endpoint.
 
-    The created ``KnowledgeBase`` object is stored under the provided ``name``.
-    No external process is started; the object lives in‑process.
+    This registers the KB with the universe server, ensuring it appears in
+    health checks and info queries.
     """
     action: Literal["create_kb"] = "create_kb"
     description: Literal["Create and register a KnowledgeBase"] = "Create and register a KnowledgeBase"
     payload: CreateKBArgs
-    #payload_schema: str = """{"system": <string>: "Name of the system the universe containg the KB is connected to i.e. 'local' for the local system",
-    #                          "univ_name": <string>: "Name of the universe containg the KB",
-    #                          "kb_name": <string>: "Name of the KB",
-    #                          "inventory_path": <string> : "(Optional) Path/to/root/documentation/files",""" + f'"vstore_params": <Dict> : "(Optiona) parameters of the vectorstore: {VectorStoreParams.model_fields}"'+'}'
     payload_schema: str = f"{CreateKBArgs.model_fields}"
 
 
     def execute(self, infra) -> None:
-        # Instantiate KnowledgeBase with given params (if any)
-        #kb_params = KnowledgeBaseParams(name=self.payload.kb_name,
-        #                                vstore_params = VectorStoreParams(**self.payload.vstore_params),
-        #                                inventory_path = self.payload.inventory_path
-        #                                )
-        #kb = KnowledgeBase(**self.payload.params)
-        kb = KnowledgeBase(self.payload.kb_params, db_client=infra.db_client)
+        univ_name = self.payload.univ_name.strip()
+        
+        # Check if universe exists in managed deployments
         deployments: Dict[str, Dict[str, Any]] = getattr(infra, "managed_deployments", {})
-        if self.payload.univ_name in deployments:
-            infra.UNIVs[self.payload.univ_name].KBs[self.payload.kb_name] = kb
+        if univ_name not in deployments:
+            ERROR_MSG = f"""Unable to find UNIV[{univ_name}] in the managed deployments. \n 
+                                   Try to create UNIV[{univ_name}] first."""
+            infra.append_chat_history(actor="system", content=ERROR_MSG, action={"action": "system_info"}, log_console=True)
+            return
+        
+        try:
+            univ = infra.UNIVs[univ_name]
+            univ_base_url = univ.get_base_url()
+            
+            # Prepare KB creation request
+            kb_params = self.payload.kb_params
+            
+            # Serialize the request properly as a dictionary
+            request_data = {
+                "kb_params": kb_params.model_dump(),
+                "db_client": None  # This field cannot be serialized; will be constructed server-side
+            }
+            
+            # Call universe's POST /kbs endpoint
+            response = requests.post(
+                f"{univ_base_url}/kbs",
+                json=request_data,
+                timeout=DEFAULT_TIMEOUT
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            # Update local reference if needed
+            if infra.UNIVs[univ_name].kbs is None:
+                infra.UNIVs[univ_name].kbs = {}
+            
             infra.append_chat_history(
                 actor="system",
-                content=f" KB[{self.payload.kb_name}] sucessfully added to UNIV[{self.payload.univ_name}]",
-                action={"action": "create_universe"},
+                content=f" KB[{kb_params.name}] successfully added to UNIV[{univ_name}] via API",
+                action={"action": "create_kb"},
                 log_console=True,
             )
-        else:
-            ERROR_MSG = f"""Unable to find UNIV[{self.payload.univ_name}] in the managed deployments. \n 
-                                   Try to create UNIV[{self.payload.univ_name}] first.""" 
-            infra.append_chat_history(actor="system", content=ERROR_MSG, action={"action": "system_info"}, log_console=True,)
+            
+        except requests.exceptions.Timeout:
+            error_msg = f"Request timed out while creating KB[{kb_params.name}] in UNIV[{univ_name}]"
+            infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to create KB[{kb_params.name}] in UNIV[{univ_name}]: {str(e)}"
+            infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
+        except Exception as e:
+            error_msg = f"Error creating KB[{kb_params.name}] in UNIV[{univ_name}]: {str(e)}"
+            infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
+        
         return
 
 
@@ -98,14 +112,7 @@ class UniverseKBSearchAction(AgentAction):
     action: Literal["universe_kb_search"] = "universe_kb_search"
     description: Literal["Search a knowledge base for relevant information"] = "Search a knowledge base for relevant information"
     payload: KBSearchArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                              "universe": <string>: "Name of the universe you are interacting with",
-                              "kb_name": <string>, 
-                              "query": <string>, 
-                              "k": <int> (optional, default=5), 
-                              "context_window": <int> (optional, default=1)
-                              }
-                              """
+    payload_schema: str = """{\n                              "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                              "universe": <string>: "Name of the universe you are interacting with",\n                              "kb_name": <string>, \n                              "query": <string>, \n                              "k": <int> (optional, default=5), \n                              "context_window": <int> (optional, default=1)\n                              }\n                              """
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
@@ -154,13 +161,7 @@ class UniverseKBAppendTextsAction(AgentAction):
     action: Literal["universe_kb_append_texts"] = "universe_kb_append_texts"
     description: Literal["Add text documents to a knowledge base"] = "Add text documents to a knowledge base"
     payload: KBAppendTextsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                              "universe": <string>: "Name of the universe you are interacting with",
-                              "kb_name": <string>,
-                              "texts": <list[string]>, 
-                              "doc_source": <string> (optional, default="agent")
-                              }
-                              """
+    payload_schema: str = """{\n                              "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                              "universe": <string>: "Name of the universe you are interacting with",\n                              "kb_name": <string>,\n                              "texts": <list[string]>, \n                              "doc_source": <string> (optional, default="agent")\n                              }\n                              """
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -206,10 +207,7 @@ class UniverseKBAddURLAction(AgentAction):
     action: Literal["universe_kb_add_url"] = "universe_kb_add_url"
     description: Literal["Add a single URL document to a knowledge base"] = "Add a single URL document to a knowledge base"
     payload: KBAddURLArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                            "universe": <string>: "Name of the universe you are interacting with",
-                            "kb_name": <string>, 
-                            "url": <string>}"""
+    payload_schema: str = """{\n                            "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                            "universe": <string>: "Name of the universe you are interacting with",\n                            "kb_name": <string>, \n                            "url": <string>}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -254,10 +252,7 @@ class UniverseKBAddURLsAction(AgentAction):
     action: Literal["universe_kb_add_urls"] = "universe_kb_add_urls"
     description: Literal["Add multiple URL documents to a knowledge base"] = "Add multiple URL documents to a knowledge base"
     payload: KBAddURLsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                            "universe": <string>: "Name of the universe you are interacting with",
-                            "kb_name": <string>, 
-                            "urls": <list[string]>}"""
+    payload_schema: str = """{\n                            "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                            "universe": <string>: "Name of the universe you are interacting with",\n                            "kb_name": <string>, \n                            "urls": <list[string]>}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -301,9 +296,7 @@ class UniverseKBStatsAction(AgentAction):
     action: Literal["universe_kb_stats"] = "universe_kb_stats"
     description: Literal["Get statistics for a knowledge base"] = "Get statistics for a knowledge base"
     payload: KBStatsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                              "universe": <string>: "Name of the universe you are interacting with",
-                              "kb_name": <string>}"""
+    payload_schema: str = """{\n                              "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                              "universe": <string>: "Name of the universe you are interacting with",\n                              "kb_name": <string>}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -338,9 +331,7 @@ class UniverseKBSourcesAction(AgentAction):
     action: Literal["universe_kb_sources"] = "universe_kb_sources"
     description: Literal["List all sources in a knowledge base"] = "List all sources in a knowledge base"
     payload: KBStatsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                            "universe": <string>: "Name of the universe you are interacting with",
-                            "kb_name": <string>}"""
+    payload_schema: str = """{\n                            "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                            "universe": <string>: "Name of the universe you are interacting with",\n                            "kb_name": <string>}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -375,9 +366,7 @@ class UniverseKBPurgeAction(AgentAction):
     action: Literal["universe_kb_purge"] = "universe_kb_purge"
     description: Literal["Purge all content from a knowledge base (use with caution!)"] = "Purge all content from a knowledge base (use with caution!)"
     payload: KBStatsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                              "universe": <string>: "Name of the universe you are interacting with",
-                              "kb_name": <string>}"""
+    payload_schema: str = """{\n                              "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                              "universe": <string>: "Name of the universe you are interacting with",\n                              "kb_name": <string>}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -420,9 +409,7 @@ class UniverseKBGetDocumentAction(AgentAction):
     action: Literal["universe_kb_get_document"] = "universe_kb_get_document"
     description: Literal["Retrieve a specific document by ID from a knowledge base"] = "Retrieve a specific document by ID from a knowledge base"
     payload: KBGetDocumentArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                              "universe": <string>: "Name of the universe you are interacting with",
-                              "kb_name": <string>, "document_id": <string>}"""
+    payload_schema: str = """{\n                              "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",\n                              "universe": <string>: "Name of the universe you are interacting with",\n                              "kb_name": <string>, "document_id": <string>}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:

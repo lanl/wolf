@@ -118,15 +118,23 @@ class KnowledgeBase:
                                       vs_VRBZ = params.vrbz)
         self.vstore = VectorStore(vs_params, client=db_client)
 
-        # Inventory location
-        inv_path = params.inventory_path or os.path.join(
-            self.vstore.persist_directory, f"{self.name}_inventory.sqlite"
-        )
-        self.inventory_path = inv_path
-        Path(os.path.dirname(inv_path)).mkdir(parents=True, exist_ok=True)
+        # Inventory location - use persist_dir if set, otherwise fall back to vstore persist dir
+        inv_dir = getattr(params, 'persist_dir', None)
+        if inv_dir is None:
+            # Default to vector store's persist directory
+            inv_dir = self.vstore.persist_directory
+        
+        Path(inv_dir).mkdir(parents=True, exist_ok=True)
+        self.inventory_path = os.path.join(inv_dir, f"{self.name}_inventory.sqlite")
 
         # Ensure inventory schema
         self._init_inventory()
+        
+        # If inventory_path (docs directory) is provided, upload documents
+        if params.inventory_path and os.path.isdir(params.inventory_path):
+            if self.VRBZ > 0:
+                console.print(f"[KB] Auto-uploading documents from {params.inventory_path}")
+            self.upload_dir(params.inventory_path)
 
     # --------------------------
     # Inventory helpers
