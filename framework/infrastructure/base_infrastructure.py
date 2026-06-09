@@ -2,6 +2,7 @@ import copy
 import os
 import logging
 import pickle
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,7 +15,6 @@ from framework.utils.tokenomics import (
 
 from framework.data_store.data_models import BaseVectorStoreParams 
 from framework.knowledgebase.data_models import KnowledgeBaseParams
-#from framework.knowledgebase.knowledge_base import  KBParams, KnowledgeBase
 from framework.knowledgebase.knowledge_base import  KnowledgeBase
 from framework.tooling.toolbox import ToolBox
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
@@ -96,9 +96,6 @@ class BaseInfrastructure:
             elif isinstance(obj, KnowledgeBase):
                 self.KBs[obj.name] = obj
                 obj_type = "knowledgebase"
-            #elif isinstance(obj, KBParams):
-            #    self.KBs[obj.name] = KnowledgeBase(obj)
-            #    obj_type = "knowledgebase"
             elif isinstance(obj, KnowledgeBaseParams):
                 self.KBs[obj.name] = KnowledgeBase(obj)
                 obj_type = "knowledgebase"
@@ -141,7 +138,6 @@ class BaseInfrastructure:
         if chat_manager is not None:
             self.chat_manager = chat_manager
         else:
-            #from framework.workflows.chat_manager import BaseChatManager
             from framework.infrastructure.base_chat_manager import BaseChatManager 
             self.chat_manager = BaseChatManager(
                 session_dir=self.session_dir,
@@ -151,7 +147,6 @@ class BaseInfrastructure:
         if memory_manager is not None:
             self.memory_manager = memory_manager
         else:
-            #from framework.workflows.memory_manager import MemoryManager
             from framework.infrastructure.base_memory_manager import MemoryManager 
             self.memory_manager = MemoryManager(
                 session_dir=self.session_dir,
@@ -162,16 +157,12 @@ class BaseInfrastructure:
         if context_manager is not None:
             self.context_manager = context_manager
         else:
-            #from framework.workflows.context_manager import ContextManager
             from framework.infrastructure.base_context_manager import ContextManager 
             self.context_manager = ContextManager(
                 max_ctx_tokens=max_ctx_tokens,
                 traces_vector_store=traces_vector_store,
                 session_dir=self.session_dir
             )
-
-        # Logging setup
-        #self.log = self.chat_manager.log
 
         # Internal state
         self.FULL_CTX: List[dict] = []
@@ -242,17 +233,6 @@ class BaseInfrastructure:
 
     def console_log(self, msg: str):
         self.chat_manager.console_log(msg)
-        #MSG = msg.lower()
-        #if "[error]" in MSG:
-        #    self.log.error(MSG)
-        #elif "[warn]" in MSG:
-        #    self.log.warning(MSG)
-        #elif "[debug]" in MSG:
-        #    self.log.debug(MSG)
-        #elif "[critk]" in MSG:
-        #    self.log.critical(MSG)
-        #else:
-        #    self.log.info(MSG)
 
     def get_true_role_and_alias(self, actor: str, content: str) -> Tuple[str, str]:
         role = self.ROLEs.get(actor, "system")
@@ -337,14 +317,90 @@ class BaseInfrastructure:
         self.CONSOLE_HEAD = len(self.chat_history)
 
     def process_user_input(self, user_prompt: str):
+        """Process user input with support for \>, !>, and @ commands."""
         BREAK, IS_CMD, ERROR, INTERLOCUTOR, PROMPT = False, False, False, "system", None
         prompt = user_prompt.strip().lower()
+        original_prompt = user_prompt.strip()
+        
+        # Handle exit commands
         if prompt.startswith(("exit", "quit", "/bye", "/exit", "/quit")):
             IS_CMD, BREAK = True, True
             PROMPT = f"[system]: Good Bye"
+        
+        # Handle clear commands
         elif prompt.startswith(("clear", "cls")):
             IS_CMD = True
             os.system('cls' if os.name == 'nt' else 'clear')
+        
+        # Handle WOLF function commands (\>)
+        elif original_prompt.startswith("\\>"):
+            IS_CMD = True
+            cmd = prompt[2:].strip().split()
+            if not cmd:
+                PROMPT = f"[system][ERROR][CMD FORMAT]: Empty \\> command"
+                ERROR = True
+            elif cmd[0] in ["quit", "exit", "bye"]:
+                PROMPT = f"[system]: Good Bye"
+                BREAK = True
+            elif cmd[0] in ["clear", "cls", "clean"]:
+                os.system('cls' if os.name == 'nt' else 'clear')
+            elif cmd[0] == "show":
+                if len(cmd) > 1:
+                    if cmd[1] in ["chat", "history", "context", "hist", "ctx", "chat_history", "chat-history"]:
+                        self.show_ctx()
+                        if len(cmd) > 2:
+                            PROMPT = f"[system][WARN][CMD FORMAT]: BAD \\>show {cmd[1]} command does not take extra arguments: {cmd[2:]}"
+                    elif cmd[1] in ["updated-chat", "updated-history", "updated-context", "updated-hist", "updated-ctx", "updated-chat_history", "updated-chat-history"]:
+                        if len(cmd) >= 2:
+                            try:
+                                cmd2, console_head = cmd[1].strip().split("=")
+                                cmd2 = cmd2.strip()
+                                if cmd2 in ["head", "idx", "console", "console_head", "console-head", "console_idx"]:
+                                    try:
+                                        head = int(console_head)
+                                        self.show_updated_history(head)
+                                    except Exception as cmd_int_err:
+                                        PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} {cmd[1]} command: {cmd[2]}=??:\n {console_head} is not an integer: {cmd_int_err}"
+                                        ERROR = True
+                            except Exception as cmd2_err:
+                                PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} {cmd[1]} command format: {cmd2_err}"
+                                ERROR = True
+                    else:
+                        PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} command format: Extra arguments {cmd[1:]}"
+                        ERROR = True
+                else:
+                    PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} command format: Missing extra arguments"
+                    ERROR = True
+            else:
+                PROMPT = f"[system][ERROR][CMD FORMAT]: Unknown WOLF command: {cmd[0]}"
+                ERROR = True
+        
+        # Handle terminal commands (!>)
+        elif original_prompt.startswith("!>"):
+            IS_CMD = True
+            terminal_cmd = original_prompt[2:].strip()
+            if not terminal_cmd:
+                PROMPT = f"[system][ERROR][CMD FORMAT]: Empty !> terminal command"
+                ERROR = True
+            else:
+                try:
+                    result = subprocess.run(
+                        terminal_cmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    output = result.stdout if result.stdout else result.stderr
+                    PROMPT = f"[system][TERMINAL OUTPUT]:\n{output}"
+                except subprocess.TimeoutExpired:
+                    PROMPT = f"[system][ERROR]: Terminal command timed out after 30 seconds"
+                    ERROR = True
+                except Exception as e:
+                    PROMPT = f"[system][ERROR]: Failed to execute terminal command: {e}"
+                    ERROR = True
+        
+        # Handle old-style / commands for backward compatibility
         elif prompt.startswith("/"):
             IS_CMD = True
             cmd = prompt[1:].strip().split()
@@ -380,6 +436,8 @@ class BaseInfrastructure:
                 else:
                     PROMPT = f"[system][ERROR][CMD FORMAT]: BAD />{cmd[0]} command format: Missing extra arguments"
                     ERROR = True
+        
+        # Handle @ interlocutor commands
         elif prompt.startswith("@"):
             cmd = user_prompt.strip().split()
             INTERLOCUTOR = cmd[0][1:]
@@ -387,8 +445,11 @@ class BaseInfrastructure:
                 PROMPT = f"[system][INPUT ERROR]: BAD @interlocutor command:\n Interlocutor {INTERLOCUTOR} not in WF-MEMBERS: {self.WF_MEMBERS}"
                 ERROR = True
             PROMPT = user_prompt.strip()[len(cmd[0]):]
+        
+        # Regular user input
         else:
             PROMPT = user_prompt.strip()
+        
         return BREAK, IS_CMD, ERROR, INTERLOCUTOR, PROMPT
 
     # ------ Snapshot and Restore methods ------

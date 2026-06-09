@@ -17,7 +17,7 @@ from framework.workflows.workflow_models import (
 )
 from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
-from framework.workflows.enhanced_input import interactive_input_line_wrapped
+from framework.workflows.enhanced_input_v2 import interactive_input_line_wrapped
 
 
 def normalize_payload(payload: Dict, actor:str) -> Dict:
@@ -261,19 +261,6 @@ class BaseWorkflow:
         
         Creates a session.snapshot.json file in the session directory.
         """
-        #try:
-        #    snapshot = self.create_session_snapshot()
-        #    snapshot_path = f"{self.session.infra.chat_manager.session_dir}/session.snapshot.json"
-        #    
-        #    with open(snapshot_path, 'w') as f:
-        #        json.dump(snapshot, f, indent=2)
-        #    
-        #    console.print(f"[green]Session snapshot saved to {snapshot_path}[/green]")
-        #    
-        #except Exception as e:
-        #    console.print(f"[red]Failed to save session snapshot: {e}[/red]")
-        #    self.console_log(f"[ERROR] Failed to save session snapshot: {e}")
-
         snapshot = self.create_session_snapshot()
         snapshot_path = f"{self.session.infra.chat_manager.session_dir}/session.snapshot.json"
         
@@ -327,7 +314,6 @@ class BaseWorkflow:
         self.memory_manager = infra.memory_manager
         self.context_manager = infra.context_manager
         self.chat_block_divider = infra.chat_block_divider
-        #self.log = infra.log
         
         # Workflow‑specific state
         self.WF_USER = self.session.WORKFLOW_USER
@@ -356,7 +342,6 @@ class BaseWorkflow:
         self.wf_agent_sys_prompt_file = self.session.wf_agent_sys_prompt_file
 
     def console_log(self, msg: str):
-        #self.infra.console_log(msg)
         self.infra.chat_manager.console_log(msg)
 
     def update_workflow_rules(self, wf_rules_file: str|None =None):
@@ -534,6 +519,9 @@ class BaseWorkflow:
         self.WF_USER = user_name
         self.infra.ROLEs[user_name] = "user"
         self.WORKFLOW_TURN = wf_first_turn
+        
+        # Get list of available WOLF commands for autocompletion
+        wolf_commands = ['show', 'clear', 'quit', 'exit', 'bye', 'cls']
 
         while True:
             turn = self.WORKFLOW_TURN.strip().lower()
@@ -544,7 +532,10 @@ class BaseWorkflow:
             # ---------------------------------------------------------
             if turn in ["user", self.WF_USER.lower()]:
                 self.infra.show_updated_history()
-                raw_input = interactive_input_line_wrapped(prompt_text=f"[{self.WF_USER}]> ")
+                raw_input = interactive_input_line_wrapped(
+                    prompt_text=f"[{self.WF_USER}]> ",
+                    wf_commands=wolf_commands
+                )
                 if raw_input is None:
                     break
                 user_prompt = raw_input.strip()
