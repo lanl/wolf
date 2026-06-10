@@ -17,7 +17,7 @@ from framework.workflows.workflow_models import (
 )
 from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
-from framework.workflows.enhanced_input_v2 import interactive_input_line_wrapped
+from framework.workflows.enhanced_input import interactive_input_line_wrapped
 
 
 def normalize_payload(payload: Dict, actor:str) -> Dict:
