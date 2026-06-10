@@ -1,23 +1,21 @@
 import asyncio
-import csv
-import glob
+import glob, json, csv, pdfplumber, nbformat
 import hashlib
-import json
 import mimetypes
 import os
 import pickle
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import nbformat
-import pdfplumber
 from alive_progress import alive_bar
 
 import chromadb
 from chromadb.config import Settings
+from framework.data_store.data_models import MultimodalEmbeddingParams, MultimodalVectorStoreParams
 
 
 # ============================================================
@@ -38,6 +36,7 @@ bs4 = _try_import("bs4")
 open_clip = _try_import("open_clip")
 PIL = _try_import("PIL")
 faster_whisper = _try_import("faster_whisper")
+transformers = _try_import("transformers")
 
 
 # ============================================================
@@ -230,21 +229,16 @@ class _BasicBM25:
 # ============================================================
 # Embedders
 # ============================================================
-class MultiModalEmbedder:
-    def __init__(
-        self,
-        text_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        clip_model: str = "ViT-B-32",
-        clip_pretrained: str = "openai",
-        device: Optional[str] = None,
-    ):
-        self.device = device
-        self.text_model_name = text_model
+class MultimodalEmbedder:
+    def __init__(self, embedding_params: MultimodalEmbeddingParams):
+        self.params = embedding_params
+        self.device = embedding_params.device
+        self.text_model_name = embedding_params.text_model
 
         self._text_encoder = None
         if st is not None:
             try:
-                self._text_encoder = st.SentenceTransformer(text_model, device=device)
+                self._text_encoder = st.SentenceTransformer(embedding_params.text_model, device=self.device)
             except Exception:
                 self._text_encoder = None
 
@@ -254,15 +248,15 @@ class MultiModalEmbedder:
         if open_clip is not None and PIL is not None:
             try:
                 model, _, preprocess = open_clip.create_model_and_transforms(
-                    clip_model, pretrained=clip_pretrained
+                    embedding_params.clip_model, pretrained=embedding_params.clip_pretrained
                 )
-                tokenizer = open_clip.get_tokenizer(clip_model)
+                tokenizer = open_clip.get_tokenizer(embedding_params.clip_model)
                 self._clip = model
                 self._clip_tokenizer = tokenizer
                 self._clip_preprocess = preprocess
 
-                if device:
-                    self._clip = self._clip.to(device)
+                if self.device:
+                    self._clip = self._clip.to(self.device)
                 self._clip.eval()
             except Exception:
                 self._clip = None
@@ -272,11 +266,15 @@ class MultiModalEmbedder:
             try:
                 self._whisper = faster_whisper.WhisperModel(
                     "base",
-                    device=(device or "cpu"),
-                    compute_type="int8" if (device is None or device == "cpu") else "float16",
+                    device=(self.device or "cpu"),
+                    compute_type="int8" if (self.device is None or self.device == "cpu") else "float16",
                 )
             except Exception:
                 self._whisper = None
+
+        #DistilBERT encoder (lazy loaded)
+        self._table_encoder = None
+        self._table_tokenizer = None
 
     def _ensure_numpy(self):
         if np is None:
@@ -378,6 +376,40 @@ class MultiModalEmbedder:
             vecs.append(v.tolist())
         return vecs
 
+    def _load_table_encoder(self):
+        """Lazy‑load the DistilBERT  model and tokenizer.
+        It ia a lighter‑weight version of Google's BERT."""
+        if self._table_encoder is not None:
+            return
+        if transformers is None:
+            raise RuntimeError("transformers library is required for table encoding but is not installed.")
+        from transformers import AutoTokenizer, AutoModel
+
+        self._table_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+        self._table_encoder = AutoModel.from_pretrained("distilbert-base-uncased")
+        if self.device:
+            self._table_encoder = self._table_encoder.to(self.device)
+        self._table_encoder.eval()
+
+    def embed_table(self, table_text: str) -> List[float]:
+        """Return a single dense vector for *table_text*.
+        The method tokenises the textual representation of the table (e.g. CSV
+        or markdown) and mean‑pools the last‑hidden‑state to obtain a fixed‑size
+        embedding."""
+        self._load_table_encoder()
+        import torch
+
+        inputs = self._table_tokenizer(
+            table_text, return_tensors="pt", truncation=True, max_length=512
+        )
+        if self.device:
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self._table_encoder(**inputs)
+        # Mean‑pool over token dimension
+        vec = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
+        return vec
+
 
 # ============================================================
 # Data classes
@@ -393,61 +425,53 @@ class IngestItem:
 # ============================================================
 # Multi-modal Vector Store
 # ============================================================
-class MultiModalVectorStore:
-    def __init__(self, params: Dict[str, Any]):
-        self.persist_directory = params.get("persist_directory", "./chroma_db")
-        self.collection_name = params.get("collection_name", "default_collection")
-        self.rebuild_vstore = params.get("rebuild_vstore", False)
+class MultimodalVectorStore:
+    def __init__(self, params: MultimodalVectorStoreParams, client):
+        self.params = params
+        self.chunk_size = params.chunk_size
+        self.chunk_overlap = params.chunk_overlap
+        self.persist_directory = params.persist_directory
+        self.collection_name = params.collection_name
+        self.rebuild_vstore = params.rebuild_vstore
 
-        self.chunk_size = params.get("chunk_size", 512)
-        self.chunk_overlap = params.get("chunk_overlap", 64)
+        self.use_bm25 = params.use_bm25
+        self.use_rrf = params.use_rrf
+        self.rrf_k = params.rrf_k
 
-        self.use_bm25 = params.get("use_bm25", True)
-        self.use_rrf = params.get("use_rrf", True)
-        self.rrf_k = params.get("rrf_k", 60)
-
-        self.use_reranker = params.get("use_reranker", False)
-        self.reranker_model = params.get(
-            "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
-        )
+        self.use_reranker = params.use_reranker
+        self.reranker_model = params.reranker_model
         self._reranker = None
 
-        self.allow_online = params.get("allow_online", False)
-        self.http_timeout = int(params.get("http_timeout", 20))
+        self.allow_online = params.allow_online
+        self.http_timeout = params.http_timeout
 
-        self.text_extensions = set(params.get("text_extensions", [
+        self.text_extensions = {
             "py", "js", "ts", "md", "html", "txt", "dat", "pdf", "csv", "json",
             "log", "info", "c", "cpp", "f", "f77", "f90", "f95", "ipynb",
-        ]))
-        self.image_extensions = set(params.get("image_extensions", [
+        }
+        self.image_extensions = {
             "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"
-        ]))
-        self.audio_extensions = set(params.get("audio_extensions", [
+        }
+        self.audio_extensions = {
             "wav", "mp3", "m4a", "flac", "ogg", "aac"
-        ]))
-        self.video_extensions = set(params.get("video_extensions", [
+        }
+        self.video_extensions = {
             "mp4", "mov", "mkv", "webm", "avi"
-        ]))
+        }
+        self.table_extensions = {
+            "csv", "tsv", "json", "xls", "xlsx", "md"
+        }
 
-        self.embedder = MultiModalEmbedder(
-            text_model=params.get("text_model", "sentence-transformers/all-MiniLM-L6-v2"),
-            clip_model=params.get("clip_model", "ViT-B-32"),
-            clip_pretrained=params.get("clip_pretrained", "openai"),
-            device=params.get("device", None),
-        )
+        self.embedder = MultimodalEmbedder(params.embedding)
 
-        self.client = chromadb.Client(
-            Settings(
-                persist_directory=self.persist_directory,
-                anonymized_telemetry=False,
-            )
-        )
+        self.client = client
 
         self.text_collection_name = f"{self.collection_name}_text"
         self.vision_collection_name = f"{self.collection_name}_vision"
+        self.table_collection_name = f"{self.collection_name}_table"
 
         if self.rebuild_vstore:
-            for cname in (self.text_collection_name, self.vision_collection_name):
+            for cname in (self.text_collection_name, self.vision_collection_name, self.table_collection_name):
                 try:
                     self.client.delete_collection(name=cname)
                 except Exception:
@@ -459,6 +483,10 @@ class MultiModalVectorStore:
         )
         self.vision_collection = self.client.get_or_create_collection(
             name=self.vision_collection_name,
+            metadata={"hnsw_space": "cosine"},
+        )
+        self.table_collection = self.client.get_or_create_collection(
+            name=self.table_collection_name,
             metadata={"hnsw_space": "cosine"},
         )
 
@@ -485,6 +513,8 @@ class MultiModalVectorStore:
             return self.text_collection
         if space == "vision":
             return self.vision_collection
+        if space == "table":
+            return self.table_collection
         raise ValueError(f"Unknown embedding space: {space}")
 
     def _classify_doc_id_space(self, doc_id: str, metadata: Optional[Dict[str, Any]] = None) -> str:
@@ -492,6 +522,8 @@ class MultiModalVectorStore:
             return metadata.get("embedding_space", "text")
         if "::image::" in doc_id or "::video_frame::" in doc_id:
             return "vision"
+        if "::table::" in doc_id:
+            return "table"
         return "text"
 
     async def _split_text_with_lines(self, text: str) -> List[Tuple[str, int, int]]:
@@ -590,6 +622,7 @@ class MultiModalVectorStore:
 
         if self.bm25 is not None:
             self.bm25.add_many([(it.id, it.document, it.metadata) for it in items])
+
 
     # ----------------------------
     # Public ingestion APIs
@@ -763,14 +796,87 @@ class MultiModalVectorStore:
             IngestItem(id=doc_id, document=proxy, embedding=vec, metadata=meta)
         ])
 
+    async def _ingest_table(self, table_text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Ingest a table represented as plain text (CSV/markdown/etc.).
+
+        The table is embedded with the table encoder and stored under the
+        ``table`` modality.  ``metadata`` may contain any additional fields the
+        caller wishes to attach (e.g., source PDF, page number).
+        """
+        vec = await asyncio.to_thread(self.embedder.embed_table, table_text)
+        doc_id = (
+            f"{metadata.get('source', 'table')}::table::"
+            f"{metadata.get('page', 0)}::{metadata.get('table_index', 0)}"
+        )
+        base_meta: Dict[str, Any] = {
+            "source": metadata.get("source", "table"),
+            "uri": metadata.get("uri", "unknown"),
+            "modality": "table",
+            "embedding_space": "table",
+            "page": metadata.get("page", 0),
+            "table_index": metadata.get("table_index", 0),
+            "doc_id": doc_id,
+        }
+
+        if metadata:
+            base_meta.update({k: v for k, v in metadata.items() if k not in base_meta})
+
+        self._add_items([
+            IngestItem(
+                id=doc_id,
+                document=table_text,
+                embedding=vec,
+                metadata=base_meta,
+            )
+        ])
+
     async def add_documents(
         self,
         documents: List[str],
+        binary_payload: Optional[Dict[str, bytes]] = None,
         pbar: Optional[str] = "filling",
         pbar_title: str = "[@] Adding documents (multi-modal)",
         pbar_length: int = 20,
         pbar_spinner: str = "wait",
     ) -> None:
+        if not documents and not binary_payload:
+            return
+
+        # Handle binary payload first if provided
+        if binary_payload:
+            for modality, data in binary_payload.items():
+                suffix_map = {
+                    "image": ".png",
+                    "audio": ".wav",
+                    "video": ".mp4",
+                    "binary": ".bin",
+                    "table": ".txt",
+                    "pdf": ".pdf",
+                }
+                suffix = suffix_map.get(modality, ".bin")
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(data)
+                    p = Path(tmp.name)
+
+                try:
+                    if modality == "image":
+                        await self._ingest_image_file(p)
+                    elif modality == "audio":
+                        await self._ingest_audio_file(p)
+                    elif modality == "video":
+                        await self._ingest_video_file(p)
+                    elif modality == "table":
+                        text = data.decode("utf-8", errors="ignore")
+                        await self._ingest_table(text, metadata={"source": str(p), "uri": str(p)})
+                    else:
+                        await self._ingest_binary_file(p)
+                finally:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
         if not documents:
             return
 
@@ -806,6 +912,10 @@ class MultiModalVectorStore:
                 return await self._ingest_audio_file(p)
             if ext in self.video_extensions:
                 return await self._ingest_video_file(p)
+            if ext in self.table_extensions:
+                txt = await self._read_text_file(p)
+                await self._ingest_table(txt, metadata={"source": str(p), "uri": str(p)})
+                return
             return await self._ingest_binary_file(p)
 
         tasks = [ingest_one(p) for p in paths]
@@ -937,6 +1047,7 @@ class MultiModalVectorStore:
             "dense": 1.0,
             "bm25": 1.0,
             "vision": 0.7,
+            "table": 1.0,
         }
 
         ranked_lists: List[List[str]] = []
@@ -977,6 +1088,18 @@ class MultiModalVectorStore:
                 ranked_lists.append(vision_ids)
                 weights.append(channel_weights.get("vision", 0.7))
 
+        if hasattr(self, "table_collection"):
+            q_table = await asyncio.to_thread(self.embedder.embed_table, query)
+            table_res = self.table_collection.query(
+                query_embeddings=[q_table],
+                n_results=dense_k,
+                where=filter,
+            )
+            table_ids = table_res.get("ids", [])[0] if table_res and table_res.get("ids") else []
+            if table_ids:
+                ranked_lists.append(table_ids)
+                weights.append(channel_weights.get("table", 1.0))
+
         if self.use_rrf:
             fused_ids = rrf_fuse(
                 ranked_lists,
@@ -992,10 +1115,13 @@ class MultiModalVectorStore:
 
         text_ids = []
         vision_ids = []
+        table_ids = []
         for doc_id in fused_ids:
             space = self._classify_doc_id_space(doc_id)
             if space == "vision":
                 vision_ids.append(doc_id)
+            elif space == "table":
+                table_ids.append(doc_id)
             else:
                 text_ids.append(doc_id)
 
@@ -1022,6 +1148,23 @@ class MultiModalVectorStore:
                 got_vision.get("ids", []),
                 got_vision.get("documents", []),
                 got_vision.get("metadatas", []),
+            ):
+                candidates.append({
+                    "id": did,
+                    "document": doc,
+                    "source": meta.get("source"),
+                    "uri": meta.get("uri"),
+                    "modality": meta.get("modality"),
+                    "chunk_id": meta.get("chunk_id"),
+                    "metadata": meta,
+                })
+
+        if table_ids:
+            got_table = self.table_collection.get(ids=table_ids)
+            for did, doc, meta in zip(
+                got_table.get("ids", []),
+                got_table.get("documents", []),
+                got_table.get("metadatas", []),
             ):
                 candidates.append({
                     "id": did,
@@ -1100,9 +1243,10 @@ class MultiModalVectorStore:
     def get_stats(self) -> Dict[str, Any]:
         rt = self.text_collection.get()
         rv = self.vision_collection.get()
+        rtbl = self.table_collection.get()
 
-        ids = rt.get("ids", []) + rv.get("ids", [])
-        metas = rt.get("metadatas", []) + rv.get("metadatas", [])
+        ids = rt.get("ids", []) + rv.get("ids", []) + rtbl.get("ids", [])
+        metas = rt.get("metadatas", []) + rv.get("metadatas", []) + rtbl.get("metadatas", [])
 
         sources = set((m or {}).get("source", "unknown") for m in metas)
         modalities: Dict[str, int] = {}
@@ -1116,6 +1260,7 @@ class MultiModalVectorStore:
             "modalities": modalities,
             "collection_name_text": self.text_collection_name,
             "collection_name_vision": self.vision_collection_name,
+            "collection_name_table": self.table_collection_name,
             "persist_directory": self.persist_directory,
             "bm25_enabled": self.bm25 is not None,
             "reranker_enabled": self._reranker is not None,
@@ -1123,7 +1268,7 @@ class MultiModalVectorStore:
         }
 
     async def purge(self) -> None:
-        for cname in (self.text_collection_name, self.vision_collection_name):
+        for cname in (self.text_collection_name, self.vision_collection_name, self.table_collection_name):
             try:
                 self.client.delete_collection(name=cname)
             except Exception:
@@ -1135,6 +1280,10 @@ class MultiModalVectorStore:
         )
         self.vision_collection = self.client.get_or_create_collection(
             name=self.vision_collection_name,
+            metadata={"hnsw_space": "cosine"},
+        )
+        self.table_collection = self.client.get_or_create_collection(
+            name=self.table_collection_name,
             metadata={"hnsw_space": "cosine"},
         )
 
