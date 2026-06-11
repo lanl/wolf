@@ -11,8 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from framework.agentic.agentic_tools import NameGenerator
-from framework.knowledgebase.data_models import KnowledgeBaseParams
+from framework.knowledgebase.data_models import KnowledgeBaseParams, MultimodalKnowledgeBaseParams
 from framework.knowledgebase.knowledge_base import KnowledgeBase
+from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnowledgeBase
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams, base_universe_params_type
 from framework.tooling.toolbox import ToolBox
 from framework.tooling.tools import Tool, ToolCard
@@ -28,6 +29,7 @@ class BaseUniverse:
     - Tool discovery and execution
     - REST API factory with comprehensive endpoints
     - Support for both ToolCard and ToolMeta
+    - Support for both text-only and multimodal KnowledgeBases
     """
 
     # -----------------------------
@@ -36,7 +38,7 @@ class BaseUniverse:
     def __init__(self, params: BaseUniverseParams):
         self.params = params
         info, kbs, tbs = self.params.info, self.params.kbs, self.params.tbs
-        self.KBs: Dict[str, KnowledgeBase] = dict(kbs or {})
+        self.KBs: Dict[str, KnowledgeBase | MultimodalKnowledgeBase] = dict(kbs or {})
         self.TBs: Dict[str, ToolBox] = dict(tbs or {})
         self.info = info
         self.name = "NAMELESS"
@@ -112,13 +114,13 @@ class BaseUniverse:
     # -----------------------------
     # KB registry ops
     # -----------------------------
-    def add_kb(self, name: str, kb: KnowledgeBase) -> None:
+    def add_kb(self, name: str, kb: KnowledgeBase | MultimodalKnowledgeBase) -> None:
         self.KBs[name] = kb
 
     def remove_kb(self, name: str) -> bool:
         return self.KBs.pop(name, None) is not None
 
-    def get_kb(self, name: str) -> KnowledgeBase:
+    def get_kb(self, name: str) -> KnowledgeBase | MultimodalKnowledgeBase:
         kb = self.KBs.get(name)
         if not kb:
             raise KeyError(f"Unknown KB: {name}")
@@ -283,7 +285,9 @@ class BaseUniverse:
 # FastAPI models
 # --------------------
 class CreateKBRequest(BaseModel):
-     kb_params: KnowledgeBaseParams = Field(..., description=f"Parameters of the KB {KnowledgeBaseParams.model_fields}")
+    kb_params: KnowledgeBaseParams | MultimodalKnowledgeBaseParams = Field(..., description="Parameters of the KB")
+    type: str = Field("text", description="Type of KB: 'text' for text-only or 'multimodal' for multimodal KB")
+
 
 class CreateTBRequest(BaseModel):
     name: str
@@ -384,12 +388,28 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
 
     @app.post("/kbs")
     def create_kb(req: CreateKBRequest):
-        if req.kb_params.name in universe.KBs:
-            raise HTTPException(status_code=409, detail=f"KB {req.kb_params.name} already exists")
-        # Use the universe's db_client instead of expecting it in the request
-        kb = KnowledgeBase(req.kb_params, universe.db_client)
-        universe.add_kb(req.kb_params.name, kb)
-        return {"ok": True, "name": req.kb_params.name}
+        kb_type = req.type.lower()
+
+        if kb_type == "text":
+            if not isinstance(req.kb_params, KnowledgeBaseParams):
+                raise HTTPException(status_code=400, detail="For 'text' type, kb_params must be KnowledgeBaseParams")
+            if req.kb_params.name in universe.KBs:
+                raise HTTPException(status_code=409, detail=f"KB {req.kb_params.name} already exists")
+            kb = KnowledgeBase(req.kb_params, universe.db_client)
+            universe.add_kb(req.kb_params.name, kb)
+            return {"ok": True, "name": req.kb_params.name, "type": "text"}
+
+        elif kb_type == "multimodal":
+            if not isinstance(req.kb_params, MultimodalKnowledgeBaseParams):
+                raise HTTPException(status_code=400, detail="For 'multimodal' type, kb_params must be MultimodalKnowledgeBaseParams")
+            if req.kb_params.name in universe.KBs:
+                raise HTTPException(status_code=409, detail=f"KB {req.kb_params.name} already exists")
+            kb = MultimodalKnowledgeBase(req.kb_params, universe.db_client)
+            universe.add_kb(req.kb_params.name, kb)
+            return {"ok": True, "name": req.kb_params.name, "type": "multimodal"}
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid KB type: {req.type}. Must be 'text' or 'multimodal'")
 
     @app.delete("/kbs/{name}")
     def delete_kb(name: str):

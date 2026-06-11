@@ -264,6 +264,40 @@ class CreateUniverseAction(AgentAction):
         if actual_host is not None:
             infra.UNIVs[self.payload.name].info.host = actual_host
 
+        # **VERIFICATION STEP: Confirm the update was successful**
+        verification_attempts = 0
+        max_verification_attempts = 3
+        verification_successful = False
+
+        while verification_attempts < max_verification_attempts:
+            stored_port = infra.UNIVs[self.payload.name].info.port
+            stored_host = infra.UNIVs[self.payload.name].info.host
+
+            if stored_port == actual_port and stored_host == actual_host:
+                verification_successful = True
+                break
+
+            # If verification failed, wait a bit and try updating again
+            time.sleep(0.1)
+            if actual_port is not None:
+                infra.UNIVs[self.payload.name].info.port = actual_port
+            if actual_host is not None:
+                infra.UNIVs[self.payload.name].info.host = actual_host
+
+            verification_attempts += 1
+
+        if not verification_successful:
+            infra.append_chat_history(
+                actor="system",
+                content=(
+                    f"WARNING: Universe '{self.payload.name}' launched but port update verification failed. "
+                    f"Expected port: {actual_port}, Stored port: {infra.UNIVs[self.payload.name].info.port}. "
+                    f"Universe may not be accessible via universe_info/universe_health actions."
+                ),
+                action={"action": "create_universe"},
+                log_console=True,
+            )
+
         meta_data = {
             "type": "universe",
             "system": self.payload.system,
@@ -297,7 +331,8 @@ class CreateUniverseAction(AgentAction):
                 f"PID: {proc.pid}\n"
                 f"Host: {actual_host or 'unknown'}\n"
                 f"Port: {actual_port}\n"
-                f"URL: {actual_url or 'unknown'}"
+                f"URL: {actual_url or 'unknown'}\n"
+                f"Verification: {'successful' if verification_successful else 'FAILED'}"
             )
         else:
             msg = (
@@ -329,8 +364,26 @@ class CreateUniverseAction(AgentAction):
             if handle.actual_port is not None:
                 infra.UNIVs[self.payload.name].info.port = handle.actual_port
             
+            # **VERIFICATION STEP for remote deployment**
+            verification_attempts = 0
+            max_verification_attempts = 3
+            verification_successful = False
+
+            while verification_attempts < max_verification_attempts:
+                stored_port = infra.UNIVs[self.payload.name].info.port
+
+                if stored_port == handle.actual_port:
+                    verification_successful = True
+                    break
+
+                time.sleep(0.1)
+                if handle.actual_port is not None:
+                    infra.UNIVs[self.payload.name].info.port = handle.actual_port
+
+                verification_attempts += 1
+
             serializable = params.model_dump(mode="json") if hasattr(params, "model_dump") else params.dict()
-            
+
             meta_data = {
                 "type": "universe",
                 "system": self.payload.system,
@@ -343,7 +396,7 @@ class CreateUniverseAction(AgentAction):
                 "remote_work_dir": handle.remote_work_dir,
                 "actual_port": handle.actual_port,
             }
-            
+
             deployments[self.payload.name] = {
                 "handle": handle,
                 "params": serializable,
@@ -353,19 +406,22 @@ class CreateUniverseAction(AgentAction):
                 "stderr_file": handle.local_stderr_file,
                 "meta_data": meta_data,
             }
-            
+
+            msg = (
+                f"Universe '{self.payload.name}' remotely deployed to "
+                f"{handle.remote_user}@{handle.remote_host} "
+                f"(Remote PID {handle.remote_pid}, Port {handle.actual_port}) "
+                f"and registered.\n"
+                f"Verification: {'successful' if verification_successful else 'FAILED'}"
+            )
+
             infra.append_chat_history(
                 actor="system",
-                content=(
-                    f"Universe '{self.payload.name}' remotely deployed to "
-                    f"{handle.remote_user}@{handle.remote_host} "
-                    f"(Remote PID {handle.remote_pid}, Port {handle.actual_port}) "
-                    f"and registered."
-                ),
+                content=msg,
                 action={"action": "create_universe"},
                 log_console=True,
             )
-            
+
         except Exception as e:
             infra.append_chat_history(
                 actor="system",

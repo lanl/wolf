@@ -14,8 +14,9 @@ from framework.utils.tokenomics import (
 )
 
 from framework.data_store.data_models import BaseVectorStoreParams 
-from framework.knowledgebase.data_models import KnowledgeBaseParams
+from framework.knowledgebase.data_models import KnowledgeBaseParams, MultimodalKnowledgeBaseParams
 from framework.knowledgebase.knowledge_base import  KnowledgeBase
+from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnowledgeBase
 from framework.tooling.toolbox import ToolBox
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
 from framework.universes.base_universe import BaseUniverse
@@ -98,6 +99,12 @@ class BaseInfrastructure:
                 obj_type = "knowledgebase"
             elif isinstance(obj, KnowledgeBaseParams):
                 self.KBs[obj.name] = KnowledgeBase(obj)
+                obj_type = "knowledgebase"
+            elif isinstance(obj, MultimodalKnowledgeBase):
+                self.KBs[obj.name] = obj
+                obj_type = "knowledgebase"
+            elif isinstance(obj, MultimodalKnowledgeBaseParams):
+                self.KBs[obj.name] = MultimodalKnowledgeBase(obj, db_client=self.db_client)
                 obj_type = "knowledgebase"
             elif isinstance(obj, ToolBox):
                 self.TBs[obj.name] = obj

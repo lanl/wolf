@@ -4,8 +4,12 @@ import pathlib
 import asyncio
 import re
 import concurrent.futures
+import json
+import os
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Union
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Core imports
@@ -15,6 +19,51 @@ from chromadb.config import Settings
 from framework.data_store.data_models import MultimodalEmbeddingParams, MultimodalVectorStoreParams
 from framework.data_store.multimodal_vstore import MultimodalVectorStore
 from framework.knowledgebase.data_models import MultimodalKnowledgeBaseParams
+
+# ---------------------------------------------------------------------------
+# Inventory (SQLite) schema for multimodal KB
+# ---------------------------------------------------------------------------
+
+MULTIMODAL_INVENTORY_SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_path TEXT,
+    doc_type   TEXT,
+    modality   TEXT,    -- 'text', 'image', 'audio', 'video', 'table', 'binary'
+    v_ids_json TEXT,    -- JSON array of vector IDs associated with this source
+    n_chunks   INTEGER,
+    n_tokens   INTEGER,
+    added_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_documents_source_path ON documents(source_path);
+CREATE INDEX IF NOT EXISTS idx_documents_modality ON documents(modality);
+
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    v_id       TEXT,      -- vector id returned by the vstore
+    source_path TEXT,
+    modality   TEXT,      -- modality of this chunk
+    line_start INTEGER,   -- line number where chunk starts (for text)
+    line_end   INTEGER,   -- line number where chunk ends (for text)
+    position   INTEGER,   -- position/order within the source
+    n_tokens   INTEGER,
+    metadata_json TEXT,
+    added_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_v_id ON chunks(v_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_path);
+CREATE INDEX IF NOT EXISTS idx_chunks_modality ON chunks(modality);
+"""
+
+def _now_iso() -> str:
+    """Return current UTC timestamp in ISO format."""
+    dt = datetime.now(timezone.utc).replace(microsecond=0)
+    return dt.isoformat().replace("+00:00", "Z")
+
+def _count_tokens(text: str) -> int:
+    """Conservative token proxy (whitespace split)."""
+    return len(str(text).split())
 
 # ---------------------------------------------------------------------------
 # Types accepted by the public API
@@ -36,6 +85,8 @@ class MultimodalKnowledgeBase:
     All other helpers (``add_document``, ``add_documents``, ``add_texts``,
     ``delete_collection``, …) are kept for API compatibility and simply forward
     to the same store.
+
+    Includes SQLite inventory tracking similar to KnowledgeBase.
     """
 
     # ---------------------------------------------------------------------
@@ -89,6 +140,77 @@ class MultimodalKnowledgeBase:
         # Backward‑compatibility shim – expose the client for callers that may need direct access
         self.client = db_client
 
+        # Initialize inventory
+        inv_dir = params.persist_dir or "./chroma_db"
+        pathlib.Path(inv_dir).mkdir(parents=True, exist_ok=True)
+        self.inventory_path = os.path.join(inv_dir, f"{self.name}_inventory.sqlite")
+        self._init_inventory()
+
+    # --------------------------
+    # Inventory helpers
+    # --------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.inventory_path, isolation_level=None)
+
+    def _init_inventory(self) -> None:
+        with self._connect() as cx:
+            cx.executescript(MULTIMODAL_INVENTORY_SCHEMA)
+
+    def _record_document(self, source_path: str, doc_type: str, modality: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Record a document in the inventory after it's been added to the vector store."""
+        n_chunks = len(results)
+        n_tokens = sum(_count_tokens(str(r.get("document", ""))) for r in results)
+        v_ids = [r.get("id", f"{source_path}_chunk_{i}") for i, r in enumerate(results)]
+        added_at = _now_iso()
+
+        with self._connect() as cx:
+            cx.execute(
+                "INSERT INTO documents (source_path, doc_type, modality, v_ids_json, n_chunks, n_tokens, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (source_path, doc_type, modality, json.dumps(v_ids), n_chunks, n_tokens, added_at),
+            )
+            # Store chunk-level info
+            for i, result in enumerate(results):
+                meta = result.get("metadata", {})
+                v_id = result.get("id", f"{source_path}_chunk_{i}")
+                line_start = meta.get("line_start", 0)
+                line_end = meta.get("line_end", 0)
+                chunk_id = meta.get("chunk_id", i)
+                content = result.get("document", "")
+
+                cx.execute(
+                    "INSERT INTO chunks (v_id, source_path, modality, line_start, line_end, position, n_tokens, metadata_json, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (v_id, source_path, modality, line_start, line_end, chunk_id, _count_tokens(str(content)), json.dumps(meta), added_at),
+                )
+
+        return {"source_path": source_path, "doc_type": doc_type, "modality": modality, "n_chunks": n_chunks, "n_tokens": n_tokens, "v_ids": v_ids}
+
+    def inventory_stats(self) -> Dict[str, Any]:
+        """Get statistics about the knowledge base inventory."""
+        with self._connect() as cx:
+            cur = cx.execute("SELECT COUNT(*), COALESCE(SUM(n_chunks),0), COALESCE(SUM(n_tokens),0) FROM documents")
+            n_docs, n_chunks, n_tokens = cur.fetchone()
+
+            # Get modality breakdown
+            cur = cx.execute("SELECT modality, COUNT(*), COALESCE(SUM(n_chunks),0) FROM documents GROUP BY modality")
+            modality_stats = {row[0]: {"n_docs": row[1], "n_chunks": row[2]} for row in cur.fetchall()}
+
+        return {
+            "n_sources": int(n_docs),
+            "n_chunks": int(n_chunks),
+            "n_tokens": int(n_tokens),
+            "modalities": modality_stats
+        }
+
+    def list_sources(self) -> List[Dict[str, Any]]:
+        """List all sources in the knowledge base."""
+        with self._connect() as cx:
+            cur = cx.execute("SELECT source_path, doc_type, modality, n_chunks, n_tokens, added_at FROM documents ORDER BY added_at DESC")
+            return [
+                {"source_path": r[0], "doc_type": r[1], "modality": r[2], "n_chunks": r[3], "n_tokens": r[4], "added_at": r[5]}
+                for r in cur.fetchall()
+            ]
+
     # ---------------------------------------------------------------------
     # Async API required by the test suite
     # ---------------------------------------------------------------------
@@ -104,6 +226,12 @@ class MultimodalKnowledgeBase:
         straight to the multimodal store.
         """
         await self.store.add_text_docs(texts, doc_source=doc_source)
+
+        # Record in inventory
+        results = await self.store.query_hybrid(query=doc_source, k=len(texts) * 10)
+        filtered_results = [r for r in results if r.get("metadata", {}).get("source") == doc_source]
+        if filtered_results:
+            self._record_document(source_path=f"text://{doc_source}", doc_type="text", modality="text", results=filtered_results)
 
     async def query(
         self,
@@ -121,7 +249,7 @@ class MultimodalKnowledgeBase:
         """
         # ----- detect visual intent ------------------------------------------------
         visual_keywords = ["picture", "image", "photo", "diagram", "figure", "show", "display"]
-        is_visual = any(re.search(r"\\b" + kw + r"\\b", query, re.IGNORECASE) for kw in visual_keywords)
+        is_visual = any(re.search(r"\b" + kw + r"\b", query, re.IGNORECASE) for kw in visual_keywords)
 
         # Preserve original ``channel_weights`` handling.
         channel_weights: Optional[Dict[str, float]] = None
@@ -301,7 +429,14 @@ class MultimodalKnowledgeBase:
         """Return a dict ``{modality: count}`` summarising what is stored.
         Useful in tests to verify that each modality was ingested.
         """
-        return self.store.get_stats().get("modalities", {})
+        stats = self.inventory_stats()
+        return {k: v.get("n_chunks", 0) for k, v in stats.get("modalities", {}).items()}
 
     def get_stats(self) -> Dict[str, Any]:
-        return self.store.get_stats()
+        inventory_stats = self.inventory_stats()
+        vstore_stats = self.store.get_stats()
+        return {
+            **inventory_stats,
+            **vstore_stats,
+            "name": self.name
+        }
