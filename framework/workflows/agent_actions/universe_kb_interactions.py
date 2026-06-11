@@ -344,6 +344,64 @@ class UniverseKBAddURLsAction(AgentAction):
         return
 
 
+class KBAddDocumentArgs(BaseModel):
+    system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
+    universe: str = Field(description="Name of the universe you are interacting with")
+    kb_name: str = Field(description="Name of the knowledge base")
+    content: str = Field(description="Content of the document (text, base64-encoded data, or file path)")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata for the document")
+    modality: str = Field(default="text", description="Modality type: 'text', 'image', 'audio', 'video', 'table', 'binary'")
+
+
+class UniverseKBAddDocumentAction(AgentAction):
+    """Add a single document to a multimodal knowledge base."""
+    action: Literal["universe_kb_add_document"] = "universe_kb_add_document"
+    description: Literal["Add a single document to a multimodal knowledge base"] = "Add a single document to a multimodal knowledge base"
+    payload: KBAddDocumentArgs
+    payload_schema: str = """{
+                            "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+                            "universe": <string>: "Name of the universe you are interacting with",
+                            "kb_name": <string>,
+                            "content": <string>,
+                            "metadata": <dict> (optional),
+                            "modality": <string> (optional, default="text")}"""
+    yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
+
+    def execute(self, infra) -> Dict[str, Any]:
+        univ_name = self.payload.universe.strip()
+        try:
+            univ = infra.UNIVs[univ_name]
+        except Exception as info_err:
+            ctx_msg = (f"[ERROR] finding universe {univ_name}'s info:\n"
+                       f"  {info_err}")
+            infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
+            return
+        try:
+            univ_base_url = univ.get_base_url()
+            response = requests.post(
+                f"{univ_base_url}/kbs/{self.payload.kb_name}/add_document",
+                json={
+                    "content": self.payload.content,
+                    "metadata": self.payload.metadata,
+                    "modality": self.payload.modality
+                },
+                timeout=DEFAULT_TIMEOUT
+            )
+            response.raise_for_status()
+            result = response.json()
+        except requests.exceptions.Timeout:
+            result = {"error": "Request timed out", "action": self.action}
+        except requests.exceptions.RequestException as e:
+            result = {"error": f"Request failed: {str(e)}", "action": self.action}
+        except Exception as e:
+            result = {"error": str(e), "action": self.action}
+        ## Show results
+        ctx_msg = (f"[Universe: {univ_base_url}] Knowledgebase add document results:\n"
+                   f"{result}")
+        infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
+        return
+
+
 class KBStatsArgs(BaseModel):
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")

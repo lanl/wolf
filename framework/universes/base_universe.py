@@ -67,6 +67,7 @@ class BaseUniverse:
             "kb_upload_dir",
             "kb_add_url",
             "kb_add_urls",
+            "kb_add_document",
             "kb_stats",
             "kb_sources",
             "kb_purge",
@@ -183,6 +184,21 @@ class BaseUniverse:
     async def akb_add_urls(self, name: str, urls: Sequence[str]) -> Any:
         """Add multiple HTML documents from URLs (async)."""
         return await self.get_kb(name).aadd_url_docs(urls)
+
+    def kb_add_document(self, name: str, content: Any, metadata: Optional[Dict[str, Any]] = None, modality: str = "text") -> Any:
+        """Add a single document to a knowledge base (multimodal KB only)."""
+        kb = self.get_kb(name)
+        if not isinstance(kb, MultimodalKnowledgeBase):
+            raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
+        return kb.add_document(content, metadata=metadata, modality=modality)
+
+    async def akb_add_document(self, name: str, content: Any, metadata: Optional[Dict[str, Any]] = None, modality: str = "text") -> Any:
+        """Add a single document to a knowledge base (multimodal KB only) (async)."""
+        kb = self.get_kb(name)
+        if not isinstance(kb, MultimodalKnowledgeBase):
+            raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
+        # MultimodalKnowledgeBase.add_document is sync but uses _run_async_in_thread internally
+        return kb.add_document(content, metadata=metadata, modality=modality)
 
     def kb_stats(self, name: str) -> Dict[str, int]:
         return self.get_kb(name).get_stats()
@@ -320,6 +336,12 @@ class AddURLRequest(BaseModel):
 
 class AddURLsRequest(BaseModel):
     urls: List[str]
+
+
+class AddDocumentRequest(BaseModel):
+    content: str = Field(..., description="Content of the document (text, base64-encoded data, or file path)")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata for the document")
+    modality: str = Field("text", description="Modality type: 'text', 'image', 'audio', 'video', 'table', 'binary'")
 
 
 class ExecuteRequest(BaseModel):
@@ -504,6 +526,47 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
             return await universe.akb_add_urls(name, req.urls)
         except KeyError:
             raise HTTPException(status_code=404, detail="KB not found")
+
+    @app.post("/kbs/{name}/add_document")
+    async def kb_add_document(name: str, req: AddDocumentRequest):
+        """Add a single document to a multimodal knowledge base."""
+        try:
+            # Convert content based on modality
+            if req.modality == "text":
+                content = req.content
+            else:
+                # For non-text modalities, assume content is a file path or base64 data
+                # Try as file path first
+                if os.path.exists(req.content):
+                    content = Path(req.content)
+                else:
+                    # Assume it's base64-encoded bytes
+                    import base64
+                    try:
+                        content = base64.b64decode(req.content)
+                    except Exception:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"For modality '{req.modality}', content must be a valid file path or base64-encoded data"
+                        )
+
+            result = await universe.akb_add_document(name, content, metadata=req.metadata, modality=req.modality)
+            return {
+                "ok": True,
+                "kb_name": name,
+                "modality": req.modality,
+                "result": result,
+                "message": f"Successfully added {req.modality} document to KB '{name}'"
+            }
+        except KeyError:
+            raise HTTPException(status_code=404, detail="KB not found")
+        except TypeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error adding document to KB '{name}': {str(e)}"
+            )
 
     @app.post("/kbs/{name}/purge")
     async def kb_purge(name: str):
