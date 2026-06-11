@@ -208,6 +208,11 @@ class MultimodalKnowledgeBase:
         # ----- All other modalities (table, image, audio, video, binary) ------
         if isinstance(content, pathlib.Path):
             data = content.read_bytes()
+            # Extract the filename for metadata
+            if metadata is None:
+                metadata = {}
+            if "source_file" not in metadata:
+                metadata["source_file"] = content.name
         elif isinstance(content, bytes):
             data = content
         elif isinstance(content, str):
@@ -219,6 +224,8 @@ class MultimodalKnowledgeBase:
             )
 
         payload = {modality: data}
+        if metadata:
+            payload["metadata"] = metadata
         self._logger.info("Adding %s document via store.add_documents", modality)
         coro = self.store.add_documents([], binary_payload=payload)
         self._run_async_in_thread(coro)

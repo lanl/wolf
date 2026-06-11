@@ -679,9 +679,12 @@ class MultimodalVectorStore:
 
         self._add_items(items)
 
-    async def _ingest_image_file(self, p: Path) -> None:
+    async def _ingest_image_file(self, p: Path, extra_metadata: Optional[Dict[str, Any]] = None) -> None:
         caption = await asyncio.to_thread(self.embedder.caption_image, str(p))
-        proxy = caption.strip() if caption.strip() else f"[image] {p.name}"
+
+        # Use source_file from extra_metadata if available, otherwise fall back to p.name
+        image_name = extra_metadata.get('source_file', p.name) if extra_metadata else p.name
+        proxy = caption.strip() if caption.strip() else f"[image] {image_name}"
 
         img_vec = (await asyncio.to_thread(self.embedder.embed_images, [str(p)]))[0]
         doc_id = f"{str(p)}::image::0"
@@ -695,6 +698,8 @@ class MultimodalVectorStore:
             "caption": caption,
             "sha256": await asyncio.to_thread(sha256_file, p),
         }
+        if extra_metadata:
+            meta.update(extra_metadata)
         self._add_items([
             IngestItem(id=doc_id, document=proxy, embedding=img_vec, metadata=meta)
         ])
@@ -833,7 +838,7 @@ class MultimodalVectorStore:
     async def add_documents(
         self,
         documents: List[str],
-        binary_payload: Optional[Dict[str, bytes]] = None,
+        binary_payload: Optional[Dict[str, Any]] = None,
         pbar: Optional[str] = "filling",
         pbar_title: str = "[@] Adding documents (multi-modal)",
         pbar_length: int = 20,
@@ -844,6 +849,9 @@ class MultimodalVectorStore:
 
         # Handle binary payload first if provided
         if binary_payload:
+            # Extract metadata if present
+            extra_metadata = binary_payload.pop("metadata", None)
+
             for modality, data in binary_payload.items():
                 suffix_map = {
                     "image": ".png",
@@ -861,14 +869,17 @@ class MultimodalVectorStore:
 
                 try:
                     if modality == "image":
-                        await self._ingest_image_file(p)
+                        await self._ingest_image_file(p, extra_metadata=extra_metadata)
                     elif modality == "audio":
                         await self._ingest_audio_file(p)
                     elif modality == "video":
                         await self._ingest_video_file(p)
                     elif modality == "table":
                         text = data.decode("utf-8", errors="ignore")
-                        await self._ingest_table(text, metadata={"source": str(p), "uri": str(p)})
+                        table_meta = {"source": str(p), "uri": str(p)}
+                        if extra_metadata:
+                            table_meta.update(extra_metadata)
+                        await self._ingest_table(text, metadata=table_meta)
                     else:
                         await self._ingest_binary_file(p)
                 finally:

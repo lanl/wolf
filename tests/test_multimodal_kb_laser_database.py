@@ -49,7 +49,7 @@ def extract_images_from_pdf(pdf_path: Path, out_dir: Path) -> list[dict]:
             img_path = out_dir / img_name
             pix.save(str(img_path))
             pix = None
-            manifest.append({"page": page_num + 1, "image_path": str(img_path)})
+            manifest.append({"page": page_num + 1, "image_path": str(img_path), "image_name": img_name})
             print(f"Saved image {img_name} → {img_path}")
     return manifest
 
@@ -164,11 +164,6 @@ async def main():
         # -----------------------------------------------------------------
         # Create ChromaDB client
         # -----------------------------------------------------------------
-        #chroma_client = chromadb.Client(Settings(
-        #    chroma_db_impl="duckdb+parquet",
-        #    persist_directory=str(persist_dir)
-        #))
-        #chroma_client = chromadb.PersistentClient(path=str(persist_dir))
         chroma_client = chromadb.Client(Settings(persist_directory=str(persist_dir), anonymized_telemetry=False))
 
         # -----------------------------------------------------------------
@@ -200,10 +195,16 @@ async def main():
         # -----------------------------------------------------------------
         # Ingest images
         # -----------------------------------------------------------------
-        print("Ingesting extracted images as image modality")
+        print("Ingesting extracted images as image modality with metadata")
         for entry in image_manifest:
             img_path = Path(entry["image_path"]).resolve()
-            kb.add_document(img_path, modality="image")
+            meta = {
+                "source_pdf": str(pdf_path),
+                "page": entry["page"],
+                "source_file": entry["image_name"],
+                "embedding_space": "vision",
+            }
+            kb.add_document(img_path, modality="image", metadata=meta)
 
         # -----------------------------------------------------------------
         # Ingest tables
@@ -248,7 +249,8 @@ async def main():
                 meta = hit.get("metadata", {})
                 modality = meta.get("modality", "unknown")
                 page = meta.get("page") or meta.get("line_start") or "?"
-                print(f"{status} [{modality.upper():5}] (page {page}): {snippet[:200]}…")
+                source_file = meta.get("source_file", "unknown")
+                print(f"{status} [{modality.upper():5}] (page {page}, file: {source_file}): {snippet[:200]}…")
 
             if not any(hit_matches):
                 failures.append({"index": idx, "question": question, "expected": expected, "results": results})
