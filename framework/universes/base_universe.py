@@ -533,7 +533,13 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
         try:
             # Convert content based on modality
             if req.modality == "text":
-                content = req.content
+                # Check if content is a file path - if so, convert to Path object
+                # so that MultimodalKnowledgeBase.add_document can detect PDFs
+                if os.path.exists(req.content):
+                    content = Path(req.content)
+                else:
+                    # Raw text content
+                    content = req.content
             else:
                 # For non-text modalities, assume content is a file path or base64 data
                 # Try as file path first
