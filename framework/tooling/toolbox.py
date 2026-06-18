@@ -9,7 +9,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from rich.console import Console
 
+import chromadb
 from framework.knowledgebase.knowledge_base import KnowledgeBase, IngestResult
+from framework.knowledgebase.data_models import KnowledgeBaseParams
 from framework.tooling.tools import Tool, ToolCard
 from framework.tooling.tool_models import ToolMeta
 
@@ -38,13 +40,14 @@ class ToolBox:
     - Support for both ToolCard and ToolMeta
     """
 
-    def __init__(self, params: Dict[str, Any] | ToolBoxParams):
+    def __init__(self, params: Dict[str, Any] | ToolBoxParams, db_client: chromadb.Client):
         if isinstance(params, dict):
             params = ToolBoxParams(**params)
 
         self.name = params.name
         self.vrbz = int(params.vrbz)
         self.registry_path = params.registry_path
+        self.db_client = db_client
 
         vstore_params = {
             "collection_name": f"{self.name}_index",
@@ -57,7 +60,8 @@ class ToolBox:
             "inventory_path": params.inventory_path or os.path.join(params.index_persist_dir, f"{self.name}_inventory.sqlite"),
             "vrbz": self.vrbz,
         }
-        self.index = KnowledgeBase(kb_params)
+        # Convert dict to KnowledgeBaseParams before passing to KnowledgeBase
+        self.index = KnowledgeBase(KnowledgeBaseParams(**kb_params), self.db_client)
 
         # Bidirectional registry
         self.tool_id: Dict[str, str] = {}  # name -> vector_id

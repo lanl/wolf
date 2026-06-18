@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 import requests
@@ -11,12 +12,12 @@ DEFAULT_TIMEOUT = 30
 # ---------------------------
 # Create ToolBox Action
 # ---------------------------
-from framework.tooling.toolbox import ToolBox
+from framework.tooling.toolbox import ToolBox, ToolBoxParams
 
 class CreateToolBoxArgs(BaseModel):
     system: str = Field(description="System where the toolbox will be created, e.g., 'local'")
     name: str = Field(description="Name for the new ToolBox")
-    params: dict = Field(default_factory=dict, description="Optional dict of parameters for ToolBox constructor")
+    tb_params: ToolBoxParams = Field(default_factory=ToolBoxParams, description="Structured ToolBox parameters")
 
 class CreateToolBoxAction(AgentAction):
     """Create a ToolBox instance and register it in ``infra.managed_deployments``.
@@ -26,15 +27,15 @@ class CreateToolBoxAction(AgentAction):
     action: Literal["create_toolbox"] = "create_toolbox"
     description: Literal["Create and register a ToolBox"] = "Create and register a ToolBox"
     payload: CreateToolBoxArgs
-    payload_schema: str = "{\n    \"system\": \"string\",\n    \"name\": \"string\",\n    \"params\": \"optional dict of ToolBox init args\"\n}"
+    payload_schema: str = f"{CreateToolBoxArgs.model_fields}"
 
     def execute(self, infra) -> None:
-        # Instantiate ToolBox with given params (if any)
-        tb = ToolBox(**self.payload.params)
+        # Instantiate ToolBox with given params and db_client
+        tb = ToolBox(self.payload.tb_params, infra.db_client)
         # Store in managed_deployments
         infra.managed_deployments[self.payload.name] = {
             "handle": tb,
-            "params": self.payload.params,
+            "params": self.payload.tb_params.model_dump() if hasattr(self.payload.tb_params, 'model_dump') else self.payload.tb_params.__dict__,
             "meta_data": {
                 "type": "toolbox",
                 "status": "ready",
@@ -67,11 +68,11 @@ class UniverseTBSearchToolsAction(AgentAction):
     action: Literal["universe_tb_search_tools"] = "universe_tb_search_tools"
     description: Literal["Search for tools in a toolbox based on query"] = "Search for tools in a toolbox based on query"
     payload: TBSearchArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+    payload_schema: str = """{{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
                               "tb_name": <string>, 
                               "query": <string>, 
-                              "k": <int> (optional, default=5)}"""
+                              "k": <int> (optional, default=5)}}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -128,7 +129,7 @@ class UniverseTBExecuteAction(AgentAction):
     action: Literal["universe_tb_execute"] = "universe_tb_execute"
     description: Literal["Execute a tool in a toolbox with specified parameters"] = "Execute a tool in a toolbox with specified parameters"
     payload: TBExecuteArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+    payload_schema: str = """{{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
                               "tb_name": <string>, 
                               "tool_name": <string>, 
@@ -139,7 +140,7 @@ class UniverseTBExecuteAction(AgentAction):
                               "cwd": <string> (optional), 
                               "timeout": <float> (optional), 
                               "input_data": <string> (optional), 
-                              "text": <bool> (optional, default=True)}"""
+                              "text": <bool> (optional, default=True)}}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -191,10 +192,10 @@ class UniverseTBToolInfoAction(AgentAction):
     action: Literal["universe_tb_tool_info"] = "universe_tb_tool_info"
     description: Literal["Get detailed information about a specific tool in a toolbox"] = "Get detailed information about a specific tool in a toolbox"
     payload: TBToolInfoArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+    payload_schema: str = """{{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
                               "tb_name": <string>, 
-                              "tool_name": <string>}"""
+                              "tool_name": <string>}}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -239,9 +240,9 @@ class UniverseTBListToolsAction(AgentAction):
     action: Literal["universe_tb_list_tools"] = "universe_tb_list_tools"
     description: Literal["List all tools available in a toolbox"] = "List all tools available in a toolbox"
     payload: TBListToolsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+    payload_schema: str = """{{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
-                              "tb_name": <string>}"""
+                              "tb_name": <string>}}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -292,7 +293,7 @@ class UniverseTBSearchDocsAction(AgentAction):
     action: Literal["universe_tb_search_docs"] = "universe_tb_search_docs"
     description: Literal["Search documentation for a specific tool"] = "Search documentation for a specific tool"
     payload: TBSearchDocsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+    payload_schema: str = """{{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with", 
                               "tb_name": <string>, 
                               "tool_name": <string>, 
@@ -339,9 +340,9 @@ class UniverseTBStatsAction(AgentAction):
     action: Literal["universe_tb_stats"] = "universe_tb_stats"
     description: Literal["Get statistics for a toolbox"] = "Get statistics for a toolbox"
     payload: TBListToolsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+    payload_schema: str = """{{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
-                              "tb_name": <string>}"""
+                              "tb_name": <string>}}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
@@ -391,12 +392,12 @@ class UniverseTBAppendDocsAction(AgentAction):
     action: Literal["universe_tb_append_docs"] = "universe_tb_append_docs"
     description: Literal["Append documentation texts to a specific tool"] = "Append documentation texts to a specific tool"
     payload: TBAppendDocsArgs
-    payload_schema: str = """{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
+    payload_schema: str = """{{"system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
                               "tb_name": <string>, 
                               "tool_name": <string>, 
                               "texts": <list[string]>, 
-                              "doc_source": <string> (optional, default="agent")}"""
+                              "doc_source": <string> (optional, default="agent")}}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
