@@ -5,13 +5,14 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from rich.console import Console
 
 import chromadb
 from framework.knowledgebase.knowledge_base import KnowledgeBase, IngestResult
-from framework.knowledgebase.data_models import KnowledgeBaseParams
+from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnowledgeBase
+from framework.knowledgebase.data_models import KnowledgeBaseParams, MultimodalKnowledgeBaseParams
 from framework.tooling.tools import Tool, ToolCard
 from framework.tooling.tool_models import ToolMeta
 
@@ -26,6 +27,7 @@ class ToolBoxParams:
     inventory_path: Optional[str] = None
     vrbz: int = 0
     registry_path: Optional[str] = None  # JSON file to persist registries
+    use_multimodal: bool = False  # Enable multimodal KB support
 
 
 class ToolBox:
@@ -34,10 +36,11 @@ class ToolBox:
     Enhanced features:
     - Persistent tool registry (tool_id <-> tool_name mapping)
     - Full async support for all operations
-    - Tool documentation management
+    - Tool documentation management (text and multimodal)
     - Tool execution (sync and async)
     - Semantic tool search
     - Support for both ToolCard and ToolMeta
+    - Multimodal KB support for rich tool documentation
     """
 
     def __init__(self, params: Dict[str, Any] | ToolBoxParams, db_client: chromadb.Client):
@@ -48,20 +51,35 @@ class ToolBox:
         self.vrbz = int(params.vrbz)
         self.registry_path = params.registry_path
         self.db_client = db_client
+        self.use_multimodal = params.use_multimodal
 
-        vstore_params = {
-            "collection_name": f"{self.name}_index",
-            "persist_directory": params.index_persist_dir,
-            "embedding_model": params.embedding_model,
-        }
-        kb_params = {
-            "name": f"{self.name}_kb",
-            "vstore_params": vstore_params,
-            "inventory_path": params.inventory_path or os.path.join(params.index_persist_dir, f"{self.name}_inventory.sqlite"),
-            "vrbz": self.vrbz,
-        }
-        # Convert dict to KnowledgeBaseParams before passing to KnowledgeBase
-        self.index = KnowledgeBase(KnowledgeBaseParams(**kb_params), self.db_client)
+        # Initialize KB (text or multimodal based on configuration)
+        if self.use_multimodal:
+            kb_params = MultimodalKnowledgeBaseParams(
+                name=f"{self.name}_kb",
+                persist_dir=params.index_persist_dir,
+                embedding={
+                    "model_name": params.embedding_model,
+                    "modalities": ["text", "image", "audio", "video", "table"]
+                },
+                chunk_size=500,
+                chunk_overlap=50,
+                vrbz=self.vrbz
+            )
+            self.index = MultimodalKnowledgeBase(kb_params, self.db_client)
+        else:
+            vstore_params = {
+                "collection_name": f"{self.name}_index",
+                "persist_directory": params.index_persist_dir,
+                "embedding_model": params.embedding_model,
+            }
+            kb_params = {
+                "name": f"{self.name}_kb",
+                "vstore_params": vstore_params,
+                "inventory_path": params.inventory_path or os.path.join(params.index_persist_dir, f"{self.name}_inventory.sqlite"),
+                "vrbz": self.vrbz,
+            }
+            self.index = KnowledgeBase(KnowledgeBaseParams(**kb_params), self.db_client)
 
         # Bidirectional registry
         self.tool_id: Dict[str, str] = {}  # name -> vector_id
@@ -185,7 +203,13 @@ class ToolBox:
         t = self.tools.get(name)
         if not t:
             return None
-        return t.info()
+        info = t.info()
+        
+        # Add modality information if using multimodal KB
+        if self.use_multimodal and hasattr(t.index, 'list_modalities'):
+            info['modalities'] = t.index.list_modalities()
+        
+        return info
 
     def list_tools(self) -> List[str]:
         """List all tool names in the toolbox."""
@@ -277,10 +301,7 @@ class ToolBox:
         extensions: Optional[List[str]] = None,
         kb_persist_dir: Optional[str] = None
     ) -> List[Tuple[str, str]]:
-        """
-        Walk a directory and auto-discover tools from matching files.
-        Creates ToolMeta and Tool objects for each discovered file.
-        """
+        """Walk a directory and auto-discover tools from matching files."""
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(path)
@@ -343,9 +364,16 @@ class ToolBox:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get toolbox statistics."""
-        return {
+        stats = {
             "name": self.name,
             "num_tools": len(self.tools),
             "tool_names": list(self.tools.keys()),
             "index_stats": self.index.get_stats(),
+            "multimodal_enabled": self.use_multimodal
         }
+        
+        # Add modality breakdown for multimodal toolboxes
+        if self.use_multimodal and hasattr(self.index, 'list_modalities'):
+            stats["modalities"] = self.index.list_modalities()
+        
+        return stats
