@@ -1,22 +1,29 @@
-from typing import  Literal, Optional, List
-from pydantic import Field
-
+from typing import Literal, Optional, List
+from pydantic import Field, SecretStr
 from config.llm.base_provider import Base_LLM_Provider
 
-ollama_known_endpoints = {"chat/completions":["chat_completions","streaming", "json", "reproducible_outputs", "vision", 'tools'], 
+ollama_known_endpoints = {"chat/completions":["chat_completions","streaming", "json", "reproducible_outputs", "vision", 'tools'],
                           "completions":["completions","streaming", "json", "reproducible_outputs"],
                           "models":[],
                           "embeddings":[],
                           "images/generations":[],
                           "responses":[]
                           }
-class Ollama_LLM_Provider(Base_LLM_Provider):
+ollama_endpoints = list(ollama_known_endpoints.keys())
+
+# --- Ollama ---
+# Ollama is OpenAI-compatible BUT also has its own native API.
+class Ollama_LLM_Provider(Base_LLM_Provider[List[str]]):
     name: Literal["ollama"] = "ollama"
-    description: Literal["Ollama LLM inference provider"] = "Ollama LLM inference provider"
-    port: Optional[int] = Field(default=11434, description="port of the inference endpoint")
-    api_version: Optional[str] = Field(default='v1', description="version of the api endpoint")
-    endpoints: Optional[List[dict]] = Field(default=ollama_known_endpoints, description="""Supported API endpoints i.e 
-                                                                                           'chat/completions':['chat_completions','streaming', 
-                                                                                           'json','vision', 'tools'][]
-                                                                                        """
-                                            )
+    description: str = "Ollama Local LLM Runner"
+    host: str = "localhost"
+    port: Optional[int] = Field(default=11434)
+    api_key: Optional[SecretStr] = Field(default=SecretStr("ollama"))
+    # We include the native ollama endpoints as well as the compatible ones
+    endpoints: List[str] = Field(
+        default_factory=lambda: ollama_endpoints,
+        description="Includes both native Ollama and OpenAI-compatible endpoints"
+    )
+
+    def get_client(self):
+        return f"OllamaClient(url=http://{self.host}:{self.port})"

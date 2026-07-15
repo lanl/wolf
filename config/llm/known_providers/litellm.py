@@ -1,10 +1,10 @@
 from typing import Literal, Optional, List, Dict
 from pydantic import Field
-
 from config.llm.base_provider import Base_LLM_Provider
 
-litellm_known_endpoints = {
-    "chat/completions": [],
+# Defined as a constant to keep the class definition clean
+LITELLM_KNOWN_ENDPOINTS: Dict[str, List[str]] = {
+    "chat/completions": ["chat_completions", "streaming", "json", "vision", "tools"],
     "completions": [],
     "converse": [],
     "responses": [],
@@ -52,11 +52,26 @@ litellm_known_endpoints = {
     "skills": []
 }
 
-class LiteLLM_LLM_Provider(Base_LLM_Provider):
+class LiteLLM_LLM_Provider(Base_LLM_Provider[Dict[str, List[str]]]):
+    """LiteLLM LLM inference provider implementation."""
+    
     name: Literal["litellm"] = "litellm"
-    description: Literal["LiteLLM LLM inference provider"] = "LiteLLM LLM inference provider"
+    description: str = "LiteLLM LLM inference provider"
     port: Optional[int] = Field(default=4000, description="port of the inference endpoint")
-    endpoints: Optional[Dict[str, List[str]]] = Field(
-        default=litellm_known_endpoints,
-        description="""Supported API endpoints i.e 'chat/completions':['chat_completions','streaming','json','vision','tools']"""
+    
+    # We use default_factory to ensure each instance gets its own copy of the dict
+    endpoints: Dict[str, List[str]] = Field(
+        default_factory=lambda: LITELLM_KNOWN_ENDPOINTS,
+        description="Supported API endpoints and their specific attributes"
     )
+
+    def get_client(self):
+        """
+        Implementation of the client initialization for LiteLLM.
+        """
+        # Example implementation logic:
+        # import litellm
+        # litellm.api_base = f"http://{self.host}:{self.port}"
+        # return litellm
+        print(f"Connecting to LiteLLM at {self.host}:{self.port}...")
+        return f"LiteLLMClient({self.host})"

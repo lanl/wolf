@@ -1,9 +1,9 @@
-from typing import  Literal, Optional, List, Dict
-from pydantic import Field
-
+from typing import Literal, Optional, List
+from pydantic import Field, SecretStr
 from config.llm.base_provider import Base_LLM_Provider
 
-vllm_known_endpoints = {"chat/completions":[], 
+
+vllm_known_endpoints = {"chat/completions":[],
                           "completions":[],
                           "responses":[],
                           "models":[],
@@ -21,14 +21,18 @@ vllm_known_endpoints = {"chat/completions":[],
                           "v1/rerank":[],
                           "v2/rerank":[]
                           }
-class VLLM_LLM_Provider(Base_LLM_Provider):
+vllm_endpoints = list(vllm_known_endpoints.keys())
+
+# --- vLLM ---
+# vLLM is strictly OpenAI-compatible.
+class vLLM_LLM_Provider(Base_LLM_Provider[List[str]]):
     name: Literal["vllm"] = "vllm"
-    description: Literal["VLLM LLM inference provider"] = "VLLM LLM inference provider"
-    port: Optional[int] = Field(default=8000, description="port of the inference endpoint")
-    api_version: Optional[str] = Field(default='v1', description="version of the api endpoint")
-    endpoints: Optional[Dict[str, List[str]]] = Field(
-        default=vllm_known_endpoints,
-        description="""Supported API endpoints i.e '
-                    chat/completions':['chat_completions','streaming','json','vision','tools']
-                    """
-                    )
+    description: str = "vLLM High-throughput inference engine"
+    host: str = "localhost"
+    port: Optional[int] = Field(default=8000)
+    api_key: Optional[SecretStr] = Field(default=SecretStr("token-not-required"))
+    endpoints: List[str] = Field(default_factory=lambda: vllm_endpoints)
+
+    def get_client(self):
+        return f"vLLMClient(url=http://{self.host}:{self.port}/v1)"
+

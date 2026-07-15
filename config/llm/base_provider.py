@@ -1,15 +1,38 @@
-from pydantic import BaseModel, Field
-from framework.utils.io_tools import clone_dict
-from typing import List, Type, NewType, Union, Literal, Optional
+from pydantic import BaseModel, Field, SecretStr
+from typing import List, Optional, Generic, TypeVar
+from abc import ABC, abstractmethod
 
-class Base_LLM_Provider(BaseModel):
-    """Base class for every LLM inference provider.
+# This TypeVar allows subclasses to define their own structure for 'endpoints'
+# (e.g., some might use a List[str], others a Dict[str, List[str]])
+T_Endpoints = TypeVar("T_Endpoints")
+
+class Base_LLM_Provider(BaseModel, Generic[T_Endpoints], ABC):
+    """
+    Base class for every LLM inference provider.
+    Inherits from ABC to ensure it cannot be instantiated directly.
     """
     name: str = Field(..., description="Discriminator for the different providers")
     host: str = Field(default='localhost', description="address of the inference endpoint")
     port: Optional[int] = Field(default=None, description="port of the inference endpoint")
-    api_key: Optional[str] = Field(default=None, description="API key to make inference with")
+    
+    # SecretStr prevents the API key from being printed in plain text in logs/console
+    api_key_var: Optional[str] = Field(
+        default=None, 
+        description="ENVIRONMENT VARIABLE name holding the API key"
+    )
+    api_key: Optional[SecretStr] = Field(
+        default=None, 
+        description="Actual API key"
+    )
+    
     api_version: Optional[str] = Field(default=None, description="version of the api endpoint")
-    endpoints: Optional[List[str]] = Field(default=[], description="['different','endpoint']")
+    endpoints: T_Endpoints
+    capabilities: List[str] = Field(default_factory=list, description="List of capabilities (e.g. 'vision', 'tools')")
 
-base_llm_provider_type = NewType('base_llm_provider_type', Type[Base_LLM_Provider])
+    @abstractmethod
+    def get_client(self) -> any:
+        """
+        Abstract method to initialize and return the provider's client.
+        Must be implemented by all subclasses.
+        """
+        pass
