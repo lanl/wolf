@@ -8,14 +8,12 @@ import glob
 
 from framework.utils.io_tools import console, jsonfy, save_pickle_file, load_pickle_file
 from framework.utils.json_parsing import robust_jsonfy
-from framework.utils.tokenomics import num_tokens_from_string
 # Import the updated workflow models that provide action‑subset capability
 from framework.workflows.workflow_models import (
     Actions as FullActions,
     SCHEMA_STRING as FULL_SCHEMA_STRING,
     AGENT_ROLE_PROMPT as FULL_AGENT_ROLE_PROMPT,
     get_actions_subset,
-    ACTION_SPACE_PROMPT, ACTIONS, ACTION_NAMES,
 )
 from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
@@ -60,14 +58,14 @@ class BaseWorkflow:
                  wf_agent_behaviour_file: str|None   ="config/preferences/behaviour/workflow/basewf.md",
                  wf_agent_sys_prompt_file: str|None  ="config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md",
                  wf_user:str                         = "user",
-                 wf_turn                             = None,
-                 WF_TAG                              = "BaseWorkflow",
-                 WF_VERBOSE: int                     = 0
+                 wf_turn                             = None
                  ):
-        self.WF_TAG = WF_TAG
-        self.WF_VERBOSE = WF_VERBOSE
-        if session is None: # Starting a completely new session
-            console.print(f"[+] STARTING NEW SESSION")
+        self.WF_TAG = "BaseWorkflow"
+        
+        # Determine if we're starting new or resuming
+        if session is None:
+            # Starting a completely new session
+            print(f"[+] STARTING NEW SESSION")
             self.session = BaseSession(
                 infra = infra,
                 actions_union = actions_union,
@@ -81,11 +79,19 @@ class BaseWorkflow:
                 full_schema_string = FULL_SCHEMA_STRING,
                 WF_RULES = ""
             )
-        else:
+            self.load_session_state()
+        elif isinstance(session, str):
+            # Resuming from a session identifier (path, date, keyword, etc.)
+            print(f"[+] RESUMING SESSION FROM: {session}")
+            session_path = self._resolve_session_path(session)
+            self._load_session_snapshot(session_path)
+        elif isinstance(session, BaseSession):
+            # Using a provided BaseSession object
+            print(f"[+] RESUMING SESSION FROM BaseSession OBJECT")
             self.session = session
-        # Load Session
-        self.load_session_state()
-        print(f"[+][{self.WF_TAG}]: Session Loaded OK")
+            self.load_session_state()
+        else:
+            raise Exception(f"[!][ERROR] Invalid session type: {type(session)}. Expected BaseSession, str, or None")
 
     # -----------------------------------------------------------------
     # Session state management (NEW IMPLEMENTATION)
@@ -255,6 +261,19 @@ class BaseWorkflow:
         
         Creates a session.snapshot.json file in the session directory.
         """
+        #try:
+        #    snapshot = self.create_session_snapshot()
+        #    snapshot_path = f"{self.session.infra.chat_manager.session_dir}/session.snapshot.json"
+        #    
+        #    with open(snapshot_path, 'w') as f:
+        #        json.dump(snapshot, f, indent=2)
+        #    
+        #    console.print(f"[green]Session snapshot saved to {snapshot_path}[/green]")
+        #    
+        #except Exception as e:
+        #    console.print(f"[red]Failed to save session snapshot: {e}[/red]")
+        #    self.console_log(f"[ERROR] Failed to save session snapshot: {e}")
+
         snapshot = self.create_session_snapshot()
         snapshot_path = f"{self.session.infra.chat_manager.session_dir}/session.snapshot.json"
         
@@ -288,23 +307,11 @@ class BaseWorkflow:
         """
         if session is None: 
             session = self.session
-        elif isinstance(session, str):
-            self.session = session
-        elif isinstance(session, BaseSession):
-            console.print(f"[+] RESUMING SESSION FROM BaseSession OBJECT")
-            self.session = session
-
-        else:
-            raise Exception(f"[!][ERROR] Invalid session type: {type(session)}. Expected BaseSession, str, or None")
         
-        if isinstance(self.session, str):
-            # Resuming from a session identifier (path, date, keyword, etc.)
-            console.print(f"[+] RESUMING SESSION FROM: {session}")
-            session_path = self._resolve_session_path(session)
-            self._load_session_snapshot(session_path)
-            return
-            
-
+        if not isinstance(session, BaseSession):
+            raise Exception(f"[!][ERROR] Invalid session type: {type(session)}. Expected BaseSession")
+        
+        self.session = session
         infra = self.session.infra
         
         # Extract infrastructure components
@@ -320,6 +327,7 @@ class BaseWorkflow:
         self.memory_manager = infra.memory_manager
         self.context_manager = infra.context_manager
         self.chat_block_divider = infra.chat_block_divider
+        self.log = infra.log
         
         # Workflow‑specific state
         self.WF_USER = self.session.WORKFLOW_USER
@@ -338,49 +346,19 @@ class BaseWorkflow:
         
         # Load configuration files
         self.wf_agent_behaviour_file = self.session.wf_agent_behaviour_file
-        self.wf_rules_file = self.session.wf_rules_file 
-        self.wf_agent_sys_prompt_file = self.session.wf_agent_sys_prompt_file
-      
         self.AGENT_BEHAVIOUR = ""
-        self.WF_RULES = ""
-        self.WF_AGENT_SYS_PROMPT=""
-
         self.update_agent_behaviour(self.wf_agent_behaviour_file)
-        self.update_workflow_rules(self.wf_rules_file)
-        self.update_workflow_agent_sys_prompt(self.wf_agent_sys_prompt_file)
         
+        self.wf_rules_file = self.session.wf_rules_file
+        self.WF_RULES = ''
+        self.update_workflow_rules(self.wf_rules_file)
+        
+        self.wf_agent_sys_prompt_file = self.session.wf_agent_sys_prompt_file
+
     def console_log(self, msg: str):
-        self.infra.chat_manager.console_log(msg)
+        self.infra.console_log(msg)
 
-    def show_wf_behaviour_ctx_size(self, log_console: bool = True):
-        self.update_history(actor="SYSTEM",
-            content=f"Size (WF BEST PRACTICES / AGENT BEHAVIOUR CTX) = {num_tokens_from_string(self.AGENT_BEHAVIOUR)} Tokens.",
-            action={"action": "info"},
-            log_console=log_console,)
-
-    def show_wf_rules_ctx_size(self, log_console: bool = True):
-        self.update_history(actor="SYSTEM",
-            content=f"size (wf rules ctx) = {num_tokens_from_string(self.WF_RULES)} tokens.",
-            action={"action": "info"},
-            log_console=log_console,)
-
-    def show_wf_agent_sys_prompt_ctx_size(self, log_console: bool = True):
-        self.update_history(actor="SYSTEM",
-            content=f"size (wf agent sys prompt ctx) = {num_tokens_from_string(self.WF_AGENT_SYS_PROMPT)} tokens.",
-            action={"action": "info"},
-            log_console=log_console,)
-
-    def update_workflow_agent_sys_prompt(self, wf_agent_sys_prompt_file: str|None =None, log_console: bool = True):
-        if wf_agent_sys_prompt_file is not None:
-            self.wf_agent_sys_prompt_file = wf_agent_sys_prompt_file
-        else:
-            if self.wf_agent_sys_prompt_file is None:
-                self.WF_AGENT_SYS_PROMPT = ''
-                return
-        with open(self.wf_agent_sys_prompt_file, "r") as f: self.WF_AGENT_SYS_PROMPT = f.read()
-        self.show_wf_agent_sys_prompt_ctx_size(log_console=log_console)
-
-    def update_workflow_rules(self, wf_rules_file: str|None =None, log_console: bool = True):
+    def update_workflow_rules(self, wf_rules_file: str|None =None):
         if wf_rules_file is not None:
             self.wf_rules_file = wf_rules_file
         else:
@@ -388,9 +366,8 @@ class BaseWorkflow:
                 self.WF_RULES = ''
                 return
         with open(self.wf_rules_file, "r") as f: self.WF_RULES = f.read()
-        self.show_wf_rules_ctx_size(log_console=log_console)
 
-    def update_agent_behaviour(self, agent_behaviour_file: str|None =None, log_console: bool = True):
+    def update_agent_behaviour(self, agent_behaviour_file: str|None =None):
         if agent_behaviour_file is not None:
            self.wf_agent_behaviour_file = agent_behaviour_file
         else:
@@ -398,8 +375,6 @@ class BaseWorkflow:
                 self.AGENT_BEHAVIOUR = ''
                 return
         with open(self.wf_agent_behaviour_file, "r") as f: self.AGENT_BEHAVIOUR = f.read()
-        self.show_wf_behaviour_ctx_size(log_console=log_console)
-
 
     def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):
         self.infra.append_chat_history(actor, content, action, log_console)
@@ -414,12 +389,12 @@ class BaseWorkflow:
         try:
             normalized = normalize_payload(response, actor)
         except Exception as exc:
-            console.print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to normalize agent_response:\n type(response) = {type(response)} \n response = {response}")
+            print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to normalize agent_response:\n type(response) = {type(response)} \n response = {response}")
             return True, f"[payload normalization error] {exc}", None, None
         try:
             action_obj = self.action_adapter.validate_python(normalized)
         except Exception as exc:
-            console.print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to validate agent_response:\n type(response) = {type(response)} \n response = {response}")
+            print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to validate agent_response:\n type(response) = {type(response)} \n response = {response}")
             return True, f"[Normalized payload validation error] {exc}", None, normalized
         return False, None, action_obj, normalized
 
@@ -439,12 +414,112 @@ class BaseWorkflow:
             return True, None, raw, result
             ntrial += 1
 
-
-    def set_wf_action_space(self, action_names: Optional[List[str]] = None):
-        """If *action_names* is provided, only those actions (by their 
-           ``action`` discriminator value) will be accepted. The corresponding 
-           schema is generated via ``get_actions_subset``.
+    # -----------------------------------------------------------------
+    # Unified actor‑turn handling (used for both the main agent and workers)
+    # -----------------------------------------------------------------
+    def _handle_actor_turn(self, actor, name: str):
+        """Process a turn for *actor* (either the main agent or a worker).
+        *actor* – the agent/worker instance.
+        *name*  – string identifier used for routing the next turn.
         """
+        self.infra.show_updated_history()
+        
+        # Get the current context buffer (no rebuild unless threshold exceeded)
+        context_str = self.context_manager.get_compacted_context()
+        diagnostics = self.context_manager.get_context_diagnostics()
+        
+        # Build agent prompt with the current context
+        AGENT_PROMPT = (
+            f"{self.agent_role_prompt}\n\n"
+            "Below is the context formed from the current chat history:\n"
+            "*** Context Start ***\n"
+            f"{context_str}\n"
+            "*** Context End ***\n\n"
+            "The following are the actions you can take in  response to the context\n"
+            "*** List of allowed Actions Start *** \n"
+            f"{self.schema_to_use}\n"
+            "*** List of allowed Actions End *** \n"
+            "*** Description of the infrastructure Start *** \n"
+            f"{self.infra.INFRA_DESCRIPTION}\n"
+            "*** Description of the infrastructure End *** \n"
+            f"*** Best Practices Start *** \n"
+            f"{self.AGENT_BEHAVIOUR}\n"
+            f"*** Best Practices End *** \n"
+            f"*** WORKFLOW RULES Start *** \n"
+            f"{self.WF_RULES}\n"
+            "*** WORKFLOW RULES End *** \n\n"
+        )
+        
+        # Obtain a response (structured or free‑form)
+        if "structured_output" in getattr(actor, "capabilities", []):
+            response = actor.get_structured_output(user_prompt=AGENT_PROMPT, output_format=self.Actions)
+        else:
+            bad_format, response, raw_response, result = actor.format_agent_response(AGENT_PROMPT, self.schema_to_use)
+            if bad_format:
+                # fallback to user turn on failure
+                self.WORKFLOW_TURN = "user"
+                self.update_history(
+                    actor="system",
+                    content=f"{actor.name} could not produce a valid response:\n {raw_response}",
+                    action={"action": "system_info"},
+                    log_console=True,
+                )
+                return
+        
+        # Validate payload
+        if isinstance(response, dict) and "action" in response:
+            bad_format, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(response, actor)
+            if bad_format:
+                self.WORKFLOW_TURN = name
+                self.update_history(
+                    actor="system",
+                    content=err_msg,
+                    action={"action": "system_info"},
+                    log_console=True,
+                )
+                return
+            
+            # Show Actor's action
+            self.update_history(
+                actor=actor.name,
+                content=normalized,
+                action=normalized["action"],
+                log_console=True,
+            )
+            
+            # Execute the concrete action
+            result = action_obj.execute(infra=self.infra)
+            
+            # Determine next turn
+            if getattr(action_obj, "yield_motion_to", None):
+                self.WORKFLOW_TURN = action_obj.yield_motion_to
+            elif getattr(action_obj, "receiver", None):
+                self.WORKFLOW_TURN = action_obj.receiver
+            else:
+                self.WORKFLOW_TURN = "system"
+        else:
+            self.update_history(
+                actor="system",
+                content=f"[ERROR] Invalid action payload: {response}",
+                action={"action": "system_error"},
+                log_console=True,
+            )
+            self.WORKFLOW_TURN = name
+
+    # -----------------------------------------------------------------
+    # Core workflow loop – now can optionally restrict actions
+    # -----------------------------------------------------------------
+    def run(self, user_name: str = "user", 
+            wf_first_turn: str = "user", 
+            action_names: Optional[List[str]] = None, 
+            log_console: bool = True):
+        """Execute the workflow.
+
+        If *action_names* is provided, only those actions (by their ``action``
+        discriminator value) will be accepted. The corresponding schema is
+        generated via ``get_actions_subset``.
+        """
+        # Determine the actions union and schema for this run
         if action_names:
             SubsetActions, subset_schema = get_actions_subset(action_names)
             self.Actions = SubsetActions
@@ -455,25 +530,60 @@ class BaseWorkflow:
             self.action_adapter = TypeAdapter(self.Actions)
             self.schema_to_use = self.full_schema_string
 
-
-    # -----------------------------------------------------------------
-    # Core workflow loop – now can optionally restrict actions
-    # -----------------------------------------------------------------
-    def run(self, user_name: str = "user", 
-            action_names: Optional[List[str]] = None,
-            wolf_commands = ['show', 'clear', 'quit', 'exit', 'bye', 'cls'], 
-            log_console: bool = True):
-        """Execute the workflow.
-        If *action_names* is provided, only those actions (by their ``action``
-        discriminator value) will be accepted. The corresponding schema is
-        generated via ``get_actions_subset``.
-        """
-        # Determine the actions union and schema for this run
-        self.set_wf_action_space(action_names)
         self.WF_USER = user_name
         self.infra.ROLEs[user_name] = "user"
-        self.update_history(actor="SYSTEM",
-                            content="Stub implementation of the 'run()' method of the BaseWF class.\n ",
-                            action={"action": "info"},
-                            log_console=log_console,)
-        
+        self.WORKFLOW_TURN = wf_first_turn
+
+        while True:
+            turn = self.WORKFLOW_TURN.strip().lower()
+            worker_names = [w.strip().lower() for w in self.workers]
+
+            # ---------------------------------------------------------
+            # USER TURN
+            # ---------------------------------------------------------
+            if turn in ["user", self.WF_USER.lower()]:
+                self.infra.show_updated_history()
+                raw_input = interactive_input_line_wrapped(prompt_text=f"[{self.WF_USER}]> ")
+                if raw_input is None:
+                    break
+                user_prompt = raw_input.strip()
+                BREAK, IS_CMD, ERROR, INTERLOCUTOR, WF_PROMPT = self.infra.process_user_input(user_prompt)
+                if IS_CMD:
+                    if WF_PROMPT:
+                        console.print(WF_PROMPT)
+                        self.console_log(WF_PROMPT)
+                    if BREAK:
+                        break
+                else:
+                    if ERROR and WF_PROMPT:
+                        console.print(WF_PROMPT)
+                        self.console_log(WF_PROMPT)
+                    else:
+                        self.update_history(
+                            actor=self.WF_USER,
+                            content=WF_PROMPT,
+                            action={"action": "user_input"},
+                            log_console=log_console,
+                        )
+                        self.WORKFLOW_TURN = INTERLOCUTOR
+                continue
+
+            # ---------------------------------------------------------
+            # MAIN AGENT TURN
+            # ---------------------------------------------------------
+            if turn in ["system", "assistant", "agent", self.agent.name.strip().lower()]:
+                self._handle_actor_turn(self.agent, self.agent.name)
+                continue
+
+            # ---------------------------------------------------------
+            # WORKER TURN
+            # ---------------------------------------------------------
+            if turn in worker_names:
+                worker = self.workers[self.WORKFLOW_TURN]
+                self._handle_actor_turn(worker, worker.name)
+                continue
+
+            # ---------------------------------------------------------
+            # FALLBACK – unknown turn, reset to user
+            # ---------------------------------------------------------
+            self.WORKFLOW_TURN = "user"

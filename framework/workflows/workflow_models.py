@@ -14,6 +14,8 @@ from pydantic import Field
 
 # Import the base AgentAction class – all actions must inherit from it.
 from .base_agent_action import AgentAction
+from framework.utils.tokenomics import num_tokens_from_string
+from framework.utils.io_tools import console
 
 # ---------------------------------------------------------------------
 # Dynamically collect every concrete subclass of ``AgentAction``.
@@ -46,6 +48,23 @@ def _collect_action_classes() -> list[type[AgentAction]]:
 _action_classes = sorted(_collect_action_classes(), key=lambda cls: cls.model_fields["action"].default)
 _ActionsUnion = Union[tuple(_action_classes)]
 Actions = Annotated[_ActionsUnion, Field(discriminator="action")]
+
+# Build the list
+ACTIONS = {}
+ACTION_SPACE_PROMPT = "Below are 'name':'description' key-value pairs for all allowed actions in this workflow:\n"
+ACTION_SPACE_PROMPT += "*** BEGIN ACTION SPACE ***:\n"
+for i, A in enumerate(_action_classes):
+    model_fields = getattr(A, "model_fields", {})
+    action_name_fields  = model_fields.get("action")
+    action_description_fields = model_fields.get("description")
+    action_name = getattr(action_name_fields, "default", {})
+    description = getattr(action_description_fields, "default", {})
+    ACTIONS[action_name] = A
+    ACTION_SPACE_PROMPT += f"'{action_name}': {description}\n"
+ACTION_NAMES = list(ACTIONS.keys())
+ACTION_SPACE_PROMPT +=  "*** END ACTION SPACE ***"
+#print(f"{ACTION_SPACE_PROMPT}")
+console.print(f"[+] ACTION_SPACE_PROMPT: {num_tokens_from_string(ACTION_SPACE_PROMPT)} Tokens")
 
 # ---------------------------------------------------------------------
 # Helper: generate schema string dynamically.
@@ -225,4 +244,4 @@ AGENT_ROLE_PROMPT = """You are a helpful assistant. You exist in the "system", a
 #)
 SYS_PROMPT = ( AGENT_ROLE_PROMPT + SCHEMA_STRING )
 
-print(f"[!!!!] SYS_PROMPT = {SYS_PROMPT}")
+#print(f"[!!!!] SYS_PROMPT = {SYS_PROMPT}")
