@@ -311,7 +311,25 @@ class BaseInfrastructure:
         else:
             for line in self.chat_history[i0:i1]:
                 CTX += f"{line['content']}\n"
-        CTX += f"[Tokens(CTX) = {self.FULL_CTX_TOKENS}]"
+        #CTX += f"[Tokens(CTX) = {self.FULL_CTX_TOKENS}]"
+        ctx_diagnostics = self.context_manager.get_context_diagnostics()
+        #[HINT] ctx_diagnostics = {
+        #    "current_ctx_tokens": self.current_ctx_tokens,
+        #    "max_ctx_tokens": self.max_ctx_tokens,
+        #    "utilization": utilization,
+        #    "utilization_pct": utilization * 100,
+        #    "should_rebuild": self.should_rebuild(),
+        #    "rebuild_threshold": self.rebuild_threshold,
+        #    "num_entries": len(self.current_ctx),
+        #    "avg_tokens_per_entry": avg_tokens,
+        #    "rebuild_count": self.rebuild_count,
+        #    "total_appends": self.total_appends,
+        #    "context_version": self.context_version,
+        #    "last_rebuild": self.last_rebuild_timestamp,
+        #    "snapshots_available": len(self.context_history)
+        #}
+        CTX += f"[CTX({round(ctx_diagnostics['utilization_pct'], 2)}%): {ctx_diagnostics['current_ctx_tokens']}/{ctx_diagnostics['max_ctx_tokens']} tks | Forced rebuild @{100.0*ctx_diagnostics['rebuild_threshold']}%] "
+
         CTX += self.chat_block_divider + self.chat_block_divider[-5:]
         return CTX
 

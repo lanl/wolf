@@ -29,7 +29,7 @@ class ContextManager:
         recent_chat_ratio: float = 0.30,
         memory_ratio: float = 0.50,
         trace_ratio: float = 0.20,
-        rebuild_threshold: float = 0.85,
+        rebuild_threshold: float = 0.450,
         traces_vector_store: Any = None,
         session_dir: str = "./",
     ):
@@ -173,7 +173,7 @@ class ContextManager:
         ]
         
         for idx, entry in enumerate(chat_history):
-            content = str(entry.get("content", "")).lower()
+            content = (entry.get("content", "") if isinstance(entry, dict) else getattr(entry, "content", "")).lower()
             if any(keyword in content for keyword in critical_keywords):
                 critical_indices.append(idx)
         
@@ -368,7 +368,7 @@ class ContextManager:
         """Restore the context manager state from a snapshot.
         
         Args:
-            snapshot_data: Dictionary containing state information from a previous snapshot.
+            snapshot_data: Dictionary containing all state information needed to restore the instance.
         """
         # Restore context buffer and metrics
         self.current_ctx = snapshot_data.get("current_ctx", [])
