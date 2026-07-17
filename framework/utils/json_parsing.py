@@ -15,7 +15,7 @@ try:
     JSON5_AVAILABLE = True
 except ImportError:
     JSON5_AVAILABLE = False
-    console.print("[WARNING] json5 not available; falling back to strict json")
+    #console.print("[WARNING] json5 not available; falling back to strict json")
 
 
 def extract_json_block(text: str) -> Optional[str]:

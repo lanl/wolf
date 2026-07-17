@@ -29,7 +29,6 @@ from framework.universes.universe_tools import get_base_universe_params
 
 # Agents
 from framework.agentic.agents import OpenAIAgent
-from framework.agentic.default.params.llm_params import LANL_AIPORTAL_LLMs as LLMs
 
 # WORKFLOWS
 from framework.workflows.workflow_models import Actions
@@ -37,7 +36,8 @@ from framework.infrastructure.base_chat_manager import BaseChatManager
 from framework.infrastructure.base_memory_manager import MemoryManager
 from framework.infrastructure.base_context_manager import ContextManager
 from framework.infrastructure.base_infrastructure import BaseInfrastructure 
-from framework.workflows.base_workflow import BaseWorkflow
+#from framework.workflows.base_workflow import BaseWorkflow
+from framework.workflows.custom_workflows.turn_based_workflow import TurnBasedWorkflow 
 
 
 def create_session_dir():
@@ -51,10 +51,11 @@ def set_llm_api_key(llm, env_vars=None, env_path=".env",
                     api_key_handle="api_key",           # Making this flexible 
                     api_key_var_handle="api_key_var"):  # for changing the keys
     if api_key_handle in llm.keys():
-        console.print(f"[!][utils][io_tools][set_llm_api_key][DANGER]:")
-        console.print(f"     * API KEY for LLM{llm['model']} on {llm['host']}:{llm['port']}")
-        console.print(f"     provided unsafly. use the 'api_key_var' approach insted")
-        return # API ke 
+        if llm[api_key_handle] is not None:
+            console.print(f"[!][utils][io_tools][set_llm_api_key][DANGER]:")
+            console.print(f"     * API KEY for LLM{llm['model']} on {llm['host']}:{llm['port']}")
+            console.print(f"     provided unsafly. use the 'api_key_var' approach insted")
+            return # API ke 
     keys = list(llm.keys())
     # No need to relod .env file if provided
     if env_vars is None:
@@ -77,7 +78,6 @@ def load_session_certs(session_params):
     cache_dir = session_params.get('tiktoken_cache_dir', (Path.cwd() / ".tiktoken_cache").resolve())
     os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(cache_dir))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    #os.environ['CURL_CA_BUNDLE'] = session_params.get('curl_ca_bundle_file','/etc/ssl/ca-bundle.pem')
 
 def show_banner(session_params):
     console.print("|=================================================================================|")
@@ -206,13 +206,9 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
     memory_db_persist_sub_dir = session_params.get('memory_db_persist_sub_dir', 'memory')
     
     summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
-    #summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
-    #summaries_vs_params.persist_directory =  f"{session_dir}/{memory_db_persist_sub_dir}"
     summaries_vs = VectorStore(summaries_vs_params)
     
     traces_vs_params = copy.deepcopy(TRACES_PARAMS)
-    #traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir}"
-    #traces_vs_params.persist_directory = f"{session_dir}/{memory_db_persist_sub_dir}"
     traces_vs = VectorStore(traces_vs_params)
     
     # Reconstruct managers
@@ -254,7 +250,8 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
     INFRA.restore(infra_snapshot)
     
     # Create workflow with restored infrastructure
-    WF = BaseWorkflow(
+    #WF = BaseWorkflow(
+    WF = TurnBasedWorkflow(
         session=None,  # Will be set during load_session_state
         infra=INFRA,
         actions_union=Actions,
@@ -331,8 +328,6 @@ def setup_cli_session(session_params, resume_session: Optional[str] = None, db_c
     summaries_vs_params = session_params.get('summaries_params', None)
     if summaries_vs_params is None:
         summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
-        #summaries_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
-        #summaries_vs_params.persist_directory = vs_persist_dir #f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
     if verbose > 0: console.print(f"[INFO][MEMORY] Summaries params: {summaries_vs_params}")
     summaries_vs = VectorStore(summaries_vs_params, client=db_client)
     
@@ -340,8 +335,6 @@ def setup_cli_session(session_params, resume_session: Optional[str] = None, db_c
     traces_vs_params = session_params.get('traces_params', None)
     if traces_vs_params is None:
         traces_vs_params = copy.deepcopy(TRACES_PARAMS)
-        #traces_vs_params["persist_directory"] = f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
-        #traces_vs_params.persist_directory = vs_persist_dir #f"{session_dir}/{memory_db_persist_sub_dir.strip().lstrip('./').rstrip('/')}"
     if verbose > 0: console.print(f"[INFO][MEMORY] Traces params: {traces_vs_params}")
     traces_vs = VectorStore(traces_vs_params, client=db_client)
     
@@ -373,7 +366,8 @@ def setup_cli_session(session_params, resume_session: Optional[str] = None, db_c
                                )
     
     # WORKFLOW
-    WF = session_params.get('wf', BaseWorkflow(infra=INFRA, actions_union=session_params.get('actions', Actions)))
+    #WF = session_params.get('wf', BaseWorkflow(infra=INFRA, actions_union=session_params.get('actions', Actions)))
+    WF = session_params.get('wf', TurnBasedWorkflow(infra=INFRA, actions_union=session_params.get('actions', Actions)))
     
     return {
         'agents': {'main': main_agent, 'workers': workers},
@@ -404,5 +398,4 @@ class CliSession(BaseSession):
         self.session = setup_cli_session(session_params=self.session_params, 
                                          resume_session=resume_session, 
                                          db_client=db_client)
-
 
