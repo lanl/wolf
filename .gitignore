@@ -101,6 +101,11 @@ solvers/
 standar_wf/
 .chainlit/   # prefer directory form over *.chainlit
 
-# If `service/` contains source you want tracked, do NOT ignore it.
-# service/
-
+#-------------------------
+# Institutional files
+#-------------------------
+*lanl*
+*llnl*
+*sandia*
+*DOE*
+*DOW*

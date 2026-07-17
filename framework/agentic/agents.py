@@ -1,6 +1,7 @@
 # agents.py
 from __future__ import annotations
 import asyncio
+import base64
 from typing import Any, Dict, List, Union, Optional
 from pydantic import BaseModel
 from urllib.parse import urlparse
@@ -28,10 +29,10 @@ Message = Dict[str, str]  # alias for chat message dict
 class OpenAIAgent:
     """
     A unified OpenAI-compatible agent wrapper.
-    Supports sync/async chat, streaming, and structured outputs.
+    Supports sync/async chat, streaming, structured outputs, vision, and audio.
     """
     def __init__(
-        self,
+        self, 
         model: str,
         host_address: str = "http://localhost",
         host_port: Optional[int] = None,
@@ -42,8 +43,8 @@ class OpenAIAgent:
         cache_history: bool = True,
         verbose: int = 0,
         capabilities=[],
-        ctx_window_length=None,
-    ) -> None:
+        ctx_window_length=None, ) -> None:
+
         # Name assignment
         if agent_name is None:
             name_generator = NameGenerator()
@@ -61,28 +62,29 @@ class OpenAIAgent:
         self.console = console if console is not None else print
         self.capabilities=capabilities
         self.ctx_window_length = ctx_window_length
-        # Construct base_url safely
-        #if verbose> 1: print(f"[++] HOST: {self.host_address}")
+        
         parsed = urlparse(host_address)
-        #if verbose> 1: print(f"[++] PARSED: {parsed}")
         scheme = parsed.scheme if parsed.scheme else "http"
-        #if verbose> 1: print(f"[++] SCHEME: {scheme}")
-        #netloc = parsed.path or "localhost"
         netloc = parsed.netloc or "localhost"
-        #if verbose> 1: print(f"[++] NETLOC: {netloc}")
+        path = parsed.path
         if host_port:
             netloc = f"{netloc}:{host_port}"
-        self.base_url = f"{scheme}://{netloc}"
+        
+        # Construct base_url: include the path from host_address if present
+        self.base_url = f"{scheme}://{netloc}{path}"
+        
         if api_version:
+            # Ensure we don't double slash
+            self.base_url = self.base_url.rstrip('/')
             self.base_url += f"/{api_version}"
-        # Core clients
+            
         if api_key:
             self.llm = OpenAI(api_key=api_key, base_url=self.base_url)
             self.async_llm = AsyncOpenAI(api_key=api_key, base_url=self.base_url)
         else:
             self.llm = OpenAI(base_url=self.base_url)
             self.async_llm = AsyncOpenAI(base_url=self.base_url)
-        # Instructor support
+            
         if instructor:
             self.instructor_client = instructor.from_openai(
                 OpenAI(base_url=self.base_url, api_key=self.api_key),
@@ -95,7 +97,7 @@ class OpenAIAgent:
         else:
             self.instructor_client = None
             self.instructor_async_client = None
-        # Initial context
+            
         self.CTX: List[Message] = [
             {"role": "system", "content": f"You name is {self.name}"},
             {"role": "system", "content": self.sys_prompt},
@@ -116,35 +118,33 @@ class OpenAIAgent:
     # Public Methods
     # ---------------------------
 
-    # -------------------- CHAT RESPONSE --------------------
     def get_chat_response(
-        self,
-        user_prompt: Union[str, Message, List[Message]],
+        self, 
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
         model: Optional[str] = None,
-        resp_choice_idx: Union[int, List[int]] = 0,
-    ) -> Union[str, List[str]]:
-        """Return a single chat completion."""
+        resp_choice_idx: Union[int, List[int]] = 0,) -> Union[str, List[str]]:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
         raw_response = self.llm.chat.completions.create(model=model, messages=CTX)
         return self._extract_response(raw_response, resp_choice_idx)
+
     async def get_chat_response_async(
-        self,
-        user_prompt: Union[str, Message, List[Message]],
+        self, 
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
         model: Optional[str] = None,
-        resp_choice_idx: Union[int, List[int]] = 0,
-    ) -> Union[str, List[str]]:
+        resp_choice_idx: Union[int, List[int]] = 0,) -> Union[str, List[str]]:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
         raw_response = await self.async_llm.chat.completions.create(
             model=model, messages=CTX
         )
         return self._extract_response(raw_response, resp_choice_idx)
-    # -------------------- STREAMING RESPONSE --------------------
-    def stream_chat_response(
-        self, user_prompt: Union[str, Message, List[Message]], model: Optional[str] = None
-    ) -> str:
-        """Stream response to console and return final aggregated string."""
+
+    def stream_chat_response(self, user_prompt: Union[str, Message, List[Message], 
+                             List[Dict[str, Any]]], model: Optional[str] = None) -> str:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
         stream = self.llm.chat.completions.create(model=model, messages=CTX, stream=True)
@@ -154,9 +154,10 @@ class OpenAIAgent:
             self.console_log(delta, end="")
             response += delta
         return response
-    async def stream_chat_response_async(
-        self, user_prompt: Union[str, Message, List[Message]], model: Optional[str] = None
-    ) -> str:
+
+    async def stream_chat_response_async(self, user_prompt: Union[str, Message, List[Message], 
+                                         List[Dict[str, Any]]], model: Optional[str] = None) -> str:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
         response = ""
@@ -168,16 +169,15 @@ class OpenAIAgent:
                 self.console_log(delta, end="")
                 response += delta
         return response
-    # -------------------- STRUCTURED CHAT RESPONSE --------------------
+
     def get_json_structured_output(
-        self,
-        user_prompt: Union[str, Message, List[Message]],
+        self, 
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
         output_format: Any,
         temperature: float = 0,
         model: Optional[str] = None,
-        resp_choice_idx: Union[int, List[int]] = 0,
-    ) -> Any:
-        """Return structured JSON output (OpenAI beta API)."""
+        resp_choice_idx: Union[int, List[int]] = 0,) -> Any:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
         if "structured_output" in self.capabilities:
@@ -191,7 +191,7 @@ class OpenAIAgent:
                 return self._extract_response(completion, resp_choice_idx, structured=True)
             except Exception as e:
                 return f"[0][!][FORMAT ERROR]: Problem with Assistant output: {e}"
-        else: #if "structured_output" not in self.capabilities
+        else:
             try:
                 completion = self.llm.beta.chat.completions.parse(
                     temperature=temperature,
@@ -205,30 +205,25 @@ class OpenAIAgent:
                 try:
                     return [ jsonfy(output) for output in agent_output ]
                 except Exception as e:
-                    return("[2][!][get_json_structured_output][FORMAT ERROR]: Problem with Assistant output: {e}")
+                    return f"[2][!][get_json_structured_output][FORMAT ERROR]: Problem with Assistant output: {e}"
             elif isinstance(agent_output, str):
                     try:
                         return jsonfy(agent_output)
                     except Exception as e1:
                         return f"[3][!][get_json_structured_output][FORMAT ERROR]: Problem with Assistant output: {e1}"
             else:
-                response  = f"[4][!][get_json_structured_output][FORMAT ERROR]: Problem with Assistant output:"
-                response +="completion={completion}\n"
-                response += "agent_output={agent_output}"
-                return response
-                #f"[4][!][get_json_structured_output][FORMAT ERROR]: Problem with Assistant output:\n completion={completion}\n\n agent_output={agent_output}"
+                return f"[4][!][get_json_structured_output][FORMAT ERROR]: Problem with Assistant output"
 
     async def get_json_structured_output_async(
-        self,
-        user_prompt: Union[str, Message, List[Message]],
+        self, 
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
         output_format: Any,
         temperature: float = 0,
         model: Optional[str] = None,
-        resp_choice_idx: Union[int, List[int]] = 0,
-    ) -> Any:
+        resp_choice_idx: Union[int, List[int]] = 0,) -> Any:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
-        FORMATED = False
         if "structured_output" in self.capabilities:
             try:
                 completion = await self.async_llm.beta.chat.completions.parse(
@@ -239,13 +234,13 @@ class OpenAIAgent:
                 )
                 return self._extract_response(completion, resp_choice_idx, structured=True)
             except Exception as e:
-                console.print("[5][!][get_json_structured_output_async][FORMAT WARN]: Problem with Assistant output: {e}")
-                if isinstance(CTX, str):
+                self.console_log(f"[5][!][get_json_structured_output_async][FORMAT WARN]: Problem with Assistant output: {e}")
+                if isinstance(user_prompt, str):
                     try:
-                        return jsonfy(CTX) 
+                        return jsonfy(user_prompt)
                     except Exception as e1:
                         return f"[6][!][FORMAT ERROR]: Problem with Assistant output: {e1}"
-        else: #if "structured_output" not in self.capabilities
+        else:
             try:
                 completion = await self.async_llm.beta.chat.completions.parse(temperature=temperature, 
                                                                           model=model, messages=CTX,)
@@ -256,7 +251,7 @@ class OpenAIAgent:
                 try:
                     return [ jsonfy(output) for output in agent_output ]
                 except Exception as e:
-                    return("[8][!][get_json_structured_output_async][FORMAT ERROR]: Problem with Assistant output: {e}")
+                    return f"[8][!][get_json_structured_output_async][FORMAT ERROR]: Problem with Assistant output: {e}"
             elif isinstance(agent_output, str):
                     try:
                         return jsonfy(agent_output)
@@ -266,40 +261,31 @@ class OpenAIAgent:
                 return f"[10][!][get_json_structured_output_async][FORMAT ERROR]: Problem with Assistant output"
 
     def get_structured_output(
-        self,
-        user_prompt: Union[str, Message, List[Message]],
+        self, 
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
         output_format: BaseModel,
         temperature: float = 0,
-        model: Optional[str] = None,
-    ) -> Any:
-        """Use instructor if available, else fallback to JSON structured output."""
+        model: Optional[str] = None,) -> Any:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
         if self.instructor_client:
             if "structured_output" in self.capabilities:
-                print(f"[INSTRUCTOR][STRUCTURED OUT]")
                 return self.instructor_client.chat.completions.create(
                     model=model, messages=CTX, response_model=output_format
                 )
-                #return self.instructor_client.create(
-                #        model=model,
-                #        response_model=output_format,
-                #        messages=CTX,
-                #        )
-
             else:
-                print(f"[DIY][STRUCTURED OUT]")
-                return self.get_json_structured_output(CTX, output_format, temperature, model)
+                return self.get_json_structured_output(user_prompt, output_format, temperature, model)
         else:
-            return self.get_json_structured_output(CTX, output_format, temperature, model)
+            return self.get_json_structured_output(user_prompt, output_format, temperature, model)
 
     async def get_structured_output_async(
-        self,
-        user_prompt: Union[str, Message, List[Message]],
+        self, 
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
         output_format: BaseModel,
         temperature: float = 0,
-        model: Optional[str] = None,
-    ) -> Any:
+        model: Optional[str] = None,) -> Any:
+
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
         if self.instructor_async_client:
@@ -311,9 +297,32 @@ class OpenAIAgent:
                 return await self.get_json_structured_output_async( user_prompt, output_format, temperature, model)
         else:
             return await self.get_json_structured_output_async(user_prompt, output_format, temperature, model)
+
+    # -------------------- AUDIO MODALITIES --------------------
+    def get_audio_transcription(self, file_path: str, model: str = "whisper-1") -> str:
+        """Transcribe audio file to text."""
+        with open(file_path, "rb") as audio_file:
+            transcript = self.llm.audio.transcriptions.create(model=model, file=audio_file)
+            return transcript.text
+
+    async def get_audio_transcription_async(self, file_path: str, model: str = "whisper-1") -> str:
+        """Transcribe audio file to text asynchronously."""
+        with open(file_path, "rb") as audio_file:
+            transcript = await self.async_llm.audio.transcriptions.create(model=model, file=audio_file)
+            return transcript.text
+
+    def get_speech_synthesis(self, text: str, output_path: str, model: str = "tts-1", voice: str = "alloy") -> None:
+        """Convert text to speech and save to file."""
+        response = self.llm.audio.speech.create(model=model, voice=voice, input=text)
+        response.stream_to_file(output_path)
+
+    async def get_speech_synthesis_async(self, text: str, output_path: str, model: str = "tts-1", voice: str = "alloy") -> None:
+        """Convert text to speech and save to file asynchronously."""
+        response = await self.async_llm.audio.speech.create(model=model, voice=voice, input=text)
+        await response.stream_to_file(output_path)
+
     # -------------------- CTX OPERATIONS --------------------
     def reset_ctx(self, system_prompt: Optional[str] = None) -> None:
-        """Reset context but preserve agent name."""
         system_prompt = system_prompt or self.sys_prompt
         self.CTX = [
             {"role": "system", "content": f"You name is {self.name}"},
@@ -324,20 +333,38 @@ class OpenAIAgent:
     # Private Helpers
     # ---------------------------
 
-    def _make_ctx(
-        self, user_prompt: Union[str, Message, List[Message]]
-    ) -> List[Message]:
+    def _make_ctx(self, user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]]) -> List[Message]:
+
         if isinstance(user_prompt, list):
-            return self.CTX + user_prompt
+            # Check if the list is already formatted as multimodal content
+            if len(user_prompt) > 0 and isinstance(user_prompt[0], dict) and "role" in user_prompt[0]:
+                return self.CTX + user_prompt
+            
+            # Otherwise, treat it as content blocks for a single user message
+            content = []
+            for item in user_prompt:
+                if isinstance(item, str):
+                    content.append({"type": "text", "text": item})
+                elif isinstance(item, dict):
+                    if "image_url" in item:
+                        content.append({"type": "image_url", "image_url": item})
+                    elif "type" in item:
+                        content.append(item)
+                    else:
+                        content.append({"type": "text", "text": str(item)})
+            return self.CTX + [{"role": "user", "content": content}]
+
         if isinstance(user_prompt, dict):
-            return self.CTX + [user_prompt]
+            if "role" in user_prompt:
+                return self.CTX + [user_prompt]
+            return self.CTX + [{"role": "user", "content": user_prompt}]
+            
         if isinstance(user_prompt, str):
             return self.CTX + [{"role": "user", "content": user_prompt}]
+            
         raise TypeError(f"[FORMAT ERROR]: {type(user_prompt)} not supported")
 
-    def _extract_response(
-        self, completion: Any, resp_choice_idx: Union[int, List[int]], structured: bool = False
-    ) -> Union[str, List[str], Any]:
+    def _extract_response(self, completion: Any, resp_choice_idx: Union[int, List[int]], structured: bool = False) -> Union[str, List[str], Any]:
         if isinstance(resp_choice_idx, list):
             return [
                 self._extract_single(completion, idx, structured)
@@ -348,21 +375,18 @@ class OpenAIAgent:
     def _extract_single(self, completion: Any, idx: int, structured: bool) -> Any:
         if structured:
             return completion.choices[idx].message
-        #print(f"p[+++] {completion}")
         return completion.choices[idx].message.content
 
     def console_log(self, msg: str, end: str = "\n") -> None:
         if self.verbose > 0:
             if callable(self.console):
-                self.console(msg, end=end)  # console is a function
+                self.console(msg, end=end)
             else:
-                self.console.print(msg, end=end)  # console is a rich Console
-
+                self.console.print(msg, end=end)
 
     def format_agent_response(self, prompt, schema, n_max_trials=5):
         n_trial = 0
         while n_trial < n_max_trials:
-            #print(f"[+] Formatting agent's response {n_trial+1}/{n_max_trials}\n prompt={prompt}")
             raw = self.get_chat_response(user_prompt=prompt + f"\n{schema}")
             result = robust_jsonfy(raw)
             if "parsed" in result:
