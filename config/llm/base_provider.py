@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, SecretStr
-from typing import List, Optional, Generic, TypeVar
+from typing import List, Optional, Generic, TypeVar, Type, NewType
 from abc import ABC, abstractmethod
 
 # This TypeVar allows subclasses to define their own structure for 'endpoints'
@@ -36,3 +36,5 @@ class Base_LLM_Provider(BaseModel, Generic[T_Endpoints], ABC):
         Must be implemented by all subclasses.
         """
         pass
+
+base_llm_provider_type = NewType('base_llm_provider_type', Type[Base_LLM_Provider])

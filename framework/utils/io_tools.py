@@ -606,3 +606,6 @@ def image_to_ascii(path, width=80, flag='america'):
     for i, line in enumerate(lines):
         color = FLAGS[FLAG][i % len(FLAGS[FLAG])]
         print(color(line))
+
+USER_ENV_VARs = load_env_vars()
+USER_ENV_VAR_KEYs = USER_ENV_VARs.keys()
