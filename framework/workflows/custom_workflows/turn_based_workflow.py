@@ -13,6 +13,7 @@ from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
 from framework.workflows.enhanced_input import interactive_input_line_wrapped
 from framework.workflows.base_workflow import BaseWorkflow
+from framework.utils.multimodal_input import combine_prompt_with_user_content
 
 
 class TurnBasedWorkflow(BaseWorkflow):
@@ -82,12 +83,14 @@ class TurnBasedWorkflow(BaseWorkflow):
             f"{self.WF_RULES}\n"
             "*** WORKFLOW RULES End *** \n\n"
         )
+        pending_agent_content = self.infra.consume_pending_agent_content()
+        AGENT_INPUT = combine_prompt_with_user_content(AGENT_PROMPT, pending_agent_content)
         
         # Obtain a response (structured or free‑form)
         if "structured_output" in getattr(actor, "capabilities", []):
-            response = actor.get_structured_output(user_prompt=AGENT_PROMPT, output_format=self.Actions)
+            response = actor.get_structured_output(user_prompt=AGENT_INPUT, output_format=self.Actions)
         else:
-            bad_format, response, raw_response, result = actor.format_agent_response(AGENT_PROMPT, self.schema_to_use)
+            bad_format, response, raw_response, result = actor.format_agent_response(AGENT_INPUT, self.schema_to_use)
             if bad_format:
                 # fallback to user turn on failure
                 self.WORKFLOW_TURN = "user"
@@ -188,9 +191,15 @@ class TurnBasedWorkflow(BaseWorkflow):
                         console.print(WF_PROMPT)
                         self.console_log(WF_PROMPT)
                     else:
+                        # Normal user input is converted through the reusable
+                        # infrastructure input processor. History receives only
+                        # a compact text representation; rich content is kept
+                        # pending for the next immediate agent turn.
+                        target_actor = self.workers.get(INTERLOCUTOR, self.agent)
+                        input_bundle = self.infra.prepare_user_input_for_agent(WF_PROMPT, agent=target_actor)
                         self.update_history(
                             actor=self.WF_USER,
-                            content=WF_PROMPT,
+                            content=input_bundle.history_text,
                             action={"action": "user_input"},
                             log_console=log_console,
                         )

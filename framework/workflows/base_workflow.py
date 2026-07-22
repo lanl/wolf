@@ -345,9 +345,14 @@ class BaseWorkflow:
         self.WF_RULES = ""
         self.WF_AGENT_SYS_PROMPT=""
 
-        self.update_agent_behaviour(self.wf_agent_behaviour_file)
-        self.update_workflow_rules(self.wf_rules_file)
-        self.update_workflow_agent_sys_prompt(self.wf_agent_sys_prompt_file)
+        # If the chat manager already has entries, we are restoring an existing
+        # session. Loading prompt/rule files should refresh in-memory strings,
+        # but must not append duplicate config-size messages or autosave/mutate
+        # the historical snapshot as a side effect of merely opening it.
+        log_config_context_sizes = len(getattr(self.chat_manager, "CHAT_HISTORY", [])) == 0
+        self.update_agent_behaviour(self.wf_agent_behaviour_file, log_console=log_config_context_sizes)
+        self.update_workflow_rules(self.wf_rules_file, log_console=log_config_context_sizes)
+        self.update_workflow_agent_sys_prompt(self.wf_agent_sys_prompt_file, log_console=log_config_context_sizes)
         
     def console_log(self, msg: str):
         self.infra.chat_manager.console_log(msg)
@@ -378,7 +383,8 @@ class BaseWorkflow:
                 self.WF_AGENT_SYS_PROMPT = ''
                 return
         with open(self.wf_agent_sys_prompt_file, "r") as f: self.WF_AGENT_SYS_PROMPT = f.read()
-        self.show_wf_agent_sys_prompt_ctx_size(log_console=log_console)
+        if log_console:
+            self.show_wf_agent_sys_prompt_ctx_size(log_console=log_console)
 
     def update_workflow_rules(self, wf_rules_file: str|None =None, log_console: bool = True):
         if wf_rules_file is not None:
@@ -388,7 +394,8 @@ class BaseWorkflow:
                 self.WF_RULES = ''
                 return
         with open(self.wf_rules_file, "r") as f: self.WF_RULES = f.read()
-        self.show_wf_rules_ctx_size(log_console=log_console)
+        if log_console:
+            self.show_wf_rules_ctx_size(log_console=log_console)
 
     def update_agent_behaviour(self, agent_behaviour_file: str|None =None, log_console: bool = True):
         if agent_behaviour_file is not None:
@@ -398,7 +405,8 @@ class BaseWorkflow:
                 self.AGENT_BEHAVIOUR = ''
                 return
         with open(self.wf_agent_behaviour_file, "r") as f: self.AGENT_BEHAVIOUR = f.read()
-        self.show_wf_behaviour_ctx_size(log_console=log_console)
+        if log_console:
+            self.show_wf_behaviour_ctx_size(log_console=log_console)
 
 
     def update_history(self, actor: str, content: Any, action=None, log_console: bool = True):

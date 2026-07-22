@@ -10,8 +10,10 @@ import chromadb
 from chromadb.config import Settings
 
 # UTILs
-from framework.utils.io_tools import console, load_env_vars, image_to_ascii
+from framework.utils.io_tools import console, image_to_ascii
+from framework.utils.io_tools import USER_ENV_VARs
 from framework.utils.machines_ssl_config import conform_machine_ssl_certs
+from framework.utils.multimodal_input import normalize_capabilities
 
 # VStore
 from framework.data_store.vstore import VectorStore
@@ -59,7 +61,7 @@ def set_llm_api_key(llm, env_vars=None, env_path=".env",
     keys = list(llm.keys())
     # No need to relod .env file if provided
     if env_vars is None:
-        ENV_VARs = load_env_vars(env_path)
+        ENV_VARs = copy.deepcopy(USER_ENV_VARs) #load_env_vars(env_path)
     else:
         ENV_VARs = copy.deepcopy(env_vars)
     # Now let's get the env var keys
@@ -91,7 +93,7 @@ def build_list_agents(session_params):
     params = list(session_params.keys())
     assert 'LLMs' in params, "[ERROR][CLI SESSION SETUP]: 'LLMs' are required parameters for building agents"
     LLMs = session_params['LLMs']
-    ENV_VARs = load_env_vars()
+    ENV_VARs = copy.deepcopy(USER_ENV_VARs) #load_env_vars()
     AGENTs = {}
     # Construct the Agent list based on the provided LLMs
     for k in LLMs.keys():
@@ -108,7 +110,7 @@ def build_list_agents(session_params):
             api_version=llm["api_version"],
             api_key=llm["api_key"],
             verbose=llm["verbose"],
-            capabilities=llm["capabilities"],
+            capabilities=list(normalize_capabilities(llm.get("capabilities", []))),
             ctx_window_length = max_ctx
         )
     return AGENTs
@@ -137,7 +139,7 @@ def build_list_universes(session_params):
     return UNIVs
 
 
-def load_existing_session(session_identifier: str, session_params: dict) -> dict:
+def load_existing_session(session_identifier: str, session_params: dict, db_client: Optional[chromadb.Client] = None) -> dict:
     """Load an existing session from snapshots.
     
     Args:
@@ -202,14 +204,26 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
     # Reconstruct universes
     UNIVs = build_list_universes(session_params)
 
-    # Setup vector stores
+    # Setup vector stores. VectorStore requires an explicit Chroma client.
+    # New sessions create this in setup_cli_session(); resumed sessions must do
+    # the same before reconstructing MemoryManager/ContextManager.
+    vs_persist_dir = os.path.join(session_dir, "VStore")
+    if db_client is None:
+        db_client = chromadb.Client(
+            Settings(persist_directory=vs_persist_dir, anonymized_telemetry=False)
+        )
+
     memory_db_persist_sub_dir = session_params.get('memory_db_persist_sub_dir', 'memory')
     
-    summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
-    summaries_vs = VectorStore(summaries_vs_params)
+    summaries_vs_params = session_params.get('summaries_params', None)
+    if summaries_vs_params is None:
+        summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
+    summaries_vs = VectorStore(summaries_vs_params, client=db_client)
     
-    traces_vs_params = copy.deepcopy(TRACES_PARAMS)
-    traces_vs = VectorStore(traces_vs_params)
+    traces_vs_params = session_params.get('traces_params', None)
+    if traces_vs_params is None:
+        traces_vs_params = copy.deepcopy(TRACES_PARAMS)
+    traces_vs = VectorStore(traces_vs_params, client=db_client)
     
     # Reconstruct managers
     chat_manager = BaseChatManager(session_dir=session_dir)
@@ -219,7 +233,7 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
         summaries_vector_store=summaries_vs
     )
     context_manager = ContextManager(
-        max_ctx_tokens=100000,
+        max_ctx_tokens=200000,
         traces_vector_store=traces_vs,
         session_dir=session_dir
     )
@@ -239,7 +253,7 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
         workers=workers,
         objects=UNIVs,
         max_ctx_tokens=snapshot_data.get('max_ctx_tokens', 50000),
-        wf_log_dir=session_dir,
+        wf_log_dir="wf_logs",
         session_dir=session_dir,
         chat_manager=chat_manager,
         memory_manager=memory_manager,
@@ -269,6 +283,7 @@ def load_existing_session(session_identifier: str, session_params: dict) -> dict
         'objects': {'universes': UNIVs, 'kbs': [], 'tbs': []},
         'managers': {'chat': chat_manager, 'memory': memory_manager, 'context': context_manager},
         'session_dir': session_dir,
+        'db_client': db_client,
         'wf': WF
     }
 
@@ -292,7 +307,7 @@ def setup_cli_session(session_params, resume_session: Optional[str] = None, db_c
     
     # Check if resuming existing session
     if resume_session:
-        return load_existing_session(resume_session, session_params)
+        return load_existing_session(resume_session, session_params, db_client=db_client)
 
     # SESSION
     session_dir = session_params.get('session_dir', create_session_dir())
@@ -345,7 +360,7 @@ def setup_cli_session(session_params, resume_session: Optional[str] = None, db_c
                                                     traces_vector_store=traces_vs,
                                                     summaries_vector_store=summaries_vs))
     context_manager = session_params.get('context_manager', 
-                                        ContextManager(max_ctx_tokens=100000,
+                                        ContextManager(max_ctx_tokens=200000,
                                                       recent_chat_ratio=0.50,
                                                       memory_ratio=0.30,
                                                       trace_ratio=0.20,

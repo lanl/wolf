@@ -29,7 +29,7 @@ class ContextManager:
         recent_chat_ratio: float = 0.30,
         memory_ratio: float = 0.50,
         trace_ratio: float = 0.20,
-        rebuild_threshold: float = 0.450,
+        rebuild_threshold: float = 0.850,
         traces_vector_store: Any = None,
         session_dir: str = "./",
     ):
@@ -81,9 +81,9 @@ class ContextManager:
         Returns:
             Structured context entry with token count and metadata
         """
-        sender = entry.get("sender", "") if isinstance(entry, dict) else getattr(entry, "sender", "")
-        content = entry.get("content", "") if isinstance(entry, dict) else getattr(entry, "content", "")
-        timestamp = entry.get("timestamp", "") if isinstance(entry, dict) else getattr(entry, "timestamp", "")
+        sender = self._entry_field(entry, "sender", "")
+        content = self._stringify_content(self._entry_field(entry, "content", ""))
+        timestamp = self._entry_field(entry, "timestamp", "")
         
         ctx_line = f"[{timestamp}][{sender}]: {content}"
         tokens = self._estimate_token_count(ctx_line)
@@ -154,6 +154,35 @@ class ContextManager:
         console.print(f"[CONTEXT] Rolled back to version {self.context_version}")
         return True
 
+    def _entry_field(self, entry: Any, field: str, default: Any = "") -> Any:
+        """Return *field* from either a dict-like or object-like chat entry.
+
+        Chat/history entries are not guaranteed to contain only strings. Some
+        action payloads and tool results are stored as dicts/lists. Context
+        rebuild code must therefore normalize values before applying string
+        operations such as ``lower()`` or token counting.
+        """
+        if isinstance(entry, dict):
+            return entry.get(field, default)
+        return getattr(entry, field, default)
+
+    def _stringify_content(self, content: Any) -> str:
+        """Convert arbitrary chat content to a stable string representation.
+
+        The context manager receives content from user messages, structured
+        agent actions, syscall results, and manager diagnostics. Those may be
+        strings, dicts, lists, numbers, or None. JSON is preferred for
+        containers so that context text is deterministic and readable.
+        """
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        try:
+            return json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            return str(content)
+
     def _identify_critical_entries(self, chat_history: List[Dict[str, Any]]) -> List[int]:
         """Identify indices of critical entries that should be preserved during rebuild.
         
@@ -173,7 +202,8 @@ class ContextManager:
         ]
         
         for idx, entry in enumerate(chat_history):
-            content = (entry.get("content", "") if isinstance(entry, dict) else getattr(entry, "content", "")).lower()
+            raw_content = self._entry_field(entry, "content", "")
+            content = self._stringify_content(raw_content).lower()
             if any(keyword in content for keyword in critical_keywords):
                 critical_indices.append(idx)
         
@@ -226,15 +256,22 @@ class ContextManager:
             new_ctx.insert(0, ctx_entry)
             new_ctx_tokens += ctx_entry["tokens"]
         
-        # 2. Add critical entries if not already included
+        # 2. Add critical entries if not already included. Keep the original
+        # history index as metadata so chronological insertion does not rely on
+        # reconstructing a dict and calling ``chat_history.index(...)``. That
+        # older approach was fragile for non-string content and duplicate rows.
         recent_indices = set(range(len(chat_history) - len(new_ctx), len(chat_history)))
+        for offset, ctx_entry in enumerate(new_ctx):
+            ctx_entry.setdefault("history_index", len(chat_history) - len(new_ctx) + offset)
+
         for idx in critical_indices:
             if idx not in recent_indices and new_ctx_tokens < target_tokens:
                 entry = chat_history[idx]
                 ctx_entry = self._create_context_entry(entry)
+                ctx_entry["history_index"] = idx
                 if new_ctx_tokens + ctx_entry["tokens"] <= target_tokens:
-                    # Insert in chronological position
-                    insert_pos = sum(1 for e in new_ctx if chat_history.index({"sender": e["sender"], "content": e["content"], "timestamp": e["timestamp"]}) < idx)
+                    # Insert in chronological position.
+                    insert_pos = sum(1 for e in new_ctx if e.get("history_index", len(chat_history)) < idx)
                     new_ctx.insert(insert_pos, ctx_entry)
                     new_ctx_tokens += ctx_entry["tokens"]
         
@@ -256,6 +293,264 @@ class ContextManager:
         This is the context that should be sent to the LLM.
         """
         return "\n".join([entry["formatted"] for entry in self.current_ctx])
+
+    # ---------------------------------------------------------------------
+    # Context-window action support methods
+    # ---------------------------------------------------------------------
+    def _recompute_current_ctx_tokens(self) -> int:
+        """Recompute and store the token total for ``current_ctx``.
+
+        This is used by surgical context-window operations that remove,
+        replace, or filter entries after they have already been tokenized.
+        """
+        total = 0
+        for entry in self.current_ctx:
+            if not isinstance(entry, dict):
+                entry = self._create_context_entry(entry)
+            tokens = entry.get("tokens")
+            if not isinstance(tokens, int):
+                formatted = entry.get("formatted")
+                if formatted is None:
+                    formatted = f"[{entry.get('timestamp', '')}][{entry.get('sender', '')}]: {self._stringify_content(entry.get('content', ''))}"
+                    entry["formatted"] = formatted
+                tokens = self._estimate_token_count(str(formatted))
+                entry["tokens"] = tokens
+            total += tokens
+        self.current_ctx_tokens = total
+        return total
+
+    def _chat_history_from_current_ctx(self) -> List[Dict[str, Any]]:
+        """Build a chat-history-like list from the active context buffer.
+
+        ``force_rebuild`` is best when called with the authoritative full chat
+        history. This fallback keeps the method safe when it is called directly
+        by older code that only passes a recipe.
+        """
+        chat_history = []
+        for entry in self.current_ctx:
+            if isinstance(entry, dict):
+                chat_history.append({
+                    "sender": entry.get("sender", ""),
+                    "content": entry.get("content", ""),
+                    "timestamp": entry.get("timestamp", ""),
+                })
+            else:
+                chat_history.append({"sender": "system", "content": entry, "timestamp": ""})
+        return chat_history
+
+    def force_rebuild(
+        self,
+        recipe: Optional[str] = "balanced",
+        chat_history: Optional[List[Dict[str, Any]]] = None,
+        memory_manager: Any = None,
+        target_utilization: Optional[float] = None,
+        verbose: int = 1,
+    ) -> Dict[str, Any]:
+        """Force an immediate context-buffer rebuild.
+
+        Parameters
+        ----------
+        recipe:
+            One of ``lean``, ``balanced``, or ``full``. The recipe controls the
+            target post-rebuild utilization and the source allocation ratios.
+        chat_history:
+            The authoritative full chat history. If omitted, the current active
+            context buffer is used as a safe fallback.
+        memory_manager:
+            Optional memory manager passed through to ``rebuild_current_ctx``.
+        target_utilization:
+            Optional explicit override for the recipe target.
+        verbose:
+            Verbosity level.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Before/after diagnostics and the recipe used.
+        """
+        recipe_name = (recipe or "balanced").strip().lower()
+        recipes = {
+            # Keep only the most recent/raw essentials plus critical entries.
+            "lean": {
+                "target_utilization": 0.35,
+                "recent_chat_ratio": 0.85,
+                "memory_ratio": 0.10,
+                "trace_ratio": 0.05,
+            },
+            # Normal automatic-compaction target.
+            "balanced": {
+                "target_utilization": 0.60,
+                "recent_chat_ratio": 0.50,
+                "memory_ratio": 0.30,
+                "trace_ratio": 0.20,
+            },
+            # Preserve more raw recent chat while still getting below threshold.
+            "full": {
+                "target_utilization": 0.75,
+                "recent_chat_ratio": 0.65,
+                "memory_ratio": 0.25,
+                "trace_ratio": 0.10,
+            },
+        }
+        if recipe_name not in recipes:
+            raise ValueError(f"Unknown context rebuild recipe '{recipe}'. Expected one of: {', '.join(recipes)}")
+
+        before = self.get_context_diagnostics()
+        selected = recipes[recipe_name]
+        selected_target = selected["target_utilization"] if target_utilization is None else target_utilization
+        if not 0.0 < selected_target <= 1.0:
+            raise ValueError("target_utilization must be in the interval (0.0, 1.0]")
+
+        if chat_history is None:
+            chat_history = self._chat_history_from_current_ctx()
+
+        # Temporarily apply recipe ratios. Preserve existing configuration so
+        # this forced operation does not permanently mutate session policy.
+        old_ratios = (self.recent_chat_ratio, self.memory_ratio, self.trace_ratio)
+        try:
+            self.recent_chat_ratio = selected["recent_chat_ratio"]
+            self.memory_ratio = selected["memory_ratio"]
+            self.trace_ratio = selected["trace_ratio"]
+            self.rebuild_current_ctx(
+                chat_history=chat_history,
+                memory_manager=memory_manager,
+                target_utilization=selected_target,
+                verbose=verbose,
+            )
+        finally:
+            self.recent_chat_ratio, self.memory_ratio, self.trace_ratio = old_ratios
+
+        after = self.get_context_diagnostics()
+        return {
+            "recipe": recipe_name,
+            "target_utilization": selected_target,
+            "before": before,
+            "after": after,
+        }
+
+    def set_window_start(self, start_index: int) -> Dict[str, Any]:
+        """Slide the active context window forward.
+
+        Entries with ``history_index`` lower than ``start_index`` are removed.
+        If entries do not have ``history_index`` metadata, their current list
+        position is used as a fallback index.
+        """
+        if start_index < 0:
+            raise ValueError("start_index must be non-negative")
+        before_entries = len(self.current_ctx)
+        before_tokens = self.current_ctx_tokens
+        filtered = []
+        for pos, entry in enumerate(self.current_ctx):
+            if not isinstance(entry, dict):
+                entry = self._create_context_entry(entry)
+            idx = entry.get("history_index", pos)
+            if idx >= start_index:
+                filtered.append(entry)
+        self._save_context_snapshot()
+        self.current_ctx = filtered
+        self._recompute_current_ctx_tokens()
+        self.context_version += 1
+        self.last_rebuild_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "start_index": start_index,
+            "entries_before": before_entries,
+            "entries_after": len(self.current_ctx),
+            "tokens_before": before_tokens,
+            "tokens_after": self.current_ctx_tokens,
+        }
+
+    def set_filter(self, excluded: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Filter active context entries containing excluded categories/terms.
+
+        The filter checks sender, action metadata, and stringified content. It
+        is intentionally conservative and only affects the active context
+        buffer, never the permanent chat history.
+        """
+        excluded = [str(x).strip().lower() for x in (excluded or []) if str(x).strip()]
+        self.excluded_categories = excluded
+        before_entries = len(self.current_ctx)
+        before_tokens = self.current_ctx_tokens
+        if not excluded:
+            return {
+                "excluded": [],
+                "entries_before": before_entries,
+                "entries_after": before_entries,
+                "tokens_before": before_tokens,
+                "tokens_after": before_tokens,
+            }
+
+        def matches(entry: Dict[str, Any]) -> bool:
+            action = entry.get("action", "") if isinstance(entry, dict) else ""
+            haystack = " ".join([
+                str(entry.get("sender", "")),
+                self._stringify_content(entry.get("content", "")),
+                self._stringify_content(action),
+            ]).lower()
+            return any(term in haystack for term in excluded)
+
+        self._save_context_snapshot()
+        self.current_ctx = [e for e in self.current_ctx if not matches(e if isinstance(e, dict) else self._create_context_entry(e))]
+        self._recompute_current_ctx_tokens()
+        self.context_version += 1
+        self.last_rebuild_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "excluded": excluded,
+            "entries_before": before_entries,
+            "entries_after": len(self.current_ctx),
+            "tokens_before": before_tokens,
+            "tokens_after": self.current_ctx_tokens,
+        }
+
+    def replace_range_with_memory(self, start: int, end: int, memory_key: str) -> Dict[str, Any]:
+        """Replace an active-context history range with a compact memory ref.
+
+        This supports the ``selective_context_summarization`` action. The
+        actual summary is stored by the memory manager; the context buffer keeps
+        a lightweight reference to that summary.
+        """
+        if start < 0 or end < start:
+            raise ValueError("Invalid range: expected 0 <= start <= end")
+        before_entries = len(self.current_ctx)
+        before_tokens = self.current_ctx_tokens
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        replacement = self._create_context_entry({
+            "sender": "system",
+            "content": f"[CONTEXT SUMMARY REFERENCE] Entries {start}-{end} replaced by memory key '{memory_key}'.",
+            "timestamp": now,
+        })
+        replacement["history_index"] = start
+        replacement["memory_key"] = memory_key
+        replacement["replaces_range"] = [start, end]
+
+        new_ctx = []
+        inserted = False
+        for pos, entry in enumerate(self.current_ctx):
+            if not isinstance(entry, dict):
+                entry = self._create_context_entry(entry)
+            idx = entry.get("history_index", pos)
+            if start <= idx < end:
+                if not inserted:
+                    new_ctx.append(replacement)
+                    inserted = True
+                continue
+            new_ctx.append(entry)
+        if not inserted:
+            new_ctx.append(replacement)
+            new_ctx.sort(key=lambda e: e.get("history_index", 10**12))
+
+        self._save_context_snapshot()
+        self.current_ctx = new_ctx
+        self._recompute_current_ctx_tokens()
+        self.context_version += 1
+        self.last_rebuild_timestamp = now
+        return {
+            "range": [start, end],
+            "memory_key": memory_key,
+            "entries_before": before_entries,
+            "entries_after": len(self.current_ctx),
+            "tokens_before": before_tokens,
+            "tokens_after": self.current_ctx_tokens,
+        }
 
     def get_context_diagnostics(self) -> Dict[str, Any]:
         """Return comprehensive diagnostics about the current context buffer.

@@ -73,8 +73,22 @@ class ForceContextRebuild(AgentAction):
 
     def execute(self, infra) -> None:
         try:
-            infra.context_manager.force_rebuild(recipe=self.payload.recipe)
-            ctx_msg = f"[CONTEXT] Forced rebuild completed using recipe: {self.payload.recipe}"
+            result = infra.context_manager.force_rebuild(
+                recipe=self.payload.recipe,
+                chat_history=infra.chat_manager.CHAT_HISTORY,
+                memory_manager=infra.memory_manager,
+                verbose=1,
+            )
+            before = result.get("before", {})
+            after = result.get("after", {})
+            ctx_msg = (
+                f"[CONTEXT] Forced rebuild completed using recipe: {result.get('recipe', self.payload.recipe)}\n"
+                f"Purpose: {self.payload.purpose or 'not specified'}\n"
+                f"Tokens: {before.get('current_ctx_tokens', 'N/A')} -> {after.get('current_ctx_tokens', 'N/A')}\n"
+                f"Utilization: {before.get('utilization_pct', 0):.1f}% -> {after.get('utilization_pct', 0):.1f}%\n"
+                f"Entries: {before.get('num_entries', 'N/A')} -> {after.get('num_entries', 'N/A')}\n"
+                f"Context version: {after.get('context_version', 'N/A')}"
+            )
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True)
         except Exception as e:
             error_msg = f"[ERROR][CONTEXT] Failed to force rebuild: {e}"

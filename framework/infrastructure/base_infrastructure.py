@@ -20,6 +20,7 @@ from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnow
 from framework.tooling.toolbox import ToolBox
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
 from framework.universes.base_universe import BaseUniverse
+from framework.utils.multimodal_input import MultimodalInputProcessor, MultimodalInputConfig
 
 class BaseInfrastructure:
     """Provides non-workflow-specific functionality with integrated managers."""
@@ -40,12 +41,24 @@ class BaseInfrastructure:
         traces_vector_store: Any = None,
         summaries_vector_store: Any = None,
         db_client: Any = None,
-        infra_description_file = "framework/infrastructure/config/base_infra_description.md"
+        infra_description_file = "framework/infrastructure/config/base_infra_description.md",
+        input_processor: Any = None,
+        input_processor_config: Any = None
     ):
         # Support session_dir as primary, fall back to wf_log_dir for backwards compatibility
         self.session_dir = session_dir.strip().rstrip("/")
         self.log_dir = f"{self.session_dir}/{wf_log_dir.strip().rstrip('/')}"
         self.db_client = db_client
+        # Reusable user-input processing service. Workflows can opt in without
+        # owning parsing/classification/provider-adapter logic.
+        if input_processor is not None:
+            self.input_processor = input_processor
+        else:
+            if input_processor_config is None:
+                input_processor_config = MultimodalInputConfig(root_dir=str(Path.cwd()))
+            self.input_processor = MultimodalInputProcessor(config=input_processor_config)
+        self.pending_user_input_bundle = None
+        self.pending_agent_content = None
         # Store basic parameters
         self.agent = agent
         self.max_ctx_tokens = max_ctx_tokens
@@ -476,6 +489,31 @@ class BaseInfrastructure:
             PROMPT = user_prompt.strip()
         
         return BREAK, IS_CMD, ERROR, INTERLOCUTOR, PROMPT
+
+
+    # ------ Reusable multimodal user-input preparation ------
+    def prepare_user_input_for_agent(self, user_prompt: str, agent: Any = None):
+        """Normalize a regular user prompt and prepare optional attachments.
+
+        This workflow-independent service parses inline ``<input> ... <input/>``
+        tags, classifies referenced files, prepares provider-ready content for
+        the next immediate agent call, and returns a compact history-safe bundle.
+        Heavy payloads (e.g. base64 images) are intentionally kept out of chat
+        history and stored only as pending in-memory content.
+        """
+        if agent is None:
+            agent = self.agent
+        bundle = self.input_processor.process(user_prompt, agent=agent)
+        self.pending_user_input_bundle = bundle
+        self.pending_agent_content = bundle.agent_content if bundle.has_attachments else None
+        return bundle
+
+    def consume_pending_agent_content(self):
+        """Return and clear pending rich multimodal content for one agent turn."""
+        content = self.pending_agent_content
+        self.pending_agent_content = None
+        self.pending_user_input_bundle = None
+        return content
 
     # ------ Snapshot and Restore methods ------
     def snapshot(self) -> Dict[str, Any]:

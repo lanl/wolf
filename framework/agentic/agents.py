@@ -23,6 +23,7 @@ except ImportError:
 from framework.agentic.agentic_tools import NameGenerator
 from framework.utils.io_tools import console, jsonfy
 from framework.utils.json_parsing import robust_jsonfy
+from framework.utils.multimodal_input import append_text_block
 
 Message = Dict[str, str]  # alias for chat message dict
 
@@ -346,10 +347,13 @@ class OpenAIAgent:
                 if isinstance(item, str):
                     content.append({"type": "text", "text": item})
                 elif isinstance(item, dict):
-                    if "image_url" in item:
-                        content.append({"type": "image_url", "image_url": item})
-                    elif "type" in item:
+                    # Prefer already-normalized OpenAI content blocks, e.g.
+                    # {"type": "image_url", "image_url": {"url": "data:..."}}.
+                    # The older branch below still accepts a bare image_url dict.
+                    if "type" in item:
                         content.append(item)
+                    elif "image_url" in item:
+                        content.append({"type": "image_url", "image_url": item["image_url"]})
                     else:
                         content.append({"type": "text", "text": str(item)})
             return self.CTX + [{"role": "user", "content": content}]
@@ -386,8 +390,14 @@ class OpenAIAgent:
 
     def format_agent_response(self, prompt, schema, n_max_trials=5):
         n_trial = 0
+        raw = None
+        result = {}
         while n_trial < n_max_trials:
-            raw = self.get_chat_response(user_prompt=prompt + f"\n{schema}")
+            # ``prompt`` may be either a plain string or an OpenAI-style list of
+            # multimodal content blocks. Append the schema as a text block for
+            # multimodal prompts instead of using string concatenation.
+            prompt_with_schema = append_text_block(prompt, schema)
+            raw = self.get_chat_response(user_prompt=prompt_with_schema)
             result = robust_jsonfy(raw)
             if "parsed" in result:
                 return False, result["parsed"], raw, result
