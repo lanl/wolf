@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wolf GUI</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="wolf-shell">
+      <iframe id="workspace-frame" class="workspace-frame" title="Wolf visual workspace" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-downloads"></iframe>
+      <section id="dashboard-workspace" class="dashboard-workspace" aria-label="Agent dashboard workspace" hidden></section>
+      <div id="blank-workspace" class="blank-workspace">
+        <div class="blank-card">
+          <div class="wolf-mark">◈</div>
+          <h1>Wolf Visual Workspace</h1>
+          <p>Load a browser page, generated dashboard, report, artifact, or CAD/mesh visualization behind the floating agent panel.</p>
+        </div>
+      </div>
+      <div id="annotation-layer" class="annotation-layer" aria-label="Annotation layer"></div>
+      <div id="draw-preview" class="draw-preview" hidden></div>
+
+      <header id="top-toolbar" class="top-toolbar glass toolbar-mid">
+        <div class="toolbar-primary">
+          <button id="toolbar-toggle" class="toolbar-toggle" type="button" aria-expanded="true" title="Cycle toolbar size">◑</button>
+          <span class="brand-icon" title="Wolf Visual Workspace">◈</span>
+        </div>
+        <div id="toolbar-controls" class="toolbar-controls">
+          <input id="workspace-mode" type="hidden" value="browser" />
+          <form id="open-url-form" class="url-form">
+            <input id="workspace-url" type="text" placeholder="Open URL…" autocomplete="off" />
+            <button type="submit" title="Open URL">Open</button>
+          </form>
+          <div class="toolbar-group nav-group" aria-label="Workspace navigation controls">
+            <button class="toolbar-group-trigger" type="button" title="Navigation controls">↔</button>
+            <div class="toolbar-group-items nav-controls">
+              <button id="workspace-back" type="button" title="Back in workspace page">←</button>
+              <button id="workspace-forward" type="button" title="Forward in workspace page">→</button>
+              <button id="workspace-refresh" type="button" title="Refresh workspace page">↻</button>
+              <button id="workspace-open-external" type="button" title="Open workspace page externally">↗</button>
+            </div>
+          </div>
+          <div class="toolbar-group annotation-group" aria-label="Annotation controls">
+            <button class="toolbar-group-trigger" type="button" title="Annotation controls">✎</button>
+            <div class="toolbar-group-items annotation-controls">
+              <button id="toggle-annotate" type="button" class="mode-button" title="Toggle point annotation mode">Point</button>
+              <button id="toggle-rect" type="button" class="mode-button" title="Toggle rectangle annotation mode">Box</button>
+              <button id="clear-annotations" type="button" title="Clear annotations">Clear</button>
+            </div>
+          </div>
+          <div class="toolbar-group dashboard-group toolbar-dashboard" aria-label="Dashboard controls">
+            <button class="toolbar-group-trigger" type="button" title="Dashboard controls">▦</button>
+            <div class="toolbar-group-items dashboard-controls">
+              <button id="dashboard-float-toggle" type="button" class="dashboard-float-toggle" title="Float or grid dashboard panels" disabled>Float</button>
+              <button id="dashboard-snap-grid" type="button" class="dashboard-snap-toggle" title="Snap floating dashboard panels to a grid" disabled>Snap</button>
+            </div>
+          </div>
+          <select id="dock-mode" class="toolbar-advanced" title="Dock chat panel">
+            <option value="float">Float</option>
+            <option value="left">Dock Left</option>
+            <option value="right">Dock Right</option>
+            <option value="top">Dock Top</option>
+            <option value="bottom">Dock Bottom</option>
+          </select>
+          <button id="wolfGatewayOpenButton" class="wolf-gateway-open toolbar-advanced" type="button" aria-haspopup="dialog" onclick="window.WolfGatewayUI ? window.WolfGatewayUI.open() : (document.getElementById('wolfGatewayOverlay')?.classList.remove('wolf-gateway-hidden'))"><span id="gui-health-dot" class="gui-health-dot" aria-hidden="true"></span><span>Gateway</span></button>
+        </div>
+      </header>
+
+      <aside id="agent-panel" class="agent-panel glass">
+        <div id="agent-panel-header" class="agent-panel-header">
+          <div>
+            <strong>Floating Agent</strong>
+            <div id="session-summary" class="muted tiny">visual context enabled</div>
+          </div>
+          <div class="panel-actions">
+            <select id="dock-mode-panel" title="Dock chat panel">
+              <option value="float">Float</option>
+              <option value="left">Dock Left</option>
+              <option value="right">Dock Right</option>
+              <option value="top">Dock Top</option>
+              <option value="bottom">Dock Bottom</option>
+            </select>
+            <button class="wolf-gateway-mini" type="button" data-wolf-gateway-open title="Connect gateway" onclick="window.WolfGatewayUI ? window.WolfGatewayUI.open() : (document.getElementById('wolfGatewayOverlay')?.classList.remove('wolf-gateway-hidden'))">Gateway</button>
+            <button id="refresh-state" type="button" title="Refresh discovery state">↻</button>
+            <button id="collapse-panel" type="button" title="Collapse panel">−</button>
+          </div>
+        </div>
+        <div id="agent-panel-body" class="agent-panel-body">
+          <section class="status-strip">
+            <div><span class="tiny muted">Workspace</span><span id="workspace-summary">browser</span></div>
+            <div><span class="tiny muted">Workflows</span><span id="workflow-count">?</span></div>
+            <div><span class="tiny muted">Sessions</span><span id="session-count">?</span></div>
+          </section>
+          <div id="messages" class="messages"></div>
+          <form id="message-form" class="message-form">
+            <textarea id="message-input" rows="3" placeholder="Ask about the visual workspace. Pointer/annotation context is attached automatically."></textarea>
+            <div class="composer-row">
+              <div class="composer-toggles" aria-label="Workspace context controls">
+                <label class="composer-toggle" title="Attach the current Wolf GUI workspace context to each message you send.">
+                  <input id="include-visual-context" type="checkbox" checked />
+                  <span class="toggle-icon" aria-hidden="true">👁</span>
+                  <span>Attach workspace view</span>
+                </label>
+                <label class="composer-toggle" title="Allow the connected agent to inspect the current Wolf GUI workspace on demand via gui_get_visual_context.">
+                  <input id="allow-agent-inspect" type="checkbox" />
+                  <span class="toggle-icon" aria-hidden="true">🔭</span>
+                  <span>Allow agent inspect</span>
+                </label>
+                <label class="composer-toggle" title="Allow the connected agent to request permissioned backend pixel screenshots via gui_capture_url/gui_capture_workspace. Captures may include visible page contents.">
+                  <input id="allow-agent-capture" type="checkbox" />
+                  <span class="toggle-icon" aria-hidden="true">📸</span>
+                  <span>Allow agent capture</span>
+                </label>
+              </div>
+              <button type="submit">Send</button>
+            </div>
+          </form>
+        </div>
+        <div class="agent-panel-resize resize-nw" data-resize-corner="nw" role="separator" aria-label="Resize chat panel from top left" title="Drag to resize chat panel"></div>
+        <div class="agent-panel-resize resize-ne" data-resize-corner="ne" role="separator" aria-label="Resize chat panel from top right" title="Drag to resize chat panel"></div>
+        <div class="agent-panel-resize resize-sw" data-resize-corner="sw" role="separator" aria-label="Resize chat panel from bottom left" title="Drag to resize chat panel"></div>
+        <div id="agent-panel-resize" class="agent-panel-resize resize-se" data-resize-corner="se" role="separator" aria-label="Resize chat panel from bottom right" title="Drag to resize chat panel"></div>
+      </aside>
+
+      <button id="panel-tab" class="panel-tab glass" type="button" hidden>Agent</button>
+      <div id="toast" class="toast" hidden></div>
+    </div>
+    <script src="/static/app.js?v=gui-visual-context-v1"></script>
+  
+
+<div id="wolfGatewayOverlay" class="wolf-gateway-overlay wolf-gateway-hidden" aria-hidden="true">
+  <div class="wolf-gateway-modal" role="dialog" aria-modal="true" aria-labelledby="wolfGatewayTitle">
+    <div class="wolf-gateway-header">
+      <div>
+        <p class="wolf-gateway-kicker">Wolf</p>
+        <h2 id="wolfGatewayTitle">Connect to gateway</h2>
+      </div>
+      <button id="wolfGatewayCloseButton" class="wolf-gateway-icon" type="button" aria-label="Close gateway dialog" onclick="window.WolfGatewayUI ? window.WolfGatewayUI.close() : (document.getElementById('wolfGatewayOverlay')?.classList.add('wolf-gateway-hidden'))">×</button>
+    </div>
+    <form id="wolfGatewayForm" class="wolf-gateway-form">
+      <label>Gateway URL
+        <input id="wolfGatewayUrl" type="url" placeholder="http://127.0.0.1:8080" required />
+      </label>
+      <details class="wolf-gateway-raw-panel wolf-gateway-auth-advanced">
+        <summary>Advanced: existing gateway auth token</summary>
+        <label>Gateway auth token, not provider API key
+          <input id="wolfGatewayToken" type="password" placeholder="Usually leave blank; returned by /auth/login" autocomplete="off" />
+        </label>
+        <p class="wolf-gateway-help">Provider/LLM API keys belong in Agent parameters after a session is connected.</p>
+      </details>
+      <div class="wolf-gateway-row">
+        <label>Username
+          <input id="wolfGatewayUsername" type="text" placeholder="admin" autocomplete="username" />
+        </label>
+        <label>Password
+          <input id="wolfGatewayPassword" type="password" placeholder="password" autocomplete="current-password" />
+        </label>
+      </div>
+      <div class="wolf-gateway-actions-inline wolf-gateway-auth-actions">
+        <button id="wolfGatewayAuthenticate" class="wolf-gateway-primary" type="button">Authenticate</button>
+      </div>
+<div id="wolfGatewaySessionStep" class="wolf-gateway-session-step wolf-gateway-hidden" aria-live="polite">
+        <div id="wolfGatewayAuthSummary" class="wolf-gateway-auth-summary">Not authenticated.</div>
+        <label>Session
+          <select id="wolfGatewaySessionSelect">
+            <option value="">Authenticate first…</option>
+          </select>
+        </label>
+        <div class="wolf-gateway-actions-inline">
+          <button id="wolfGatewayRefreshSessions" class="wolf-gateway-ghost" type="button">Fetch sessions</button>
+          <button id="wolfGatewayCreateSession" class="wolf-gateway-ghost" type="button">Create new session</button>
+          <button id="wolfGatewayConnectSession" class="wolf-gateway-primary" type="button">Connect selected session</button>
+        </div>
+        <details id="wolfGatewayParamsPanel" class="wolf-gateway-params-panel">
+          <summary>Agent parameters</summary>
+          <div class="wolf-gateway-actions-inline">
+            <button id="wolfGatewayShowParams" class="wolf-gateway-ghost" type="button">Fetch agent params</button>
+            <button id="wolfGatewaySaveParams" class="wolf-gateway-ghost" type="button">Commit agent params</button>
+            <button id="wolfGatewayResetSession" class="wolf-gateway-ghost" type="button">Reset context</button>
+          </div>
+          <div id="wolfGatewayConfigForm" class="wolf-gateway-config-form wolf-gateway-agent-form">
+            <label>Model
+              <input id="wolfCfgModel" type="text" placeholder="model name" autocomplete="off" />
+            </label>
+            <label>Provider URL
+              <input id="wolfCfgHostAddress" type="url" placeholder="http://localhost" autocomplete="off" />
+            </label>
+            <label>Host port
+              <input id="wolfCfgHostPort" type="number" min="1" max="65535" placeholder="optional" />
+            </label>
+            <label>API version
+              <input id="wolfCfgApiVersion" type="text" placeholder="v1 or api/v1" autocomplete="off" />
+            </label>
+            <label>API key
+              <input id="wolfCfgApiKey" type="password" placeholder="leave blank to keep existing" autocomplete="off" />
+            </label>
+            <label>API key env var
+              <input id="wolfCfgApiKeyVar" type="text" placeholder="LOCAL_API_KEY" autocomplete="off" />
+            </label>
+            <label>Agent name
+              <input id="wolfCfgAgentName" type="text" placeholder="optional" autocomplete="off" />
+            </label>
+            <label>Verbose
+              <input id="wolfCfgVerbose" type="number" min="0" max="5" step="1" />
+            </label>
+            <label>Workflow mode
+              <select id="wolfCfgMode">
+                <option value="single_step">single_step</option>
+                <option value="wolf_loop">wolf_loop</option>
+              </select>
+            </label>
+            <label>Max steps
+              <input id="wolfCfgMaxSteps" type="number" min="1" max="20" step="1" />
+            </label>
+            <label>Context window
+              <input id="wolfCfgCtxWindow" type="number" min="1" step="1" placeholder="optional" />
+            </label>
+            <label class="wolf-gateway-config-wide">Capabilities (comma separated)
+              <input id="wolfCfgCapabilities" type="text" placeholder="text, structured_output" autocomplete="off" />
+            </label>
+            <label class="wolf-gateway-config-wide">System prompt
+              <textarea id="wolfCfgSysPrompt" rows="4" spellcheck="true" placeholder="System prompt"></textarea>
+            </label>
+          </div>
+          <details class="wolf-gateway-raw-panel">
+            <summary>Advanced agent params JSON</summary>
+            <textarea id="wolfGatewayParamsEditor" class="wolf-gateway-params-editor" rows="8" spellcheck="false" placeholder="Raw agent params JSON. Known agent fields stay synchronized; policy keys are committed from the Policy parameters panel."></textarea>
+          </details>
+        </details>
+
+        <details id="wolfGatewayPolicyPanel" class="wolf-gateway-params-panel wolf-gateway-policy-panel">
+          <summary>Policy parameters</summary>
+          <div class="wolf-gateway-actions-inline">
+            <button id="wolfGatewayShowPolicy" class="wolf-gateway-ghost" type="button">Fetch policy params</button>
+            <button id="wolfGatewaySavePolicy" class="wolf-gateway-ghost" type="button">Commit policy params</button>
+          </div>
+          <div id="wolfGatewayPolicyForm" class="wolf-gateway-config-form wolf-gateway-policy-form">
+            <label>Action policy
+              <select id="wolfCfgActionPolicy">
+                <option value="limited" selected>limited</option>
+                <option value="safe">safe</option>
+                <option value="write">write</option>
+                <option value="dev">dev</option>
+                <option value="advanced">advanced</option>
+                <option value="master">master</option>
+                <option value="custom">custom</option>
+              </select>
+            </label>
+            <label class="wolf-gateway-check"><input id="wolfCfgEnableWrite" type="checkbox" /> Enable write_file</label>
+            <label class="wolf-gateway-check"><input id="wolfCfgEnableSyscall" type="checkbox" /> Enable run_syscall</label>
+            <label class="wolf-gateway-check"><input id="wolfCfgEnableGuiCapture" type="checkbox" /> Enable GUI screenshot capture</label>
+            <label class="wolf-gateway-check"><input id="wolfCfgSyscallShell" type="checkbox" /> Allow syscall shell</label>
+            <label>Syscall timeout
+              <input id="wolfCfgSyscallTimeout" type="number" min="1" max="120" step="1" />
+            </label>
+            <label class="wolf-gateway-config-wide">Allowed actions (comma separated; blank = policy default)
+              <input id="wolfCfgActionNames" type="text" placeholder="send_message, read_file" autocomplete="off" />
+            </label>
+            <label class="wolf-gateway-config-wide">Syscall allowlist (comma separated)
+              <input id="wolfCfgSyscallAllow" type="text" placeholder="pwd, ls, cat, grep" autocomplete="off" />
+            </label>
+          </div>
+          <details class="wolf-gateway-raw-panel">
+            <summary>Advanced policy params JSON</summary>
+            <textarea id="wolfGatewayPolicyEditor" class="wolf-gateway-params-editor" rows="8" spellcheck="false" placeholder="Raw policy params JSON. Commit sends only policy-related keys."></textarea>
+          </details>
+        </details>
+
+      <p id="wolfGatewayFeedback" class="wolf-gateway-feedback" aria-live="polite"></p>
+      <div class="wolf-gateway-actions">
+        <button id="wolfGatewayLocalButton" class="wolf-gateway-ghost" type="button">Continue local</button>
+        <button id="wolfGatewaySubmitButton" class="wolf-gateway-primary" type="submit">Authenticate</button>
+      </div>
+    </form>
+    <div class="wolf-gateway-state" aria-live="polite">
+      <span id="wolfGatewayStatusDot" class="wolf-gateway-dot"></span>
+      <span id="wolfGatewayStatusText">Gateway disconnected · local workspace active</span>
+    </div>
+  </div>
+</div>
+
+    <script src="/static/gateway.js?v=gateway-visual-context-v1"></script>
+  </body>
+</html>

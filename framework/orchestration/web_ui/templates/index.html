@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WOLF Orchestration Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="dashboard-header">
+            <h1>🐺 WOLF Orchestration Dashboard</h1>
+            <div class="header-controls">
+                <span id="connection-status" class="status-indicator disconnected">●</span>
+                <span id="connection-text">Disconnected</span>
+            </div>
+        </header>
+
+        <!-- Main Layout -->
+        <div class="dashboard-layout">
+            <!-- Left Sidebar: Task Tree -->
+            <aside class="sidebar left-sidebar">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>📊 Task Tree</h2>
+                        <div class="panel-controls">
+                            <button id="refresh-tree" class="btn-icon" title="Refresh">🔄</button>
+                            <button id="collapse-all" class="btn-icon" title="Collapse All">📁</button>
+                            <button id="expand-all" class="btn-icon" title="Expand All">📂</button>
+                        </div>
+                    </div>
+                    <div class="panel-body">
+                        <div id="task-tree-container"></div>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Center: Chat Interface -->
+            <main class="main-content">
+                <div class="panel chat-panel">
+                    <div class="panel-header">
+                        <h2>💬 Task Chat</h2>
+                        <div class="panel-controls">
+                            <select id="selected-task" class="task-selector">
+                                <option value="">Select a task...</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="panel-body">
+                        <div id="chat-messages" class="chat-messages"></div>
+                        <div class="chat-input-area">
+                            <textarea id="chat-input" placeholder="Type a message..." rows="3"></textarea>
+                            <div class="chat-controls">
+                                <button id="send-message" class="btn-primary">Send</button>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="wake-task" checked>
+                                    Wake task on send
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Task Detail Panel -->
+                <div class="panel task-detail-panel">
+                    <div class="panel-header">
+                        <h2>📋 Task Details</h2>
+                        <div class="panel-controls">
+                            <button id="pause-task" class="btn-secondary">⏸ Pause</button>
+                            <button id="resume-task" class="btn-secondary">▶ Resume</button>
+                            <button id="cancel-task" class="btn-danger">✖ Cancel</button>
+                            <button id="retry-task" class="btn-secondary">🔄 Retry</button>
+                        </div>
+                    </div>
+                    <div class="panel-body">
+                        <div id="task-detail-content" class="task-detail">
+                            <p class="placeholder">Select a task to view details</p>
+                        </div>
+                    </div>
+                </div>
+            </main>
+
+            <!-- Right Sidebar: Monitoring -->
+            <aside class="sidebar right-sidebar">
+                <!-- Agent Pool Monitor -->
+                <div class="panel mini-panel">
+                    <div class="panel-header">
+                        <h3>🤖 Agent Pool</h3>
+                        <button id="refresh-agents" class="btn-icon" title="Refresh">🔄</button>
+                    </div>
+                    <div class="panel-body">
+                        <div id="agent-pool-stats"></div>
+                    </div>
+                </div>
+
+                <!-- System Metrics -->
+                <div class="panel mini-panel">
+                    <div class="panel-header">
+                        <h3>📈 System Metrics</h3>
+                        <button id="refresh-metrics" class="btn-icon" title="Refresh">🔄</button>
+                    </div>
+                    <div class="panel-body">
+                        <div id="system-metrics"></div>
+                    </div>
+                </div>
+
+                <!-- Event Stream -->
+                <div class="panel mini-panel event-panel">
+                    <div class="panel-header">
+                        <h3>🔔 Events</h3>
+                        <button id="clear-events" class="btn-icon" title="Clear">🗑</button>
+                    </div>
+                    <div class="panel-body">
+                        <div id="event-stream" class="event-list"></div>
+                    </div>
+                </div>
+            </aside>
+        </div>
+
+        <!-- Create Task Modal -->
+        <div id="create-task-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>Create New Task</h2>
+                    <button class="modal-close">✖</button>
+                </div>
+                <div class="modal-body">
+                    <form id="create-task-form">
+                        <div class="form-group">
+                            <label for="task-name">Task Name:</label>
+                            <input type="text" id="task-name" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="task-objective">Objective:</label>
+                            <textarea id="task-objective" rows="4" required></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label for="task-workflow-type">Workflow Type:</label>
+                            <select id="task-workflow-type">
+                                <option value="generic">Generic</option>
+                                <option value="chat">Chat</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="task-session-id">Session ID (optional):</label>
+                            <input type="text" id="task-session-id">
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="btn-primary">Create Task</button>
+                            <button type="button" class="btn-secondary modal-cancel">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- FAB for creating tasks -->
+    <button id="fab-create-task" class="fab" title="Create New Task">+</button>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

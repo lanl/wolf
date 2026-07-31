@@ -1,0 +1,37 @@
+[project]
+name = "wolf"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alive-progress>=3.3.0",
+    "beautifulsoup4>=4.15.0",
+    "chromadb>=1.5.9",
+    "dill>=0.4.1",
+    "dotenv>=0.9.9",
+    "fastapi>=0.138.0",
+    "faster-whisper>=1.2.1",
+    "ffmpeg>=1.4",
+    "funkybob>=2023.12.0",
+    "ipython>=9.15.0",
+    "jupyter-console>=6.6.3",
+    "matplotlib>=3.11.0",
+    "nbformat>=5.10.4",
+    "open-clip-torch>=3.3.0",
+    "openai>=2.43.0",
+    "pdfplumber>=0.11.10",
+    "pillow>=12.2.0",
+    "pip>=26.1.2",
+    "playwright>=1.61.0",
+    "prompt-toolkit>=3.0.52",
+    "python-dotenv>=1.2.2",
+    "rank-bm25>=0.2.2",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+    "searxng-wrapper>=0.1.1",
+    "sentence-transformers>=5.6.0",
+    "tiktoken>=0.13.0",
+    "uvicorn>=0.49.0",
+    "websockets>=16.0",
+]

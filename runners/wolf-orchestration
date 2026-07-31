@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+PYTHONPATH=./ python ./framework/orchestration/web_ui/launcher_fixed.py

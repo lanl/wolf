@@ -1,0 +1,285 @@
+---
+nugget_id: wolf_cli_app_entrypoint
+title: "Real ./wolf CLI Application Entrypoint"
+author_agent: "silly_saha"
+created_at: "2026-07-22"
+last_reviewed_at: "2026-07-22"
+status: "active"
+confidence: "source-inspected-and-smoke-tested"
+source_files:
+  - "./wolf"
+  - "./framework/cli/wolf_app.py"
+  - "./framework/cli/config_loader.py"
+  - "./framework/cli/discovery.py"
+  - "./framework/cli/session_commands.py"
+  - "./framework/cli/launchers.py"
+  - "./framework/utils/config_tools.py"
+  - "./framework/workflows/workflow_space.py"
+  - "./sessions/example_cli_session.json"
+related_docs:
+  - "./app.md"
+  - "./wisdom.md"
+  - "./implementation_wolf_cli_app.md"
+tags:
+  - launcher
+  - cli
+  - wolf-wrapper
+  - session-config
+  - workflow-discovery
+  - session-management
+  - implementation
+---
+
+# Nugget: Real `./wolf` CLI Application Entrypoint
+
+The root `./wolf` executable is now a real application launcher rather than a hardcoded wrapper around `runners/interactive.py`.
+
+Current wrapper:
+
+```bash
+#!/usr/bin/env bash
+PYTHONPATH=./ uv run python -m framework.cli.wolf_app "$@"
+```
+
+The launcher implementation lives under:
+
+```text
+framework/cli/
+```
+
+Main entrypoint:
+
+```text
+framework/cli/wolf_app.py
+```
+
+---
+
+## Main user-facing commands
+
+Plain old behavior remains valid:
+
+```bash
+./wolf
+```
+
+This launches CLI mode with `TurnBasedWorkflow`.
+
+Useful commands:
+
+```bash
+./wolf --help
+./wolf cli --dry-run --explain
+./wolf cli --workflow TurnBasedWorkflow
+./wolf cli --workflow FastTurnBasedWorkflow
+./wolf cli --resume last
+./wolf cli --config sessions/example_cli_session.json
+./wolf workflows list
+./wolf actions list --limit 10
+./wolf sessions list
+./wolf sessions inspect last
+./wolf config print --config sessions/example_cli_session.json
+./wolf config validate --config sessions/example_cli_session.json
+./wolf doctor
+```
+
+Registered modes:
+
+- `cli` — primary supported mode.
+- `api` — currently maps to existing `AsyncAPIWorkflow` FastAPI app path.
+- `tui` — currently maps to existing gateway TUI demo path.
+- `gui` — registered but intentionally reports that no stable production GUI launcher is wired yet.
+
+---
+
+## Config loading model
+
+Implemented in:
+
+```text
+framework/cli/config_loader.py
+```
+
+Launch config merge order:
+
+```text
+built-in defaults
+  < optional JSON/YAML launch config
+  < CLI overrides
+```
+
+Defaults are built from:
+
+- `config.session.default.params.inputs:session_params`
+- `config.defaults.inference_engine:LLM`
+
+The final launch config has this shape:
+
+```python
+{
+    "mode": "cli",
+    "workflow": "TurnBasedWorkflow",
+    "resume_session": None,
+    "user_name": "user",
+    "session": { ... session params ..., "LLMs": ... },
+    "llms": { ... },
+    "run": {},
+}
+```
+
+JSON is supported directly. YAML is supported only if PyYAML is installed.
+
+Example file:
+
+```text
+sessions/example_cli_session.json
+```
+
+---
+
+## Workflow selection
+
+Workflow discovery is based on:
+
+```text
+framework/workflows/workflow_space.py
+```
+
+The launcher resolves workflows with:
+
+```python
+get_workflow_class(workflow_name)
+```
+
+A bug was fixed there:
+
+```python
+WF_NAMEs = list(WF.keys())
+```
+
+became:
+
+```python
+WF_NAMEs = list(WFs.keys())
+```
+
+A helper was also added:
+
+```python
+list_workflow_classes()
+```
+
+At smoke-test time, discovered workflows included:
+
+- `BaseWorkflow`
+- `TurnBasedWorkflow`
+- `FastTurnBasedWorkflow`
+- `AsyncAPIWorkflow`
+
+---
+
+## Session builder changes
+
+Implemented in:
+
+```text
+framework/utils/config_tools.py
+```
+
+The session builder can now receive a workflow class instead of hardcoding `TurnBasedWorkflow`:
+
+```python
+setup_cli_session(..., workflow_cls=TurnBasedWorkflow)
+load_existing_session(..., workflow_cls=TurnBasedWorkflow)
+CliSession.create_session(..., workflow_cls=TurnBasedWorkflow)
+```
+
+This enables:
+
+```bash
+./wolf cli --workflow FastTurnBasedWorkflow
+```
+
+The new-session path also avoids several side-effectful default-constructor patterns such as:
+
+```python
+session_params.get('session_dir', create_session_dir())
+```
+
+The new style explicitly checks for `None` before constructing defaults.
+
+---
+
+## Session management commands
+
+Implemented in:
+
+```text
+framework/cli/session_commands.py
+```
+
+Commands:
+
+```bash
+./wolf sessions list
+./wolf sessions inspect last
+```
+
+These inspect snapshot files under:
+
+```text
+wf_workspace/session_*/session.snapshot.json
+```
+
+Supported inspect identifiers include `last`/`latest`, paths, session IDs, and partial matches.
+
+---
+
+## Diagnostics and validation
+
+`./wolf doctor` checks:
+
+- framework import
+- workflow discovery
+- action discovery
+- default/config loading
+- LLM config presence
+- `wf_workspace` writability
+
+`./wolf config validate` checks:
+
+- supported mode
+- workflow discoverability
+- LLM presence
+- basic LLM model/key-var warnings
+
+---
+
+## Known limitations / future cleanup
+
+1. Discovery imports are noisy because existing workflow/action modules print during import.
+2. TUI/API/GUI mode support is only first-pass wiring, not a stable unified interface abstraction yet.
+3. YAML config depends on optional PyYAML.
+4. There is no Pydantic launch-config schema yet.
+5. Action-profile/subset support is deferred until `get_actions_subset()` is reviewed/fixed.
+6. Session deletion and profile templates are not implemented yet.
+
+---
+
+## Search keywords
+
+Use this nugget when looking for knowledge about:
+
+- `./wolf`
+- `framework.cli.wolf_app`
+- CLI launcher
+- session config JSON/YAML
+- workflow selection
+- workflow discovery
+- `FastTurnBasedWorkflow`
+- `TurnBasedWorkflow`
+- `CliSession.create_session(workflow_cls=...)`
+- `setup_cli_session(workflow_cls=...)`
+- `./wolf doctor`
+- `./wolf sessions list`
+- `./wolf config validate`

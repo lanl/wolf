@@ -1,0 +1,137 @@
+# -------------------------
+# Python bytecode / cache
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+# C extensions
+*.so
+
+# -------------------------
+# Site-specifics
+# -------------------------
+*_lanl*
+*_sandia*
+*_snl*
+*_llnl*
+
+# -------------------------
+# WOLF Backups
+# -------------------------
+*.wfbk
+*.bk
+*.Baks*
+*.bak
+*.backup
+*.hold*
+*.wfbk.*
+*.wfbk_*
+*.wfbk2*
+*.wfbk3*
+*.wfbk4*
+*.working*
+*_dev.py
+*.dev
+*_v1*.py
+*_v2*.py
+*_v3*.py
+*_v4*.py
+
+
+# -------------------------
+# Packaging / build artifacts
+# -------------------------
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+*.egg
+sdist/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# -------------------------
+# Test / coverage
+# -------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# -------------------------
+# Type checkers / linters
+# -------------------------
+.mypy_cache/
+.pytype/
+.pyre/
+
+# -------------------------
+# IDE / editor settings
+# -------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# -------------------------
+# Logs / temp
+# -------------------------
+*.log
+*.tmp
+*.temp
+tmp/
+
+# -------------------------
+# Environment files / secrets
+# -------------------------
+.env
+.env.*
+*.env
+!sample.env
+!.env.example
+
+# -------------------------
+# Data / local artifacts
+# -------------------------
+*.sqlite3
+*.bak*
+*.zip
+*.bin
+data/
+test_data/
+
+# -------------------------
+# Project-specific ignores
+# (add trailing / for directories)
+# -------------------------
+wf_workspace
+update_env.sh
+.HOLD
+HOLD/
+TOOLBOX/
+ACTIONBOXES/
+SIMs/
+PLAYBOOKs/
+RAG/
+VSTORE/
+backups/
+images/
+mada_mvp/
+solvers/
+standar_wf/
+.chainlit/   # prefer directory form over *.chainlit
+
+# If `service/` contains source you want tracked, do NOT ignore it.
+# service/
+

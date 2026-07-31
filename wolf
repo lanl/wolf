@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+PYTHONPATH=./ uv run python -m framework.cli.wolf_app "$@"
