@@ -1,0 +1,42 @@
+{
+  "alpha": {
+    "model": "gpt-5.3-codex",
+    "host": "http://localhost",
+    "port":"",
+    "api_key_var": "LOCAL_API_KEY",
+    "api_version": "v1",
+    "capabilities": ["text", "tool"]
+  },
+  "beta1": {
+    "model": "gpt-5.5",
+    "host": "http://localhost",
+    "port":3001,
+    "api_key_var": "LOCAL_API_KEY",
+    "api_version": "v1",
+    "capabilities": ["text", "vision", "tool", "reasoning"]
+  },
+  "beta2": {
+    "model": "gpt-5.4",
+    "host": "http://localhost",
+    "port":3002,
+    "api_key_var": "LOCAL_API_KEY",
+    "api_version": "v1",
+    "capabilities": ["text", "vision", "tool", "reasoning"]
+  },
+  "beta3": {
+    "model": "gpt-5.4-nano",
+    "host": "http://localhost",
+    "port":3003,
+    "api_key_var": "LOCAL_API_KEY",
+    "api_version": "v1",
+    "capabilities": ["text", "vision", "tool", "reasoning"]
+  },
+  "beta4": {
+    "model": "google/gemma-4-31B-it",
+    "host": "http://localhost",
+    "port":8000,
+    "api_key_var": "LOCAL_API_KEY",
+    "api_version": "api/v1",
+    "capabilities": ["text", "vision", "tool", "reasoning"]
+  }
+}

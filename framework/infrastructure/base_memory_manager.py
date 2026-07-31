@@ -4,6 +4,7 @@ import json
 import gc
 import asyncio
 import pickle
+import fnmatch
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
@@ -60,6 +61,26 @@ class MemoryManager:
             ]
         )
 
+        # Typed categories used by the context/memory management policy.
+        # Keep this additive for backward compatibility with old snapshots.
+        for default_category in [
+            "user_preferences",
+            "project_facts",
+            "decisions",
+            "active_tasks",
+            "open_questions",
+            "bugs_and_fixes",
+            "file_state",
+            "session_summaries",
+            "retrieval_hints",
+            "discardable_noise",
+            "context_summaries",
+            "working_memory",
+            "compression_provenance",
+        ]:
+            if default_category not in self.memory_fragment_types:
+                self.memory_fragment_types.append(default_category)
+
         # Initialise containers for each fragment type
         self.memory_fragments: Dict[str, Dict[str, Any]] = {}
         for frag_type in self.memory_fragment_types:
@@ -78,10 +99,44 @@ class MemoryManager:
 
         # Load any existing persisted state
         self._load()
+        self._ensure_default_categories()
 
     # ---------------------------------------------------------------------
     # Helper / public API
     # ---------------------------------------------------------------------
+    def _ensure_default_categories(self) -> None:
+        """Ensure current and older sessions contain the standard memory categories."""
+        default_categories = [
+            "facts",
+            "user_prefs",
+            "warnings",
+            "strategies",
+            "decisions",
+            "conclusions",
+            "solutions",
+            "task_state",
+            "summaries",
+            "user_preferences",
+            "project_facts",
+            "active_tasks",
+            "open_questions",
+            "bugs_and_fixes",
+            "file_state",
+            "session_summaries",
+            "retrieval_hints",
+            "discardable_noise",
+            "context_summaries",
+            "working_memory",
+            "compression_provenance",
+        ]
+        for category in default_categories:
+            if category not in self.memory_fragment_types:
+                self.memory_fragment_types.append(category)
+            self.memory_fragments.setdefault(category, {})
+        self.facts = self.memory_fragments.get("facts", {})
+        self.user_prefs = self.memory_fragments.get("user_prefs", {})
+        self.task_state = self.memory_fragments.get("task_state", {})
+
     def set_traces_vector_store(self, traces_vs: Any, verbose: int = 0) -> None:
         """Attach or update the traces vector store."""
         self._traces_vector_store = traces_vs
@@ -214,6 +269,52 @@ class MemoryManager:
             elif cat == "summaries":
                 self.summaries = []
         gc.collect()
+        self._save()
+
+    def list_categories(self) -> List[str]:
+        """Return all known memory categories in stable order."""
+        return list(self.memory_fragment_types)
+
+    def batch_forget(self, category: Optional[str] = None, key_pattern: Optional[str] = None) -> Dict[str, List[str]]:
+        """Delete multiple memory fragments matching a glob-style key pattern.
+
+        This is intentionally explicit and is only called by actions that
+        already require a confirmation flag.
+        """
+        pattern = key_pattern or "*"
+        categories = [category.strip().lower()] if category else list(self.memory_fragment_types)
+        deleted: Dict[str, List[str]] = {}
+        for cat in categories:
+            if cat not in self.memory_fragment_types:
+                raise ValueError(f"Unknown memory category: {cat}")
+            bucket = self.memory_fragments.get(cat, {})
+            matching = [key for key in list(bucket.keys()) if fnmatch.fnmatch(str(key), pattern)]
+            for key in matching:
+                del bucket[key]
+            if matching:
+                deleted[cat] = matching
+        if deleted:
+            self._save()
+        return deleted
+
+    def rename_category(self, old_category: str, new_category: str) -> None:
+        """Rename a memory category, preserving all fragments."""
+        old = old_category.strip().lower()
+        new = new_category.strip().lower()
+        if not old or not new:
+            raise ValueError("old_category and new_category must be non-empty")
+        if old not in self.memory_fragment_types:
+            raise ValueError(f"Unknown memory category: {old_category}")
+        if new in self.memory_fragment_types and new != old:
+            raise ValueError(f"Target memory category already exists: {new_category}")
+        self.memory_fragments[new] = self.memory_fragments.pop(old, {})
+        self.memory_fragment_types = [new if cat == old else cat for cat in self.memory_fragment_types]
+        if old == "facts" or new == "facts":
+            self.facts = self.memory_fragments.get("facts", {})
+        if old == "user_prefs" or new == "user_prefs":
+            self.user_prefs = self.memory_fragments.get("user_prefs", {})
+        if old == "task_state" or new == "task_state":
+            self.task_state = self.memory_fragments.get("task_state", {})
         self._save()
 
     # ----------------------------------------------------------
@@ -366,10 +467,8 @@ class MemoryManager:
         if "max_ctx_tokens" in snapshot_data:
             self.max_ctx_tokens = snapshot_data["max_ctx_tokens"]
         
-        # Update convenience shortcuts
-        self.facts = self.memory_fragments.get("facts", {})
-        self.user_prefs = self.memory_fragments.get("user_prefs", {})
-        self.task_state = self.memory_fragments.get("task_state", {})
+        # Update convenience shortcuts and upgrade old snapshots with new categories.
+        self._ensure_default_categories()
         
         # Save restored state to disk for persistence
         self._save()

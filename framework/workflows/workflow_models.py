@@ -6,9 +6,12 @@ by the system prompt is also generated dynamically from action definitions.
 
 from __future__ import annotations
 
+import os
+
 import importlib
 import pkgutil
 import textwrap
+import json
 from typing import Annotated, Union, get_args
 from pydantic import Field
 
@@ -64,86 +67,125 @@ for i, A in enumerate(_action_classes):
 ACTION_NAMES = list(ACTIONS.keys())
 ACTION_SPACE_PROMPT +=  "*** END ACTION SPACE ***"
 #print(f"{ACTION_SPACE_PROMPT}")
-console.print(f"[+] ACTION_SPACE_PROMPT: {num_tokens_from_string(ACTION_SPACE_PROMPT)} Tokens")
+if os.environ.get("WOLF_DEBUG_ACTION_SPACE", "").lower() in {"1", "true", "yes"}:
+    console.print(f"[+] ACTION_SPACE_PROMPT: {num_tokens_from_string(ACTION_SPACE_PROMPT)} Tokens")
 
 # ---------------------------------------------------------------------
 # Helper: generate schema string dynamically.
 # ---------------------------------------------------------------------
 def _generate_schema_string() -> str:
-    """Generate a natural-language schema prompt string from action classes.
-    Produces a *valid* JSON schema + prose instructions.
+    """Generate a compact, model-facing schema prompt from action classes.
+
+    The previous implementation interpolated raw Pydantic ``FieldInfo`` objects
+    and undefined defaults into the prompt. That produced non-JSON examples like
+    ``PydanticUndefined`` and ``FieldInfo(...)`` which encouraged malformed model
+    responses and validation retry loops. This renderer emits only valid JSON
+    examples with primitive placeholder values.
     """
-    def format_payload_description(cls_: type[AgentAction]) -> str:
-        """Return a human-readable payload description using Pydantic schema."""
+
+    def _resolve_ref(schema: dict, ref: str) -> dict:
+        """Resolve a local JSON-schema $ref such as '#/$defs/Payload'."""
+        if not ref.startswith("#/"):
+            return {}
+        cur = schema
+        for part in ref[2:].split("/"):
+            cur = cur.get(part, {}) if isinstance(cur, dict) else {}
+        return cur if isinstance(cur, dict) else {}
+
+    def _deref(prop: dict, root: dict) -> dict:
+        """Return a property schema with local refs resolved."""
+        seen = set()
+        while isinstance(prop, dict) and "$ref" in prop and prop["$ref"] not in seen:
+            seen.add(prop["$ref"])
+            resolved = _resolve_ref(root, prop["$ref"])
+            merged = {k: v for k, v in prop.items() if k != "$ref"}
+            prop = {**resolved, **merged}
+        return prop if isinstance(prop, dict) else {}
+
+    def _example_for_schema(prop: dict, root: dict, depth: int = 0):
+        """Build a JSON-serializable placeholder example for a schema node."""
+        if depth > 4:
+            return "..."
+        prop = _deref(prop, root)
+
+        # Pick the first non-null branch of union-like schemas.
+        for union_key in ("anyOf", "oneOf", "allOf"):
+            branches = prop.get(union_key)
+            if isinstance(branches, list) and branches:
+                branch = next((b for b in branches if isinstance(b, dict) and b.get("type") != "null"), branches[0])
+                return _example_for_schema(branch, root, depth + 1)
+
+        if "const" in prop:
+            return prop["const"]
+        if "enum" in prop and prop["enum"]:
+            return prop["enum"][0]
+
+        typ = prop.get("type")
+        if typ == "object" or "properties" in prop:
+            props = prop.get("properties", {})
+            if not isinstance(props, dict):
+                return {}
+            return {
+                name: _example_for_schema(child, root, depth + 1)
+                for name, child in props.items()
+            }
+        if typ == "array":
+            items = prop.get("items", {})
+            return [_example_for_schema(items, root, depth + 1)]
+        if "default" in prop and prop.get("default") is not None:
+            return prop.get("default")
+        if typ == "integer":
+            if "minimum" in prop:
+                return int(prop.get("minimum"))
+            if "exclusiveMinimum" in prop:
+                return int(prop.get("exclusiveMinimum")) + 1
+            return 1
+        if typ == "number":
+            if "minimum" in prop:
+                return float(prop.get("minimum"))
+            if "exclusiveMinimum" in prop:
+                return float(prop.get("exclusiveMinimum")) + 1.0
+            return 1.0
+        if typ == "boolean":
+            return False
+        if typ == "string":
+            return "string"
+        return "value"
+
+    def _payload_example(cls_: type[AgentAction]) -> dict:
         schema = cls_.model_json_schema()
-        properties = schema.get("properties", {})
-        required_fields = schema.get("required", [])
-        #print(f"[+++] Processing {cls_}:")
-        lines = ["{"]
-        for field_name, field_info in cls_.model_fields.items():
-            #print(f"    - field_name={field_name} | field_info={field_info}")
-            prop_schema = properties.get(field_name, {})
-            field_type = prop_schema.get("type", "any")
+        payload_schema = schema.get("properties", {}).get("payload", {})
+        example = _example_for_schema(payload_schema, schema)
+        return example if isinstance(example, dict) else {}
 
-            # Determine if field is optional
-            is_required = field_name in required_fields
-            is_optional = not is_required
-
-            # Get description
-            desc = prop_schema.get("description", "").strip()
-            desc = desc or "TODO: describe this field"
-
-            # Format line
-            line = f'    "{field_name}": <{field_type}>'
-            if desc:
-                line += f" # {desc}"
-            if is_optional:
-                line += " (optional)"
-            lines.append(line)
-
-        lines.append("}")
-        return "\n".join(lines)
-
-    # Start building the string
-    parts = []
-    parts.append("You must always respond with a single JSON object.")
-    parts.append('The object must have two fields: "action" and "payload".')
-    parts.append('The "action" field must be one of the following values, and the payload must match the schema exactly:')
+    parts: list[str] = []
+    parts.append("You must always respond with exactly one valid JSON object and no surrounding prose or Markdown.")
+    parts.append('The object must have exactly these top-level fields: "action", "payload", "purpose", "expectations", and "yield_motion_to".')
+    parts.append('The "action" value must be one of the allowed action names below; "payload" must match that action.')
+    parts.append('Use string values for "purpose", "expectations", and "yield_motion_to". If you intend to act again, set "yield_motion_to" to your exact agent name; otherwise use "user" or "system" as appropriate.')
     parts.append("")
+    parts.append("Allowed action examples:")
+
     for i, cls_ in enumerate(_action_classes, start=1):
         action_name = cls_.model_fields["action"].default
-        parts.append(f"{i}. {cls_.model_fields['description'].default}")
-        parts.append('{')
-        parts.append(f'  "action": "{action_name}",') # We are controlling key action and payload
-        for cls_key in cls_.model_fields.keys():
-            if cls_key in ["payload"]:
-                parts.append(f'  "payload": {cls_.model_fields["payload_schema"].default}')
-            elif cls_key in ["action","payload_schema", "description"]:
-                pass
-            else:
-                cls_val = cls_.model_fields[cls_key]
-                parts.append(f'  "{cls_key}": {cls_val.default}')
-        parts.append('}')
+        description = cls_.model_fields.get("description")
+        desc_text = getattr(description, "default", "") if description is not None else ""
+        example = {
+            "action": action_name,
+            "payload": _payload_example(cls_),
+            "purpose": "why this action is being taken",
+            "expectations": "what result is expected",
+            "yield_motion_to": "user",
+        }
+        parts.append(f"{i}. {desc_text}")
+        parts.append(json.dumps(example, indent=2, sort_keys=True))
+        parts.append("")
 
-    # Add caution notes as prose (NOT JSON)
-    parts.append("[CAUTION]")
-    parts.append("1. Referencing objects (audio, image, video, or any file) in your response:")
-    parts.append("   - When you mention an object by name in 'message', provide a proper reference using the appropriate handle (so the UI can render it).")
-    parts.append("   - For example: if you mention 'density' and 'temperature' plots, set:")
-    parts.append('       message: "Here are the plots for density and temperature",')
-    parts.append('       image_references: [{"name": "density", "reference": "/path/to/density.png"}, {"name": "temperature", "reference": "/path/to/temperature.png"}]')
-    parts.append("   - Names must exactly match; do not repeat the same name multiple times.")
-    parts.append("   - Use one-word names only (e.g., 'gravity_plot', not 'gravity plot').")
-    parts.append("   - Avoid Markdown or HTML containers (e.g., **gravity** will not work).")
-    parts.append("")
-    parts.append("2. Controlling the chat flow with 'yield_motion_to':")
-    parts.append("   - If your message is just a notification and you intend to act next, leave 'yield_motion_to' blank.")
-    parts.append("   - Otherwise, set 'yield_motion_to' to the name of the entity taking the next turn (e.g., 'user' or 'system').")
-    parts.append("   - If unsure, set it to 'yield_motion_to': 'system'.")
-    parts.append("")
-
-    # Closing instruction
-    parts.append("Do not add extra text. Respond only with the formatted JSON action.")
+    parts.append("Important rules:")
+    parts.append("- Do not invent actions or keys.")
+    parts.append("- Do not use Python object reprs, internal schema artifacts, comments, trailing commas, or single-quoted dict reprs.")
+    parts.append("- If you cannot complete the requested task, use the valid 'send_message' action with a concise error message.")
+    parts.append("- Respond only with the JSON action object.")
 
     return "\n".join(parts)
 
@@ -152,26 +194,14 @@ from typing import Annotated, Union, List
 from pydantic import Field
 
 def get_actions_subset(action_names: List) -> tuple:
-    """Return a Pydantic discriminated union **and** a schema string for a subset of actions.
+    """Return a Pydantic discriminated union and clean schema string for actions.
 
-    Parameters
-    ----------
-    action_names: List
-        The ``action`` discriminator values you are interested in, e.g.
-        ``["read_file", "run_syscall"]``.
-
-    Returns
-    -------
-    Tuple[Annotated[Union[...], Field(discriminator="action")], str]
-        * ``SubsetActions`` – the union type that can be used for validation.
-        * ``subset_schema`` – a human‑readable schema string describing only the
-          selected actions.
+    The subset schema is injected into prompts for restricted-action workflows, so
+    it must follow the same rules as the full schema renderer: valid JSON examples
+    only, no Pydantic internals, and no Python repr payload dumps.
     """
-    # ------------------------------------------------------------
-    # 1️⃣ Find the concrete classes matching the requested discriminators.
-    # ------------------------------------------------------------
     matching_classes = []
-    for cls in _action_classes:  # _action_classes is the full sorted list defined earlier
+    for cls in _action_classes:
         discr = cls.model_fields["action"].default
         if discr in action_names:
             matching_classes.append(cls)
@@ -179,47 +209,88 @@ def get_actions_subset(action_names: List) -> tuple:
     if not matching_classes:
         raise ValueError("None of the supplied action names match any known action class")
 
-    # ------------------------------------------------------------
-    # 2️⃣ Build the Union type for Pydantic.
-    # ------------------------------------------------------------
-    SubsetUnion = Union
+    SubsetUnion = Union[tuple(matching_classes)]
     SubsetActions = Annotated[SubsetUnion, Field(discriminator="action")]
 
-    # ------------------------------------------------------------
-    # 3️⃣ Generate a schema string limited to the selected actions.
-    # ------------------------------------------------------------
-    def format_payload(cls_: type) -> str:
-        schema = cls_.model_json_schema()
-        properties = schema.get("properties", {})
-        required = set(schema.get("required", []))
-        lines = ["{" ]
-        for field_name, field_info in cls_.model_fields.items():
-            prop = properties.get(field_name, {})
-            f_type = prop.get("type", "any")
-            desc = prop.get("description", "").strip() or "TODO: describe this field"
-            optional = "(optional)" if field_name not in required else ""
-            lines.append(f'    "{field_name}": <{f_type}> # {desc} {optional}'.rstrip())
-        lines.append("}")
-        return "\n".join(lines)
+    def _resolve_ref(schema: dict, ref: str) -> dict:
+        if not ref.startswith("#/"):
+            return {}
+        cur = schema
+        for part in ref[2:].split("/"):
+            cur = cur.get(part, {}) if isinstance(cur, dict) else {}
+        return cur if isinstance(cur, dict) else {}
 
-    parts: List = []
-    #parts.append("You must always respond with a single JSON object.")
-    #parts.append('The object must have two fields: "action" and "payload".')
-    #parts.append('The "action" field must be one of the following values, and the payload must match the schema exactly:')
-    #parts.append("")
+    def _deref(prop: dict, root: dict) -> dict:
+        seen = set()
+        while isinstance(prop, dict) and "$ref" in prop and prop["$ref"] not in seen:
+            seen.add(prop["$ref"])
+            resolved = _resolve_ref(root, prop["$ref"])
+            merged = {k: v for k, v in prop.items() if k != "$ref"}
+            prop = {**resolved, **merged}
+        return prop if isinstance(prop, dict) else {}
+
+    def _example_for_schema(prop: dict, root: dict, depth: int = 0):
+        if depth > 4:
+            return "..."
+        prop = _deref(prop, root)
+        for union_key in ("anyOf", "oneOf", "allOf"):
+            branches = prop.get(union_key)
+            if isinstance(branches, list) and branches:
+                branch = next((b for b in branches if isinstance(b, dict) and b.get("type") != "null"), branches[0])
+                return _example_for_schema(branch, root, depth + 1)
+        if "const" in prop:
+            return prop["const"]
+        if "enum" in prop and prop["enum"]:
+            return prop["enum"][0]
+        typ = prop.get("type")
+        if typ == "object" or "properties" in prop:
+            props = prop.get("properties", {})
+            return {name: _example_for_schema(child, root, depth + 1) for name, child in props.items()} if isinstance(props, dict) else {}
+        if typ == "array":
+            return [_example_for_schema(prop.get("items", {}), root, depth + 1)]
+        if "default" in prop and prop.get("default") is not None:
+            return prop.get("default")
+        if typ == "integer":
+            if "minimum" in prop:
+                return int(prop.get("minimum"))
+            if "exclusiveMinimum" in prop:
+                return int(prop.get("exclusiveMinimum")) + 1
+            return 1
+        if typ == "number":
+            if "minimum" in prop:
+                return float(prop.get("minimum"))
+            if "exclusiveMinimum" in prop:
+                return float(prop.get("exclusiveMinimum")) + 1.0
+            return 1.0
+        if typ == "boolean":
+            return False
+        if typ == "string":
+            return "string"
+        return "value"
+
+    def _payload_example(cls_: type[AgentAction]) -> dict:
+        schema = cls_.model_json_schema()
+        payload_schema = schema.get("properties", {}).get("payload", {})
+        example = _example_for_schema(payload_schema, schema)
+        return example if isinstance(example, dict) else {}
+
+    parts: List[str] = []
     for i, cls in enumerate(matching_classes, start=1):
         action_name = cls.model_fields["action"].default
-        description = cls.model_fields.get("description", None)
-        desc_text = description.default if description is not None else ""
+        description = cls.model_fields.get("description")
+        desc_text = getattr(description, "default", "") if description is not None else ""
+        example = {
+            "action": action_name,
+            "payload": _payload_example(cls),
+            "purpose": "why this action is being taken",
+            "expectations": "what result is expected",
+            "yield_motion_to": "user",
+        }
         parts.append(f"{i}. {desc_text}")
-        parts.append('{')
-        parts.append(f'  "action": "{action_name}",')
-        parts.append('  "payload": ' + format_payload(cls))
-        parts.append('}')
+        parts.append(json.dumps(example, indent=2, sort_keys=True))
         parts.append("")
-    # (the CAUTION section and closing note can be omitted for the subset view)
-    subset_schema = "\n".join(parts)
 
+    subset_schema = "\n".join(parts)
     return SubsetActions, subset_schema
 
 
@@ -231,7 +302,7 @@ AGENT_ROLE_PROMPT = """You are a helpful assistant. You exist in the "system", a
     The acrtionboxes are connected to the "system" which acts as the interface that allows you to interact with each actionbox.
     All your responses must match an action, and should always be a JSON object matching one of the allowed schemas below.
     Do NOT invent new keys (e.g. do not use 'filename'; always use 'file_path' for write_file).\n
-    "If you cannot comply, output an error message in JSON with action 'talk'.\n\n"""
+    "If you cannot comply, output an error message in JSON with action 'send_message'.\n\n"""
 
 #SYS_PROMPT = (
 #    """You are a helpful assistant. You exist in the "system", a local sandboxed environement inside which you can take actions.
@@ -239,7 +310,7 @@ AGENT_ROLE_PROMPT = """You are a helpful assistant. You exist in the "system", a
 #    The acrtionboxes are connected to the "system" which acts as the interface that allows you to interact with each actionbox.
 #    All your responses must match an action, and should always be a JSON object matching one of the allowed schemas below.
 #    Do NOT invent new keys (e.g. do not use 'filename'; always use 'file_path' for write_file).\n
-#    "If you cannot comply, output an error message in JSON with action 'talk'.\n\n"""
+#    "If you cannot comply, output an error message in JSON with action 'send_message'.\n\n"""
 #    + SCHEMA_STRING
 #)
 SYS_PROMPT = ( AGENT_ROLE_PROMPT + SCHEMA_STRING )

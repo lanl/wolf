@@ -1,0 +1,3 @@
+# WOLF UI Clients Requirements
+websockets>=12.0
+rich>=13.0.0

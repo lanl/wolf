@@ -1,0 +1,13 @@
+{
+  "mode": "cli",
+  "workflow": "TurnBasedWorkflow",
+  "resume_session": null,
+  "user_name": "user",
+  "session": {
+    "banner_image_color": "purple",
+    "banner_image_width": 100,
+    "verbose": 0,
+    "universes": []
+  },
+  "run": {}
+}

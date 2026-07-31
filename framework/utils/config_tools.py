@@ -5,7 +5,7 @@ from pathlib import Path
 import tiktoken
 import json
 import glob
-from typing import Optional
+from typing import Optional, Type
 import chromadb
 from chromadb.config import Settings
 
@@ -39,7 +39,8 @@ from framework.infrastructure.base_memory_manager import MemoryManager
 from framework.infrastructure.base_context_manager import ContextManager
 from framework.infrastructure.base_infrastructure import BaseInfrastructure 
 #from framework.workflows.base_workflow import BaseWorkflow
-from framework.workflows.custom_workflows.turn_based_workflow import TurnBasedWorkflow 
+from framework.workflows.custom_workflows.turn_based_workflow import TurnBasedWorkflow
+from framework.workflows.base_workflow import BaseWorkflow
 
 
 def create_session_dir():
@@ -106,10 +107,10 @@ def build_list_agents(session_params):
         AGENTs[k] = OpenAIAgent(
             model=llm["model"],
             host_address=llm["host"],
-            host_port=llm["port"],
-            api_version=llm["api_version"],
-            api_key=llm["api_key"],
-            verbose=llm["verbose"],
+            host_port=llm.get("port",""),
+            api_version=llm.get("api_version",""),
+            api_key=llm.get("api_key",""),
+            verbose=llm.get("verbose",1),
             capabilities=list(normalize_capabilities(llm.get("capabilities", []))),
             ctx_window_length = max_ctx
         )
@@ -139,7 +140,7 @@ def build_list_universes(session_params):
     return UNIVs
 
 
-def load_existing_session(session_identifier: str, session_params: dict, db_client: Optional[chromadb.Client] = None) -> dict:
+def load_existing_session(session_identifier: str, session_params: dict, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow) -> dict:
     """Load an existing session from snapshots.
     
     Args:
@@ -265,7 +266,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     
     # Create workflow with restored infrastructure
     #WF = BaseWorkflow(
-    WF = TurnBasedWorkflow(
+    WF = workflow_cls(
         session=None,  # Will be set during load_session_state
         infra=INFRA,
         actions_union=Actions,
@@ -288,7 +289,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     }
 
 
-def setup_cli_session(session_params, resume_session: Optional[str] = None, db_client: Optional[chromadb.Client] = None):
+def setup_cli_session(session_params, resume_session: Optional[str] = None, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow):
     """Setup CLI session - either new or resumed.
     
     Args:
@@ -307,10 +308,12 @@ def setup_cli_session(session_params, resume_session: Optional[str] = None, db_c
     
     # Check if resuming existing session
     if resume_session:
-        return load_existing_session(resume_session, session_params, db_client=db_client)
+        return load_existing_session(resume_session, session_params, db_client=db_client, workflow_cls=workflow_cls)
 
     # SESSION
-    session_dir = session_params.get('session_dir', create_session_dir())
+    session_dir = session_params.get('session_dir')
+    if session_dir is None:
+        session_dir = create_session_dir()
     console.print(f"[INFO] Session directory: {session_dir}")
 
     # Initialize ChromaDB client
@@ -354,35 +357,51 @@ def setup_cli_session(session_params, resume_session: Optional[str] = None, db_c
     traces_vs = VectorStore(traces_vs_params, client=db_client)
     
     # MANAGERs
-    chat_manager = session_params.get('chat_manager', BaseChatManager(session_dir=session_dir))
-    memory_manager = session_params.get('memory_manager', 
-                                       MemoryManager(memory_path=os.path.join(session_dir, "memory.json"),
-                                                    traces_vector_store=traces_vs,
-                                                    summaries_vector_store=summaries_vs))
-    context_manager = session_params.get('context_manager', 
-                                        ContextManager(max_ctx_tokens=200000,
-                                                      recent_chat_ratio=0.50,
-                                                      memory_ratio=0.30,
-                                                      trace_ratio=0.20,
-                                                      traces_vector_store=traces_vs))
+    chat_manager = session_params.get('chat_manager')
+    if chat_manager is None:
+        chat_manager = BaseChatManager(session_dir=session_dir)
+
+    memory_manager = session_params.get('memory_manager')
+    if memory_manager is None:
+        memory_manager = MemoryManager(
+            memory_path=os.path.join(session_dir, "memory.json"),
+            traces_vector_store=traces_vs,
+            summaries_vector_store=summaries_vs,
+        )
+
+    context_manager = session_params.get('context_manager')
+    if context_manager is None:
+        context_manager = ContextManager(
+            max_ctx_tokens=200000,
+            recent_chat_ratio=0.50,
+            memory_ratio=0.30,
+            trace_ratio=0.20,
+            traces_vector_store=traces_vs,
+        )
     
     # INFRA
-    INFRA = session_params.get('infra', 
-                              BaseInfrastructure(agent=main_agent,
-                                               workers=workers,
-                                               objects=UNIVs,
-                                               max_ctx_tokens=session_params.get('max_ctx_tokens', 50000),
-                                               wf_log_dir=session_dir,
-                                               session_dir=session_dir,
-                                               chat_manager=chat_manager,
-                                               memory_manager=memory_manager,
-                                               context_manager=context_manager,
-                                               db_client=db_client)
-                               )
+    INFRA = session_params.get('infra')
+    if INFRA is None:
+        INFRA = BaseInfrastructure(
+            agent=main_agent,
+            workers=workers,
+            objects=UNIVs,
+            max_ctx_tokens=session_params.get('max_ctx_tokens', 50000),
+            wf_log_dir=session_dir,
+            session_dir=session_dir,
+            chat_manager=chat_manager,
+            memory_manager=memory_manager,
+            context_manager=context_manager,
+            db_client=db_client,
+        )
     
     # WORKFLOW
-    #WF = session_params.get('wf', BaseWorkflow(infra=INFRA, actions_union=session_params.get('actions', Actions)))
-    WF = session_params.get('wf', TurnBasedWorkflow(infra=INFRA, actions_union=session_params.get('actions', Actions)))
+    WF = session_params.get('wf')
+    if WF is None:
+        WF = workflow_cls(
+            infra=INFRA,
+            actions_union=session_params.get('actions', Actions),
+        )
     
     return {
         'agents': {'main': main_agent, 'workers': workers},
@@ -408,9 +427,10 @@ class BaseSession:
 class CliSession(BaseSession):
     def __init__(self, session_params, db_client: Optional[chromadb.Client] = None):
         super().__init__(session_params=session_params, db_client=db_client)
-    def create_session(self, resume_session: Optional[str] = None, db_client=None):
+    def create_session(self, resume_session: Optional[str] = None, db_client=None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow):
         if db_client is None: db_client = self.db_client
-        self.session = setup_cli_session(session_params=self.session_params, 
-                                         resume_session=resume_session, 
-                                         db_client=db_client)
+        self.session = setup_cli_session(session_params=self.session_params,
+                                         resume_session=resume_session,
+                                         db_client=db_client,
+                                         workflow_cls=workflow_cls)
 

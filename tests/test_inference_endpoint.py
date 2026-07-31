@@ -1,4 +1,4 @@
-ENDPOINT    = "https://"
+ENDPOINT    = "https://aiportal-api.aws.lanl.gov"
 #PORT        = 8000 # Comment out if no specific  port on the endpoint
 API_VERSION = "v1"  # Comment out if no specific api version on the endpoint
 MODEL       = "gpt-oss-120b"

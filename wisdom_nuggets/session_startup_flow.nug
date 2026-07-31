@@ -1,0 +1,594 @@
+---
+nugget_id: session_startup_flow
+title: "Interactive CLI Session Startup Flow"
+author_agent: "silly_saha"
+created_at: "2026-07-22"
+last_reviewed_at: "2026-07-22"
+status: "active"
+confidence: "source-inspected"
+source_files:
+  - "./wolf"
+  - "./runners/interactive.py"
+  - "./framework/utils/config_tools.py"
+related_docs:
+  - "./app.md"
+  - "./wisdom.md"
+tags:
+  - startup
+  - cli
+  - session
+  - workflow
+  - config
+  - runtime-construction
+  - resume
+---
+
+# Nugget: Interactive CLI Session Startup Flow
+
+This nugget captures the currently source-inspected flow used when starting Cerberus/WOLF through the root-level `./wolf` wrapper.
+
+The short version:
+
+```text
+./wolf
+  -> PYTHONPATH=./ uv run python ./runners/interactive.py
+      -> load default session params and LLM config
+      -> CliSession(session_params=session_inputs, db_client=None)
+          -> CliSession.create_session(resume_session=None)
+              -> setup_cli_session(...)
+                  -> build agents, universes, vector stores, managers, infrastructure, workflow
+      -> cli_session.session['wf'].run(user_name='user')
+```
+
+---
+
+## 1. Why this nugget exists
+
+`app.md` already contains a strong architectural overview, but the exact current implementation of the CLI session startup path has several useful operational details that are easy to lose:
+
+- `./wolf` is only a Bash wrapper.
+- `runners/interactive.py` is the active launcher.
+- `CliSession` is a very thin wrapper.
+- `setup_cli_session()` is the real procedural builder.
+- The current wrapper path always starts a new session unless `interactive.py` is edited to pass `resume_session`.
+- There are a few source-level quirks worth preserving for future cleanup.
+
+---
+
+## 2. Root wrapper: `./wolf`
+
+Current implementation:
+
+```bash
+#!/usr/bin/env bash
+#PYTHONPATH=./ python ./runners/interactive.py         # Conda/pip Runner
+PYTHONPATH=./ uv run python ./runners/interactive.py   # UV Runner
+```
+
+Behavior:
+
+- Sets `PYTHONPATH=./` so the repository root is importable.
+- Runs `./runners/interactive.py` through `uv run python`.
+- Does not currently pass CLI arguments.
+- Does not itself decide whether to create or resume a session.
+
+The old Conda/pip runner line is kept as a commented alternative.
+
+---
+
+## 3. Launcher: `runners/interactive.py`
+
+This is the active launcher invoked by `./wolf`.
+
+It defines local runtime overrides:
+
+```python
+user_name = "user"
+params = {
+    'banner_image_width': 100,
+    'banner_image_color': 'purple',
+    #'universes': [{"host":"0.0.0.0", "port":8115, "scheme":"http"}],
+    'verbose': 0
+}
+```
+
+Then it imports:
+
+```python
+from config.defaults.inference_engine import LLM
+from config.session.default.params.inputs import session_params
+from framework.utils.config_tools import CliSession
+```
+
+Startup logic:
+
+```python
+session_inputs = copy.deepcopy(session_params)
+
+for k in params.keys():
+    if k in s_params:
+        session_inputs[k] = params[k]
+    else:
+        raise Exception("[!] {k} is not a recognised session input")
+
+session_inputs['LLMs'] = LLM
+
+cli_session = CliSession(session_params=session_inputs, db_client=None)
+cli_session.create_session(resume_session=None)
+cli_session.session['wf'].run(user_name=user_name)
+```
+
+Important implications:
+
+- Defaults come from `config/session/default/params/inputs.py`.
+- LLM definitions come from `config/defaults/inference_engine.py`.
+- Local `params` overrides only work if their keys already exist in the default session params.
+- The actual LLM config is injected manually as `session_inputs['LLMs'] = LLM`.
+- The current source path passes `resume_session=None`, so `./wolf` starts a fresh session.
+
+---
+
+## 4. Session classes: `BaseSession` and `CliSession`
+
+Defined in `framework/utils/config_tools.py`.
+
+### `BaseSession`
+
+```python
+class BaseSession:
+    def __init__(self, session_params, db_client: Optional[chromadb.Client] = None):
+        self.session_params = session_params
+        self.db_client = db_client
+
+    def create_session(self, resume_session: Optional[str] = None, db_client=None):
+        self.session = None
+```
+
+`BaseSession` is currently minimal. It stores:
+
+- `self.session_params`
+- `self.db_client`
+
+Its `create_session()` method is effectively a placeholder.
+
+### `CliSession`
+
+```python
+class CliSession(BaseSession):
+    def __init__(self, session_params, db_client: Optional[chromadb.Client] = None):
+        super().__init__(session_params=session_params, db_client=db_client)
+
+    def create_session(self, resume_session: Optional[str] = None, db_client=None):
+        if db_client is None:
+            db_client = self.db_client
+        self.session = setup_cli_session(
+            session_params=self.session_params,
+            resume_session=resume_session,
+            db_client=db_client
+        )
+```
+
+`CliSession` is the session-manager object used by `interactive.py`, but it is intentionally thin. The real builder is `setup_cli_session()`.
+
+After creation, `cli_session.session` is a dictionary shaped like:
+
+```python
+{
+    'agents': {'main': main_agent, 'workers': workers},
+    'objects': {'universes': UNIVs, 'kbs': KBs, 'tbs': TBs},
+    'managers': {'chat': chat_manager, 'memory': memory_manager, 'context': context_manager},
+    'session_dir': session_dir,
+    'db_client': db_client,
+    'wf': WF,
+}
+```
+
+---
+
+## 5. Main builder: `setup_cli_session()`
+
+Signature:
+
+```python
+def setup_cli_session(
+    session_params,
+    resume_session: Optional[str] = None,
+    db_client: Optional[chromadb.Client] = None
+):
+```
+
+It supports two paths:
+
+1. New session
+2. Resumed session
+
+Early behavior:
+
+```python
+params = list(session_params.keys())
+assert 'LLMs' in params, "[ERROR][CLI SESSION SETUP]: 'LLMs' are required parameters for building agents"
+
+load_session_certs(session_params)
+show_banner(session_params)
+
+if resume_session:
+    return load_existing_session(resume_session, session_params, db_client=db_client)
+```
+
+So even resumed sessions still run the cert/cache setup and banner display before loading.
+
+---
+
+## 6. Fresh-session construction flow
+
+When `resume_session` is falsey, `setup_cli_session()` builds a new runtime.
+
+### 6.1 Session directory
+
+```python
+session_dir = session_params.get('session_dir', create_session_dir())
+console.print(f"[INFO] Session directory: {session_dir}")
+```
+
+`create_session_dir()` creates:
+
+```text
+wf_workspace/session_YYYYMMDD_HHMMSS
+```
+
+Source-level quirk: because the default argument to `dict.get()` is evaluated before the call, `create_session_dir()` is invoked even when `session_params` already has a `session_dir` key. This can create an unused timestamped directory as a side effect.
+
+### 6.2 ChromaDB client
+
+```python
+vs_persist_dir = f"{session_dir}/VStore"
+if db_client is None:
+    db_client = chromadb.Client(
+        Settings(persist_directory=vs_persist_dir, anonymized_telemetry=False)
+    )
+```
+
+This client backs the session vector stores.
+
+### 6.3 Agents
+
+```python
+AGENTs = build_list_agents(session_params)
+agents = list(AGENTs.keys())
+main_agent = AGENTs[agents[0]]
+workers = [AGENTs[worker] for worker in agents[1:]] if len(agents) > 1 else []
+```
+
+The first configured LLM becomes the main agent. Additional LLMs become workers.
+
+`build_list_agents()`:
+
+- Requires `session_params['LLMs']`.
+- Resolves API keys with `set_llm_api_key()`.
+- Normalizes model capabilities with `normalize_capabilities()`.
+- Constructs `OpenAIAgent` instances.
+
+Important shape:
+
+```python
+OpenAIAgent(
+    model=llm["model"],
+    host_address=llm["host"],
+    host_port=llm["port"],
+    api_version=llm["api_version"],
+    api_key=llm["api_key"],
+    verbose=llm["verbose"],
+    capabilities=list(normalize_capabilities(llm.get("capabilities", []))),
+    ctx_window_length=max_ctx,
+)
+```
+
+### 6.4 Universes / actionboxes
+
+```python
+KBs = []
+TBs = []
+UNIVs = build_list_universes(session_params)
+```
+
+Local KB and TB lists are currently empty in this path.
+
+`build_list_universes()` reads:
+
+```python
+session_params.get('universes', [])
+```
+
+Each universe config is expected to include at least:
+
+```python
+{"host": "...", "port": 8115, "scheme": "http"}
+```
+
+It calls:
+
+```python
+get_base_universe_params(host=univ["host"], port=univ["port"], verbose=session_params['verbose'])
+```
+
+Successful universe params are appended to `UNIVs`.
+
+### 6.5 Vector stores
+
+Summaries:
+
+```python
+summaries_vs_params = session_params.get('summaries_params', None)
+if summaries_vs_params is None:
+    summaries_vs_params = copy.deepcopy(SUMMARIES_PARAMS)
+summaries_vs = VectorStore(summaries_vs_params, client=db_client)
+```
+
+Traces:
+
+```python
+traces_vs_params = session_params.get('traces_params', None)
+if traces_vs_params is None:
+    traces_vs_params = copy.deepcopy(TRACES_PARAMS)
+traces_vs = VectorStore(traces_vs_params, client=db_client)
+```
+
+These use defaults from `framework/data_store/default/params/vstore_params.py` unless overridden.
+
+### 6.6 Managers
+
+The session creates or accepts injected managers:
+
+```python
+chat_manager = session_params.get('chat_manager', BaseChatManager(session_dir=session_dir))
+
+memory_manager = session_params.get(
+    'memory_manager',
+    MemoryManager(
+        memory_path=os.path.join(session_dir, "memory.json"),
+        traces_vector_store=traces_vs,
+        summaries_vector_store=summaries_vs,
+    )
+)
+
+context_manager = session_params.get(
+    'context_manager',
+    ContextManager(
+        max_ctx_tokens=200000,
+        recent_chat_ratio=0.50,
+        memory_ratio=0.30,
+        trace_ratio=0.20,
+        traces_vector_store=traces_vs,
+    )
+)
+```
+
+Source-level quirk: these also use `dict.get(key, expensive_constructor())`, so default manager objects are constructed even when an override exists.
+
+### 6.7 Infrastructure
+
+```python
+INFRA = session_params.get(
+    'infra',
+    BaseInfrastructure(
+        agent=main_agent,
+        workers=workers,
+        objects=UNIVs,
+        max_ctx_tokens=session_params.get('max_ctx_tokens', 50000),
+        wf_log_dir=session_dir,
+        session_dir=session_dir,
+        chat_manager=chat_manager,
+        memory_manager=memory_manager,
+        context_manager=context_manager,
+        db_client=db_client,
+    )
+)
+```
+
+The infrastructure object is the main runtime bridge. It owns or references:
+
+- main agent
+- workers
+- universes/actionboxes
+- chat manager
+- memory manager
+- context manager
+- Chroma client
+- session/log directory state
+
+Concrete workflow actions receive this object in their `execute(infra=...)` path.
+
+### 6.8 Workflow
+
+```python
+WF = session_params.get(
+    'wf',
+    TurnBasedWorkflow(
+        infra=INFRA,
+        actions_union=session_params.get('actions', Actions)
+    )
+)
+```
+
+The active workflow is `TurnBasedWorkflow`, not the older/commented `BaseWorkflow` path.
+
+### 6.9 Return shape
+
+```python
+return {
+    'agents': {'main': main_agent, 'workers': workers},
+    'objects': {'universes': UNIVs, 'kbs': KBs, 'tbs': TBs},
+    'managers': {'chat': chat_manager, 'memory': memory_manager, 'context': context_manager},
+    'session_dir': session_dir,
+    'db_client': db_client,
+    'wf': WF,
+}
+```
+
+This dictionary is stored on `CliSession.session`.
+
+---
+
+## 7. Resume-session flow
+
+If `resume_session` is provided, `setup_cli_session()` delegates to:
+
+```python
+load_existing_session(resume_session, session_params, db_client=db_client)
+```
+
+Supported identifiers include:
+
+- `latest`
+- `last`
+- `recent`
+- `most_recent`
+- `newest`
+- direct `*.snapshot.json` paths
+- `wf_workspace/...` paths
+- `session_YYYYMMDD_HHMMSS`
+- date-like `YYYYMMDD`
+- partial session strings
+
+The loader resolves a snapshot file, usually:
+
+```text
+wf_workspace/session_*/session.snapshot.json
+```
+
+Then it loads JSON snapshot data, reconstructs runtime-only objects, restores serialized manager/infrastructure state, and creates a restored `TurnBasedWorkflow`.
+
+Key reconstruction steps:
+
+```python
+AGENTs = build_list_agents(session_params)
+UNIVs = build_list_universes(session_params)
+
+db_client = chromadb.Client(Settings(persist_directory=vs_persist_dir, anonymized_telemetry=False))
+summaries_vs = VectorStore(summaries_vs_params, client=db_client)
+traces_vs = VectorStore(traces_vs_params, client=db_client)
+
+chat_manager = BaseChatManager(session_dir=session_dir)
+memory_manager = MemoryManager(...)
+context_manager = ContextManager(...)
+
+chat_manager.restore(...)
+context_manager.restore(...)
+memory_manager.restore(...)
+
+INFRA = BaseInfrastructure(...)
+INFRA.restore(infra_snapshot)
+
+WF = TurnBasedWorkflow(... restored workflow file paths and turn/user state ...)
+```
+
+The resumed session returns the same general dictionary shape as a new session.
+
+---
+
+## 8. Current operational truth
+
+As of this inspection, running:
+
+```bash
+./wolf
+```
+
+starts a **new** interactive CLI session because `runners/interactive.py` contains:
+
+```python
+cli_session.create_session(resume_session=None)
+```
+
+To resume, the source currently needs to be edited or a future CLI argument layer needs to be added. There are commented examples in `interactive.py`, including:
+
+```python
+#cli_session.create_session(resume_session="20260716_082240")
+```
+
+and older commented direct builder examples:
+
+```python
+#session = setup_cli_session(session_inputs, resume_session="last")
+```
+
+---
+
+## 9. Cleanup opportunities discovered during inspection
+
+These are not necessarily bugs, but they are good future maintenance targets.
+
+1. **Expose resume/session options through `./wolf` CLI arguments.**
+   - Example future behavior: `./wolf --resume last`, `./wolf --session-dir ...`, `./wolf --universe host:port`.
+
+2. **Avoid side effects in `dict.get(..., constructor())` defaults.**
+   - Current examples can create unused session directories or construct unused managers.
+   - Prefer explicit `if value is None:` blocks.
+
+3. **Clarify the role of `BaseSession`.**
+   - It is currently a placeholder while most behavior is procedural.
+   - Either keep it intentionally thin or make lifecycle management class-based.
+
+4. **Unify new and resumed setup paths.**
+   - Both paths reconstruct many similar components.
+   - Drift risk exists as the runtime evolves.
+
+5. **Resolve or remove unused `memory_db_persist_sub_dir`.**
+   - It is read in both paths but currently appears unused.
+
+6. **Improve error message formatting in `interactive.py`.**
+   - Current code has:
+     ```python
+     raise Exception("[!] {k} is not a recognised session input")
+     ```
+   - This is missing the `f` prefix.
+
+---
+
+## 10. Suggested nugget standard established by this first nugget
+
+Future `.nug` files should be:
+
+- Stored under `./wisdom_nuggets/` unless a more specific location is clearly better.
+- Written in Markdown-compatible text even if the extension is `.nug`.
+- Started with YAML front matter containing at least:
+  - `nugget_id`
+  - `title`
+  - `author_agent`
+  - `created_at`
+  - `last_reviewed_at`
+  - `status`
+  - `confidence`
+  - `source_files`
+  - `related_docs`
+  - `tags`
+- Registered in `./wisdom.md` with enough context for humans and agents to find it.
+- Focused on discovered, source-grounded knowledge rather than speculative plans.
+
+Suggested confidence vocabulary:
+
+- `source-inspected`: confirmed by reading implementation files.
+- `runtime-observed`: confirmed by actually running behavior.
+- `inferred`: reasoned from code but not directly executed.
+- `stale-risk`: likely true but needs review after changes.
+
+---
+
+## 11. Search keywords
+
+Use this nugget when looking for knowledge about:
+
+- `./wolf`
+- `runners/interactive.py`
+- `CliSession`
+- `BaseSession`
+- `setup_cli_session`
+- `load_existing_session`
+- session builder
+- session manager
+- interactive CLI startup
+- workflow startup
+- fresh session
+- resume session
+- ChromaDB session vector store
+- `TurnBasedWorkflow` construction

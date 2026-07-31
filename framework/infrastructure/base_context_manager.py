@@ -5,6 +5,14 @@ from framework.utils.tokenomics import num_tokens_from_string
 from datetime import datetime
 import json
 import pickle
+import hashlib
+
+
+def copy_safe(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return str(value)
 
 
 class ContextManager:
@@ -53,9 +61,92 @@ class ContextManager:
         self.context_history: List[Dict[str, Any]] = []  # For rollback capability
         self.last_rebuild_timestamp: Optional[str] = None
 
+        # Context ledger/manifest state. This describes the active context as a
+        # curated view over durable chat history, not as the source of truth.
+        self.context_manifest: Dict[str, Any] = self._new_context_manifest()
+        self.pinned_entries: Dict[str, Dict[str, Any]] = {}
+        self.working_memory_packet: Dict[str, Any] = {}
+        self.context_policy: Dict[str, Any] = self._default_context_policy()
+
     # ---------------------------------------------------------------------
     # Helper methods
     # ---------------------------------------------------------------------
+
+    def _new_context_manifest(self) -> Dict[str, Any]:
+        """Create an empty context ledger/manifest."""
+        return {
+            "version": 0,
+            "updated_at": None,
+            "raw_entries": [],
+            "summarized_ranges": [],
+            "pinned_entries": [],
+            "memory_references": [],
+            "omitted_ranges": [],
+            "retrieval_hints": [],
+            "working_memory_packet": {},
+            "compression_provenance": [],
+            "policy": {},
+        }
+
+    def _default_context_policy(self) -> Dict[str, Any]:
+        """Return default context-management policy metadata."""
+        return {
+            "profile": "general",
+            "auto_rebuild_enabled": True,
+            "rebuild_threshold": self.rebuild_threshold,
+            "target_utilization": 0.60,
+            "preserve_pinned": True,
+            "preserve_working_memory": True,
+        }
+
+    def _merge_context_policy(self, policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Merge a stored/partial policy with defaults for backward compatibility."""
+        merged = self._default_context_policy()
+        if isinstance(policy, dict):
+            merged.update(policy)
+        merged["rebuild_threshold"] = float(merged.get("rebuild_threshold", self.rebuild_threshold))
+        self.rebuild_threshold = merged["rebuild_threshold"]
+        return merged
+
+    def _cognitive_load_state(self, utilization: Optional[float] = None) -> str:
+        """Map context utilization to a human-readable cognitive-load state."""
+        if utilization is None:
+            utilization = self.current_ctx_tokens / self.max_ctx_tokens if self.max_ctx_tokens > 0 else 0
+        if utilization <= 0.50:
+            return "sober"
+        if utilization <= 0.70:
+            return "caution"
+        if utilization <= 0.80:
+            return "impaired"
+        if utilization <= 0.85:
+            return "high_risk"
+        return "emergency_brake"
+
+    def _score_salience(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Return deterministic advisory salience metadata for a context entry."""
+        content = self._stringify_content(entry.get("content", ""))
+        content_l = content.lower()
+        action_text = self._stringify_content(entry.get("action", "")).lower()
+        score = 0
+        reasons: List[str] = []
+        sender = str(entry.get("sender", "")).lower()
+        if sender in {"user", "human"}:
+            score += 3
+            reasons.append("user_authored")
+        if any(k in content_l for k in ["error", "warning", "critical", "failed", "exception"]):
+            score += 3
+            reasons.append("error_or_warning")
+        if any(k in content_l for k in ["decision", "remember", "important", "todo", "task", "bug", "fix"]):
+            score += 2
+            reasons.append("important_keyword")
+        if action_text:
+            score += 1
+            reasons.append("action_metadata")
+        if entry.get("pinned"):
+            score += 5
+            reasons.append("pinned")
+        return {"score": score, "reasons": reasons}
+
     def set_traces_vector_store(self, traces_vs: Any) -> None:
         """Attach the traces vector store for semantic retrieval."""
         self._traces_vector_store = traces_vs
@@ -66,8 +157,15 @@ class ContextManager:
         return num_tokens_from_string(text)
 
     def should_rebuild(self) -> bool:
-        """Check if current context buffer exceeds rebuild threshold."""
+        """Check if current context buffer exceeds rebuild threshold.
+
+        The threshold remains an emergency brake, but can be disabled by the
+        explicit context policy for workflows that want fully agent-directed
+        compaction. Manual/forced rebuild actions are unaffected.
+        """
         if self.max_ctx_tokens == 0:
+            return False
+        if not getattr(self, "context_policy", {}).get("auto_rebuild_enabled", True):
             return False
         utilization = self.current_ctx_tokens / self.max_ctx_tokens
         return utilization >= self.rebuild_threshold
@@ -88,13 +186,27 @@ class ContextManager:
         ctx_line = f"[{timestamp}][{sender}]: {content}"
         tokens = self._estimate_token_count(ctx_line)
         
-        return {
+        history_index = self._entry_field(entry, "history_index", None)
+        action = self._entry_field(entry, "action", None)
+        entry_id = self._entry_field(entry, "entry_id", None)
+        if entry_id is None:
+            idx_part = "x" if history_index is None else str(history_index)
+            entry_id = f"ctx_{idx_part}_{hashlib.sha1(ctx_line.encode('utf-8')).hexdigest()[:12]}"
+
+        ctx_entry = {
+            "entry_id": entry_id,
+            "history_index": history_index,
             "sender": sender,
             "content": content,
             "timestamp": timestamp,
+            "action": action,
             "formatted": ctx_line,
-            "tokens": tokens
+            "tokens": tokens,
         }
+        ctx_entry["salience"] = self._score_salience(ctx_entry)
+        if str(entry_id) in self.pinned_entries:
+            ctx_entry["pinned"] = True
+        return ctx_entry
 
     def append_to_current_ctx(self, entry: Dict[str, Any]) -> None:
         """Incrementally append a new chat entry to the current context buffer.
@@ -209,6 +321,208 @@ class ContextManager:
         
         return critical_indices
 
+    def pin_context_entry(self, entry_id: Optional[str] = None, history_index: Optional[int] = None, reason: Optional[str] = None, label: Optional[str] = None) -> Dict[str, Any]:
+        """Pin an active context entry so rebuilds try to preserve it."""
+        match = None
+        for entry in self.current_ctx:
+            if not isinstance(entry, dict):
+                continue
+            if entry_id is not None and str(entry.get("entry_id")) == str(entry_id):
+                match = entry
+                break
+            if history_index is not None and entry.get("history_index") == history_index:
+                match = entry
+                break
+        if match is None:
+            raise ValueError("No active context entry matched entry_id/history_index")
+        pinned_id = str(match.get("entry_id"))
+        match["pinned"] = True
+        match["pin_reason"] = reason
+        match["pin_label"] = label
+        match["salience"] = self._score_salience(match)
+        self.pinned_entries[pinned_id] = {
+            "entry_id": pinned_id,
+            "history_index": match.get("history_index"),
+            "timestamp": match.get("timestamp"),
+            "sender": match.get("sender"),
+            "reason": reason,
+            "label": label,
+            "entry": copy_safe(match),
+            "pinned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.build_context_manifest()
+        return self.pinned_entries[pinned_id]
+
+    def unpin_context_entry(self, entry_id: str) -> Dict[str, Any]:
+        """Remove a pin by entry id."""
+        removed = self.pinned_entries.pop(str(entry_id), None)
+        for entry in self.current_ctx:
+            if isinstance(entry, dict) and str(entry.get("entry_id")) == str(entry_id):
+                entry.pop("pinned", None)
+                entry.pop("pin_reason", None)
+                entry.pop("pin_label", None)
+                entry["salience"] = self._score_salience(entry)
+        self.build_context_manifest()
+        return {"entry_id": entry_id, "removed": removed is not None}
+
+    def list_pinned_entries(self) -> Dict[str, Dict[str, Any]]:
+        return dict(self.pinned_entries)
+
+    def update_working_memory_packet(self, **fields: Any) -> Dict[str, Any]:
+        """Update the compact working-memory packet kept in active context."""
+        allowed = {
+            "current_objective", "current_plan", "current_step", "active_files",
+            "modified_files", "open_tasks", "open_questions", "decisions",
+            "known_bugs_warnings", "last_successful_action", "next_recommended_action",
+        }
+        for key, value in fields.items():
+            if key in allowed and value is not None:
+                self.working_memory_packet[key] = value
+        self.working_memory_packet["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if self.context_policy.get("preserve_working_memory", True):
+            self._upsert_working_memory_context_entry()
+        self.build_context_manifest()
+        return dict(self.working_memory_packet)
+
+    def get_working_memory_packet(self) -> Dict[str, Any]:
+        return dict(self.working_memory_packet)
+
+    def _upsert_working_memory_context_entry(self) -> None:
+        """Insert or replace the working-memory packet entry in current_ctx."""
+        wm_entry = self._working_memory_context_entry()
+        self.current_ctx = [
+            entry for entry in self.current_ctx
+            if not (isinstance(entry, dict) and entry.get("entry_id") == "working_memory_packet")
+        ]
+        if wm_entry is not None:
+            self.current_ctx.insert(0, wm_entry)
+        self._recompute_current_ctx_tokens()
+
+    def _working_memory_context_entry(self) -> Optional[Dict[str, Any]]:
+        if not self.working_memory_packet:
+            return None
+        text = "[WORKING MEMORY PACKET]\n" + json.dumps(self.working_memory_packet, indent=2, ensure_ascii=False, sort_keys=True, default=str)
+        entry = self._create_context_entry({"sender": "system", "content": text, "timestamp": self.working_memory_packet.get("updated_at", ""), "history_index": -1})
+        entry["entry_id"] = "working_memory_packet"
+        entry["pinned"] = True
+        entry["salience"] = self._score_salience(entry)
+        return entry
+
+    def build_context_manifest(self, chat_history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Build/update the machine-readable context ledger."""
+        raw_entries = []
+        memory_refs = []
+        for entry in self.current_ctx:
+            if not isinstance(entry, dict):
+                continue
+            raw_entries.append({
+                "entry_id": entry.get("entry_id"),
+                "history_index": entry.get("history_index"),
+                "sender": entry.get("sender"),
+                "timestamp": entry.get("timestamp"),
+                "tokens": entry.get("tokens"),
+                "pinned": bool(entry.get("pinned")),
+                "salience": entry.get("salience", {}),
+            })
+            if entry.get("memory_key"):
+                memory_refs.append({"memory_key": entry.get("memory_key"), "replaces_range": entry.get("replaces_range")})
+        included = [e.get("history_index") for e in raw_entries if isinstance(e.get("history_index"), int) and e.get("history_index") >= 0]
+        omitted_ranges = []
+        if chat_history is not None:
+            if not included:
+                if len(chat_history) > 0:
+                    omitted_ranges.append([0, len(chat_history)])
+            else:
+                included_set = set(included)
+                start = None
+                for idx in range(len(chat_history)):
+                    if idx not in included_set and start is None:
+                        start = idx
+                    if (idx in included_set or idx == len(chat_history) - 1) and start is not None:
+                        end = idx if idx in included_set else idx + 1
+                        omitted_ranges.append([start, end])
+                        start = None
+        self.context_manifest = {
+            "version": self.context_version,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "raw_entries": raw_entries,
+            "summarized_ranges": [e.get("replaces_range") for e in self.current_ctx if isinstance(e, dict) and e.get("replaces_range")],
+            "pinned_entries": list(self.pinned_entries.values()),
+            "memory_references": memory_refs,
+            "omitted_ranges": omitted_ranges,
+            "retrieval_hints": self.context_policy.get("retrieval_hints", []),
+            "working_memory_packet": dict(self.working_memory_packet),
+            "compression_provenance": self.context_policy.get("compression_provenance", []),
+            "policy": dict(self.context_policy),
+        }
+        return self.context_manifest
+
+    def list_context_manifest(self) -> Dict[str, Any]:
+        return dict(self.context_manifest)
+
+    def audit_context_integrity(self) -> Dict[str, Any]:
+        """Audit whether critical working state is represented in active context."""
+        wm = self.working_memory_packet
+        issues = []
+        for field in ["current_objective", "current_plan", "current_step", "next_recommended_action"]:
+            if not wm.get(field):
+                issues.append(f"working_memory_packet missing {field}")
+        if self.context_policy.get("preserve_pinned", True) and not self.pinned_entries:
+            issues.append("no pinned entries recorded")
+        diag = self.get_context_diagnostics()
+        if diag["cognitive_load_state"] in {"high_risk", "emergency_brake"}:
+            issues.append(f"context load is {diag['cognitive_load_state']}")
+        return {"ok": not issues, "issues": issues, "diagnostics": diag, "manifest_version": self.context_manifest.get("version")}
+
+    def set_context_policy(self, **policy: Any) -> Dict[str, Any]:
+        """Update context policy/profile metadata."""
+        allowed = {
+            "profile", "auto_rebuild_enabled", "rebuild_threshold",
+            "target_utilization", "preserve_pinned", "preserve_working_memory",
+            "retrieval_hints",
+        }
+        for key, value in policy.items():
+            if key not in allowed or value is None:
+                continue
+            if key in {"rebuild_threshold", "target_utilization"}:
+                value = float(value)
+                if not 0.0 < value <= 1.0:
+                    raise ValueError(f"{key} must be in the interval (0.0, 1.0]")
+            if key in {"auto_rebuild_enabled", "preserve_pinned", "preserve_working_memory"}:
+                value = bool(value)
+            if key == "retrieval_hints":
+                if isinstance(value, str):
+                    value = [value]
+                value = [str(v) for v in value]
+            self.context_policy[key] = value
+        self.rebuild_threshold = float(self.context_policy.get("rebuild_threshold", self.rebuild_threshold))
+        self.context_policy["rebuild_threshold"] = self.rebuild_threshold
+        self.build_context_manifest()
+        return dict(self.context_policy)
+
+    def promote_context_to_memory(self, start_index: int, end_index: int, memory_manager: Any, category: str, key: str, note: Optional[str] = None) -> Dict[str, Any]:
+        """Promote a durable history/context range into structured memory."""
+        if start_index < 0 or end_index < start_index:
+            raise ValueError("Invalid range: expected 0 <= start_index <= end_index")
+        selected = []
+        for pos, entry in enumerate(self.current_ctx):
+            if not isinstance(entry, dict):
+                continue
+            idx = entry.get("history_index", pos)
+            if isinstance(idx, int) and start_index <= idx < end_index:
+                selected.append(entry)
+        value = {
+            "source_range": [start_index, end_index],
+            "note": note,
+            "entries": [{"history_index": e.get("history_index"), "sender": e.get("sender"), "timestamp": e.get("timestamp"), "content": e.get("content")} for e in selected],
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        memory_manager.remember(key=key, value=value, category=category)
+        provenance = {"range": [start_index, end_index], "memory_key": key, "category": category, "created_at": value["created_at"], "note": note}
+        self.context_policy.setdefault("compression_provenance", []).append(provenance)
+        self.build_context_manifest()
+        return provenance
+
     def rebuild_current_ctx(
         self,
         chat_history: List[Dict[str, Any]],
@@ -275,12 +589,32 @@ class ContextManager:
                     new_ctx.insert(insert_pos, ctx_entry)
                     new_ctx_tokens += ctx_entry["tokens"]
         
+        # 3. Re-add pinned entries that may have fallen outside the recent/critical budget.
+        if self.context_policy.get("preserve_pinned", True):
+            existing_ids = {str(e.get("entry_id")) for e in new_ctx if isinstance(e, dict)}
+            for pin in self.pinned_entries.values():
+                entry = pin.get("entry")
+                if isinstance(entry, dict) and str(entry.get("entry_id")) not in existing_ids:
+                    new_ctx.append(entry)
+                    existing_ids.add(str(entry.get("entry_id")))
+
+        # 4. Keep the working memory packet in the active context if present.
+        if self.context_policy.get("preserve_working_memory", True):
+            wm_entry = self._working_memory_context_entry()
+            if wm_entry is not None:
+                new_ctx = [e for e in new_ctx if not (isinstance(e, dict) and e.get("entry_id") == "working_memory_packet")]
+                new_ctx.insert(0, wm_entry)
+
+        new_ctx.sort(key=lambda e: e.get("history_index", 10**12) if isinstance(e, dict) and e.get("history_index") != -1 else -1)
+        new_ctx_tokens = sum(int(e.get("tokens", 0)) for e in new_ctx if isinstance(e, dict))
+
         # Update current context
         self.current_ctx = new_ctx
         self.current_ctx_tokens = new_ctx_tokens
         self.rebuild_count += 1
         self.context_version += 1
         self.last_rebuild_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.build_context_manifest(chat_history=chat_history)
         
         if verbose > 0:
             console.print(
@@ -290,9 +624,16 @@ class ContextManager:
     def get_compacted_context(self) -> str:
         """Return the current context buffer as a formatted string.
         
-        This is the context that should be sent to the LLM.
+        This is the context that should be sent to the LLM. The working memory
+        packet is always prepended when present, even if no rebuild has occurred
+        since it was updated.
         """
-        return "\n".join([entry["formatted"] for entry in self.current_ctx])
+        if self.working_memory_packet and not any(
+            isinstance(entry, dict) and entry.get("entry_id") == "working_memory_packet"
+            for entry in self.current_ctx
+        ):
+            self._upsert_working_memory_context_entry()
+        return "\n".join([entry.get("formatted", str(entry)) for entry in self.current_ctx])
 
     # ---------------------------------------------------------------------
     # Context-window action support methods
@@ -568,6 +909,7 @@ class ContextManager:
             "max_ctx_tokens": self.max_ctx_tokens,
             "utilization": utilization,
             "utilization_pct": utilization * 100,
+            "cognitive_load_state": self._cognitive_load_state(utilization),
             "should_rebuild": self.should_rebuild(),
             "rebuild_threshold": self.rebuild_threshold,
             "num_entries": len(self.current_ctx),
@@ -576,7 +918,10 @@ class ContextManager:
             "total_appends": self.total_appends,
             "context_version": self.context_version,
             "last_rebuild": self.last_rebuild_timestamp,
-            "snapshots_available": len(self.context_history)
+            "snapshots_available": len(self.context_history),
+            "pinned_entries": len(self.pinned_entries),
+            "working_memory_fields": sorted(list(self.working_memory_packet.keys())),
+            "context_policy": dict(self.context_policy),
         }
 
     def save_context(self, filepath: Optional[str] = None) -> None:
@@ -595,6 +940,10 @@ class ContextManager:
             "rebuild_count": self.rebuild_count,
             "total_appends": self.total_appends,
             "last_rebuild": self.last_rebuild_timestamp,
+            "context_manifest": self.context_manifest,
+            "pinned_entries": self.pinned_entries,
+            "working_memory_packet": self.working_memory_packet,
+            "context_policy": self.context_policy,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         
@@ -625,6 +974,12 @@ class ContextManager:
             self.rebuild_count = state["rebuild_count"]
             self.total_appends = state["total_appends"]
             self.last_rebuild_timestamp = state.get("last_rebuild")
+            self.context_manifest = state.get("context_manifest", self._new_context_manifest())
+            self.pinned_entries = state.get("pinned_entries", {})
+            self.working_memory_packet = state.get("working_memory_packet", {})
+            self.context_policy = self._merge_context_policy(state.get("context_policy", getattr(self, "context_policy", {})))
+            if self.working_memory_packet and self.context_policy.get("preserve_working_memory", True):
+                self._upsert_working_memory_context_entry()
             
             console.print(f"[CONTEXT] State loaded from {filepath} (version {self.context_version})")
             return True
@@ -650,6 +1005,10 @@ class ContextManager:
             "total_appends": self.total_appends,
             "context_history": self.context_history,
             "last_rebuild_timestamp": self.last_rebuild_timestamp,
+            "context_manifest": self.context_manifest,
+            "pinned_entries": self.pinned_entries,
+            "working_memory_packet": self.working_memory_packet,
+            "context_policy": self.context_policy,
             "max_ctx_tokens": self.max_ctx_tokens,
             "recent_chat_ratio": self.recent_chat_ratio,
             "memory_ratio": self.memory_ratio,
@@ -673,6 +1032,12 @@ class ContextManager:
         self.total_appends = snapshot_data.get("total_appends", 0)
         self.context_history = snapshot_data.get("context_history", [])
         self.last_rebuild_timestamp = snapshot_data.get("last_rebuild_timestamp")
+        self.context_manifest = snapshot_data.get("context_manifest", self._new_context_manifest())
+        self.pinned_entries = snapshot_data.get("pinned_entries", {})
+        self.working_memory_packet = snapshot_data.get("working_memory_packet", {})
+        self.context_policy = self._merge_context_policy(snapshot_data.get("context_policy", getattr(self, "context_policy", {})))
+        if self.working_memory_packet and self.context_policy.get("preserve_working_memory", True):
+            self._upsert_working_memory_context_entry()
         
         # Restore configuration (if present)
         if "max_ctx_tokens" in snapshot_data:
@@ -686,8 +1051,8 @@ class ContextManager:
         if "rebuild_threshold" in snapshot_data:
             self.rebuild_threshold = snapshot_data["rebuild_threshold"]
         
-        # Save restored state to disk for persistence
-        self.save_context()
+        # Do not write to disk from restore(); loading/resuming a snapshot should
+        # not mutate old session files as a side effect.
 
     def save_snapshot(self, file_path: str) -> None:
         """Save a snapshot to disk.
