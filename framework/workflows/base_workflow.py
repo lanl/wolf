@@ -22,23 +22,36 @@ from framework.infrastructure.base_infrastructure import BaseInfrastructure
 from framework.workflows.enhanced_input import interactive_input_line_wrapped
 
 
-def normalize_payload(payload: Dict, actor:str) -> Dict:
+def normalize_payload(payload: Dict, actor: str) -> Dict:
     """Normalize action payloads to ensure schema compliance.
+
     - Removes empty or falsy ``yield_motion_to`` fields
     - Removes keys with ``None`` values
     - Adds defaults for ``send_message`` action when ``sender`` or ``receiver`` are missing
+
+    ``actor`` is sometimes passed as an agent object instead of a string.  The
+    previous implementation copied that object directly into
+    ``send_message.payload.sender``/``receiver``, causing Pydantic string
+    validation failures and response-validation loops.  Coerce it once here.
     """
+    actor_name = actor if isinstance(actor, str) else getattr(actor, "name", None)
+    if not isinstance(actor_name, str) or not actor_name:
+        actor_name = "assistant"
+
     normalized = {k: v for k, v in payload.items() if v is not None}
     if "yield_motion_to" in normalized and not normalized["yield_motion_to"]:
         del normalized["yield_motion_to"]
-    # Ensure ``send_message`` always includes required sender/receiver fields
+
+    # Ensure ``send_message`` always includes required string sender/receiver fields.
     if normalized.get("action") == "send_message":
         payload_section = normalized.get("payload", {})
         if isinstance(payload_section, dict):
-            if "sender" not in payload_section:
-                payload_section["sender"] = actor #"assistant"
-            if "receiver" not in payload_section:
-                payload_section["receiver"] = actor #"user"
+            sender = payload_section.get("sender")
+            receiver = payload_section.get("receiver")
+            if not isinstance(sender, str) or not sender:
+                payload_section["sender"] = actor_name
+            if not isinstance(receiver, str) or not receiver:
+                payload_section["receiver"] = actor_name
             normalized["payload"] = payload_section
     return normalized
 
@@ -204,7 +217,17 @@ class BaseWorkflow:
                 WF_RULES=snapshot_data.get('WF_RULES', '')
             )
             
+            self._pending_workflow_state = snapshot_data.get('workflow_state')
             self.load_session_state()
+            # If the concrete subclass is already fully initialized, restore
+            # immediately. Otherwise the subclass can consume
+            # _pending_workflow_state after super().__init__ returns.
+            if hasattr(self, "restore_workflow_state"):
+                try:
+                    self.restore_workflow_state(self._pending_workflow_state)
+                    self._pending_workflow_state = None
+                except Exception:
+                    pass
             console.print(f"[green]Session restored successfully[/green]")
             
         except FileNotFoundError:
@@ -247,6 +270,15 @@ class BaseWorkflow:
             'workers_info': [{'name': w.name, 'type': type(w).__name__} for w in self.workers.values()],
             'objects_info': []  # TODO: serialize object references
         }
+        
+        # Optional workflow-specific state hook. Custom workflows such as
+        # FastTurnBasedWorkflow use this to persist adaptive action-buffer
+        # statistics without changing BaseSession's Pydantic schema.
+        if hasattr(self, "get_workflow_state"):
+            try:
+                snapshot['workflow_state'] = self.get_workflow_state()
+            except Exception as exc:
+                snapshot['workflow_state_error'] = str(exc)
         
         return snapshot
 
@@ -335,6 +367,12 @@ class BaseWorkflow:
         self.full_schema_string = self.session.full_schema_string
         self.schema_to_use = self.full_schema_string
         self.agent_role_prompt = self.session.agent_role_prompt
+        self.action_names_to_use = None
+        # Let infrastructure-level CLI commands inspect/mutate workflow state.
+        try:
+            self.infra.cli_workflow = self
+        except Exception:
+            pass
         
         # Load configuration files
         self.wf_agent_behaviour_file = self.session.wf_agent_behaviour_file
@@ -458,10 +496,15 @@ class BaseWorkflow:
             self.Actions = SubsetActions
             self.action_adapter = TypeAdapter(self.Actions)
             self.schema_to_use = subset_schema
+            self.action_names_to_use = list(action_names)
         else:
             self.Actions = FullActions
             self.action_adapter = TypeAdapter(self.Actions)
             self.schema_to_use = self.full_schema_string
+            try:
+                self.action_names_to_use = list(ACTION_NAMES)
+            except Exception:
+                self.action_names_to_use = None
 
 
     # -----------------------------------------------------------------

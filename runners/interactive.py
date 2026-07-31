@@ -46,7 +46,7 @@ if __name__ == "__main__":
         if k in s_params:
             session_inputs[k] = params[k]
         else:
-            raise Exception("[!] {k} is not a recognised session input")
+            raise Exception(f"[!] {k} is not a recognised session input")
     session_inputs['LLMs'] = LLM # Not well implemented. Need to do better
     #session = setup_cli_session(session_inputs, resume_session=None)
     #session = setup_cli_session(session_inputs, resume_session="20260528_124756")

@@ -4,7 +4,8 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 from prompt_toolkit.completion import PathCompleter, WordCompleter, Completer, Completion
-from typing import Optional, Iterable
+from prompt_toolkit.document import Document
+from typing import Optional, Iterable, Tuple
 import os
 import subprocess
 
@@ -32,49 +33,98 @@ _style = Style.from_dict({
 
 
 class SmartCompleter(Completer):
-    """Intelligent completer that handles different input modes."""
-    
+    """Intelligent completer that handles commands and paths anywhere.
+
+    ``PathCompleter`` works well when the whole prompt buffer is a path, but
+    passing the full sentence means mid-field paths such as ``read ./REA`` are
+    not interpreted as path fragments.  This completer extracts only the token
+    immediately before the cursor and runs ``PathCompleter`` against that small
+    document, while preserving prompt_toolkit's replacement offsets.
+    """
+
+    _PATH_PREFIXES = ("./", "../", "/", "~/", ".", "~")
+
     def __init__(self, wf_commands=None):
         self.path_completer = PathCompleter(expanduser=True)
         self.wf_commands = wf_commands or []
         self.wf_completer = WordCompleter(self.wf_commands, ignore_case=True)
-    
+
+    @staticmethod
+    def _token_before_cursor(text: str) -> Tuple[str, int]:
+        """Return the shell-ish token ending at the cursor and its start index."""
+        if not text:
+            return "", 0
+
+        quote = None
+        start = len(text)
+        for i in range(len(text) - 1, -1, -1):
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    start = i + 1
+                    break
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                continue
+            if ch.isspace():
+                start = i + 1
+                break
+            start = i
+        return text[start:], start
+
+    @classmethod
+    def _looks_like_path_token(cls, token: str) -> bool:
+        if not token:
+            return False
+        if token.startswith(cls._PATH_PREFIXES):
+            return True
+        # Complete nested relative paths once the user has typed a slash, e.g.
+        # ``config/pre`` or ``framework/workflows/en``.
+        return "/" in token or "\\" in token
+
+    def _yield_path_completions_for_token(self, token: str, complete_event):
+        token_doc = Document(token, cursor_position=len(token))
+        yield from self.path_completer.get_completions(token_doc, complete_event)
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
-        
-        # Handle WOLF function completion (\>)
+        token, token_start = self._token_before_cursor(text)
+
+        # Handle WOLF function completion (\>) at the beginning of a command.
         if text.startswith('\\>'):
-            # Extract the partial command after \>
-            cmd_start = 2
-            partial_cmd = text[cmd_start:]
-            
-            # Provide WOLF command completions
-            for completion in self.wf_completer.get_completions(document, complete_event):
-                yield completion
-        
-        # Handle terminal command completion (!>)
-        elif text.startswith('!>'):
-            # Extract the command after !>
-            cmd_text = text[2:].lstrip()
-            
-            # Path completion for terminal commands
-            # Create a modified document that only includes the path part
-            words = cmd_text.split()
-            if words:
-                # Complete paths for command arguments
-                for completion in self.path_completer.get_completions(document, complete_event):
-                    yield completion
-        
-        # Handle @ interlocutor completion
-        elif text.startswith('@'):
-            # Could add interlocutor name completion here if we have access to WF_MEMBERS
-            pass
-        
-        # Default: filesystem-aware completion for all inputs
-        else:
-            # Always provide path completion
-            for completion in self.path_completer.get_completions(document, complete_event):
-                yield completion
+            cmd_text = text[2:]
+            cmd_token, _ = self._token_before_cursor(cmd_text)
+            # Command word completion before the first argument.
+            if len(cmd_text.strip().split()) <= 1 and not cmd_text.endswith(' '):
+                cmd_doc = Document(cmd_token, cursor_position=len(cmd_token))
+                yield from self.wf_completer.get_completions(cmd_doc, complete_event)
+                return
+            # Path completion for file=..., prompt files, or other args.
+            if "=" in token:
+                key, value = token.split("=", 1)
+                if self._looks_like_path_token(value):
+                    for c in self._yield_path_completions_for_token(value, complete_event):
+                        yield Completion(f"{key}={c.text}", start_position=-(len(key) + 1 + len(value)), display=c.display, display_meta=c.display_meta)
+                    return
+            if self._looks_like_path_token(token):
+                yield from self._yield_path_completions_for_token(token, complete_event)
+            return
+
+        # Handle terminal command completion (!>) and regular text: complete
+        # the current token if it looks like a path, regardless of field index.
+        if text.startswith('!>'):
+            if self._looks_like_path_token(token):
+                yield from self._yield_path_completions_for_token(token, complete_event)
+            return
+
+        # Handle @ interlocutor completion.  The current implementation does not
+        # receive WF_MEMBERS, but keep this branch explicit for future extension.
+        if text.startswith('@') and len(text.split()) <= 1:
+            return
+
+        if self._looks_like_path_token(token):
+            yield from self._yield_path_completions_for_token(token, complete_event)
 
 
 def interactive_input(

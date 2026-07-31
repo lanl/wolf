@@ -119,6 +119,86 @@ class OpenAIAgent:
     # Public Methods
     # ---------------------------
 
+    def _build_clients(self) -> None:
+        """Rebuild OpenAI-compatible clients from current provider fields."""
+        parsed = urlparse(self.host_address)
+        scheme = parsed.scheme if parsed.scheme else "http"
+        netloc = parsed.netloc or "localhost"
+        path = parsed.path
+        if self.host_port:
+            netloc = f"{netloc}:{self.host_port}"
+
+        self.base_url = f"{scheme}://{netloc}{path}"
+        if self.api_version:
+            self.base_url = self.base_url.rstrip('/') + f"/{self.api_version}"
+
+        if self.api_key:
+            self.llm = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            self.async_llm = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        else:
+            self.llm = OpenAI(base_url=self.base_url)
+            self.async_llm = AsyncOpenAI(base_url=self.base_url)
+
+        if instructor:
+            self.instructor_client = instructor.from_openai(
+                OpenAI(base_url=self.base_url, api_key=self.api_key),
+                mode=instructor.Mode.JSON,
+            )
+            self.instructor_async_client = instructor.from_openai(
+                AsyncOpenAI(base_url=self.base_url, api_key=self.api_key),
+                mode=instructor.Mode.JSON,
+            )
+        else:
+            self.instructor_client = None
+            self.instructor_async_client = None
+
+    def reconfigure(self, **updates: Any) -> Dict[str, Any]:
+        """Update agent runtime configuration and rebuild provider clients.
+
+        Intended for operator CLI controls.  Supported keys are intentionally
+        limited to fields that are already public attributes of OpenAIAgent.
+        Provider/client fields trigger a client rebuild so the next model call
+        uses the new endpoint.
+        """
+        aliases = {
+            "host": "host_address",
+            "ip": "host_address",
+            "port": "host_port",
+            "api_version": "api_version",
+            "api-key": "api_key",
+            "api_key": "api_key",
+        }
+        allowed = {
+            "model", "host_address", "host_port", "api_version",
+            "api_key", "verbose", "sys_prompt", "cache_history",
+            "capabilities", "ctx_window_length",
+        }
+        changed: Dict[str, Any] = {}
+        provider_fields = {"host_address", "host_port", "api_version", "api_key"}
+        rebuild = False
+
+        for key, value in updates.items():
+            attr = aliases.get(key, key)
+            if attr not in allowed:
+                raise ValueError(f"Unsupported OpenAIAgent config field: {key}")
+            if attr in {"host_port", "verbose", "ctx_window_length"} and value not in (None, ""):
+                value = int(value)
+            if attr == "cache_history" and isinstance(value, str):
+                value = value.strip().lower() in {"1", "true", "yes", "on"}
+            if attr == "capabilities" and isinstance(value, str):
+                value = [v.strip() for v in value.replace(";", ",").split(",") if v.strip()]
+            setattr(self, attr, value)
+            changed[attr] = "***" if attr == "api_key" else value
+            if attr in provider_fields:
+                rebuild = True
+
+        if rebuild:
+            self._build_clients()
+        if "sys_prompt" in changed:
+            self.reset_ctx(self.sys_prompt)
+        changed["base_url"] = getattr(self, "base_url", None)
+        return changed
+
     def get_chat_response(
         self, 
         user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
@@ -160,10 +240,9 @@ class OpenAIAgent:
                                          List[Dict[str, Any]]], model: Optional[str] = None) -> str:
 
         model = model or self.model
-        CTX = self._make_ctx(user_prompt)
         response = ""
         async with await self.async_llm.chat.completions.create(
-            model=model, messages=CTX, stream=True
+            model=model, messages=self._make_ctx(user_prompt), stream=True
         ) as stream:
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
@@ -388,15 +467,54 @@ class OpenAIAgent:
             else:
                 self.console.print(msg, end=end)
 
+    @staticmethod
+    def _prompt_contains_schema(prompt: Any) -> bool:
+        """Return True when a prompt already contains the WOLF action schema.
+
+        TurnBasedWorkflow builds a prompt that already includes the selected
+        action schema.  The legacy fallback formatter also appended ``schema``
+        before calling the model, producing two full copies of the action
+        examples in non-structured-output mode.  This helper supports both plain
+        string prompts and OpenAI-style multimodal content-block prompts.
+        """
+        markers = (
+            "Allowed action examples:",
+            "*** List of allowed Actions Start ***",
+            "The object must have exactly these top-level fields",
+        )
+        if isinstance(prompt, str):
+            return any(marker in prompt for marker in markers)
+        if isinstance(prompt, list):
+            for item in prompt:
+                if isinstance(item, str) and any(marker in item for marker in markers):
+                    return True
+                if isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                    if isinstance(text, str) and any(marker in text for marker in markers):
+                        return True
+                    if isinstance(text, list) and OpenAIAgent._prompt_contains_schema(text):
+                        return True
+        if isinstance(prompt, dict):
+            text = prompt.get("text") or prompt.get("content")
+            if isinstance(text, str):
+                return any(marker in text for marker in markers)
+            if isinstance(text, list):
+                return OpenAIAgent._prompt_contains_schema(text)
+        return False
+
     def format_agent_response(self, prompt, schema, n_max_trials=5):
         n_trial = 0
         raw = None
         result = {}
         while n_trial < n_max_trials:
             # ``prompt`` may be either a plain string or an OpenAI-style list of
-            # multimodal content blocks. Append the schema as a text block for
-            # multimodal prompts instead of using string concatenation.
-            prompt_with_schema = append_text_block(prompt, schema)
+            # multimodal content blocks.  Do not append ``schema`` when the
+            # workflow prompt already contains it; otherwise the fallback path
+            # doubles the full action examples and makes JSON compliance worse.
+            if self._prompt_contains_schema(prompt):
+                prompt_with_schema = prompt
+            else:
+                prompt_with_schema = append_text_block(prompt, schema)
             raw = self.get_chat_response(user_prompt=prompt_with_schema)
             result = robust_jsonfy(raw)
             if "parsed" in result:

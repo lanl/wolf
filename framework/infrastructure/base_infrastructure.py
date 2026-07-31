@@ -3,6 +3,8 @@ import os
 import logging
 import pickle
 import subprocess
+import shlex
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -287,7 +289,9 @@ class BaseInfrastructure:
         chat_entry = {
             "sender": actor,
             "content": content,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "action": action,
+            "history_index": len(self.chat_manager.CHAT_HISTORY),
         }
         self.chat_manager.CHAT_HISTORY.append(chat_entry)
 
@@ -354,71 +358,548 @@ class BaseInfrastructure:
         self.show_partial_ctx(idx0=head)
         self.CONSOLE_HEAD = len(self.chat_history)
 
+
+    # ------ Operator CLI command helpers ------
+
+    def _cli_get_workflow(self):
+        """Return the active workflow registered by BaseWorkflow/TurnBasedWorkflow."""
+        return getattr(self, "cli_workflow", None) or getattr(self, "workflow", None)
+
+    @staticmethod
+    def _cli_parse_kv_pairs(parts: List[str]) -> Dict[str, Any]:
+        updates: Dict[str, Any] = {}
+        for part in parts:
+            if "=" not in part:
+                raise ValueError(f"Expected key=value token, got: {part}")
+            key, value = part.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                raise ValueError(f"Empty key in token: {part}")
+            if value.lower() in {"true", "false"}:
+                value = value.lower() == "true"
+            elif value.lower() in {"none", "null"}:
+                value = None
+            else:
+                try:
+                    value = int(value)
+                except Exception:
+                    try:
+                        value = float(value)
+                    except Exception:
+                        pass
+            updates[key] = value
+        return updates
+
+    @staticmethod
+    def _cli_redact(value: Any, key: str = "") -> Any:
+        sensitive = ("api_key", "apikey", "token", "password", "secret", "authorization")
+        if any(s in key.lower() for s in sensitive):
+            return "***REDACTED***" if value not in (None, "") else value
+        if isinstance(value, dict):
+            return {k: BaseInfrastructure._cli_redact(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [BaseInfrastructure._cli_redact(v, key) for v in value]
+        return value
+
+    @staticmethod
+    def _cli_render(value: Any) -> str:
+        """Render operator CLI output as stable pretty JSON when possible."""
+        try:
+            return json.dumps(value, indent=2, sort_keys=True, default=str)
+        except Exception:
+            return str(value)
+
+    def _cli_all_agents(self) -> Dict[str, Any]:
+        agents = {self.agent.name: self.agent}
+        agents.update(self.workers)
+        return agents
+
+    def _cli_agent_summary(self, agent: Any) -> Dict[str, Any]:
+        fields = [
+            "name", "model", "host_address", "host_port", "api_version", "base_url",
+            "verbose", "capabilities", "ctx_window_length", "cache_history", "sys_prompt",
+        ]
+        out = {field: getattr(agent, field, None) for field in fields if hasattr(agent, field)}
+        out["type"] = type(agent).__name__
+        out["workflow_role"] = "main" if agent is self.agent else "worker"
+        out["has_sync_client"] = hasattr(agent, "llm")
+        out["has_async_client"] = hasattr(agent, "async_llm")
+        return self._cli_redact(out)
+
+    def _cli_help_text(self) -> str:
+        return r"""------------------------ [CLI HELP] ---------------------------------------------------
+Start you input with '\>' or with '\' to run WOLF system commands 
+and with '!>' to run terminal commands. 
+[+] [Display]:
+  \> help 
+  \> show agents
+  \> show agent <name|main>
+  \> show workflow
+  \> show prompt system|behavior|rules|infra
+  \> show actions [limit=N]
+  \> show action <action_name>
+  \> show fast-workflow|hot-actions|action-usage|action-buffer|action-validation-errors
+  \> show ctx|context|history|chat
+----------------------------------------------------------------------------------------------------------
+[+] [Modify live session]:
+  \> set agent <name|main> model=<model> host=<url> port=<port> api_version=<v> capabilities=a,b
+  \> set main-agent <worker_name>
+  \> switch main <worker_name>
+  \> switch agent <worker_name>
+  \> set prompt system file=<path>
+  \> set prompt behavior file=<path>
+  \> set prompt rules file=<path>
+  \> set prompt infra file=<path>
+  \> set fast-workflow hot_action_buffer_max=12 prompt_schema_token_budget=2500
+  \> reload prompts
+  \> reload prompt system|behavior|rules|infra
+  \> actions use all|safe|write|dev|action1,action2,...
+----------------------------------------------------------------------------------------------------------
+[!] Slash aliases such as /show and /set also work.
+----------------------------------------------------------------------------------------------------------
+[+] [Run terminal command]:
+  !> cmd. i.e !> pwd 
+----------------------------------------------------------------------------------------------------------
+[!] [FastWorkflow ONLY]:
+  \> show fast-workflow`
+  \> show hot-actions`
+  \> show action-usage`
+  \> show action-buffer`
+  \> show action-validation-errors`
+  \> set fast-workflow hot_action_buffer_max=12 prompt_schema_token_budget=2500`
+----------------------------------------------------------------------------------------------------------
+[+] [Inline input controls]: Use  <input> and </input> containers i.e <input> ./figure2.png </input> 
+    will include image modality for './figure2.png' to the context
+[+] [Screen clearing controls]: clear, cls or /clear to clear the screen 
+[+] [Exit commands]: exit, quit, /exit, /quit or /bye 
+---------------------------------------------------------------------------------------------------------- 
+"""
+
+    def _cli_show_prompt(self, which: str) -> str:
+        wf = self._cli_get_workflow()
+        key = which.lower().strip()
+        if key in ["system", "sys", "prompt", "agent_sys", "agent-system"]:
+            if wf is None:
+                return "[system][ERROR] No active workflow registered; cannot show workflow system prompt."
+            return f"[system][PROMPT system file={getattr(wf, 'wf_agent_sys_prompt_file', None)}]\n{getattr(wf, 'WF_AGENT_SYS_PROMPT', '')}"
+        if key in ["behavior", "behaviour", "heavior", "best-practices", "best_practices"]:
+            if wf is None:
+                return "[system][ERROR] No active workflow registered; cannot show behavior prompt."
+            return f"[system][PROMPT behavior file={getattr(wf, 'wf_agent_behaviour_file', None)}]\n{getattr(wf, 'AGENT_BEHAVIOUR', '')}"
+        if key in ["rules", "rule"]:
+            if wf is None:
+                return "[system][ERROR] No active workflow registered; cannot show workflow rules."
+            return f"[system][PROMPT rules file={getattr(wf, 'wf_rules_file', None)}]\n{getattr(wf, 'WF_RULES', '')}"
+        if key in ["infra", "infrastructure"]:
+            return f"[system][PROMPT infra file={self.infra_description_file}]\n{self.INFRA_DESCRIPTION}"
+        return f"[system][ERROR] Unknown prompt target: {which}"
+
+    def _cli_show_actions(self, parts: List[str]) -> str:
+        from framework.workflows.workflow_models import ACTION_NAMES
+        wf = self._cli_get_workflow()
+        limit = None
+        for part in parts:
+            if part.startswith("limit="):
+                try:
+                    limit = int(part.split("=", 1)[1])
+                except Exception:
+                    pass
+        all_names = list(ACTION_NAMES)
+        active_names = getattr(wf, "action_names_to_use", None) if wf is not None else None
+        if not active_names:
+            active_names = all_names
+        shown = active_names[:limit] if limit else active_names
+        schema = getattr(wf, "schema_to_use", self.SCHEMA_STRING) if wf is not None else self.SCHEMA_STRING
+        data = {
+            "known_count": len(all_names),
+            "active_count": len(active_names),
+            "active_names": shown,
+            "schema_tokens": num_tokens_from_string(schema),
+        }
+        return f"[system][ACTIONS]\n{self._cli_render(data)}"
+
+    def _cli_show_action(self, name: str) -> str:
+        from framework.workflows.workflow_models import ACTIONS
+        cls = ACTIONS.get(name)
+        if cls is None:
+            return f"[system][ERROR] Unknown action '{name}'."
+        desc = getattr(cls.model_fields.get("description"), "default", "")
+        try:
+            schema = cls.model_json_schema()
+        except Exception as exc:
+            schema = {"error": str(exc)}
+        return f"[system][ACTION {name}]\nDescription: {desc}\nSchema:\n{self._cli_render(schema)}"
+
+    def _cli_show_workflow(self) -> str:
+        wf = self._cli_get_workflow()
+        if wf is None:
+            return "[system][ERROR] No active workflow registered."
+        data = {
+            "type": type(wf).__name__,
+            "WF_TAG": getattr(wf, "WF_TAG", None),
+            "WF_USER": getattr(wf, "WF_USER", None),
+            "WORKFLOW_TURN": getattr(wf, "WORKFLOW_TURN", None),
+            "session_dir": self.session_dir,
+            "main_agent": getattr(self.agent, "name", None),
+            "worker_agents": list(getattr(self, "workers", {}).keys()),
+            "wf_agent_sys_prompt_file": getattr(wf, "wf_agent_sys_prompt_file", None),
+            "wf_agent_behaviour_file": getattr(wf, "wf_agent_behaviour_file", None),
+            "wf_rules_file": getattr(wf, "wf_rules_file", None),
+            "active_action_count": len(getattr(wf, "action_names_to_use", []) or []),
+            "schema_tokens": num_tokens_from_string(getattr(wf, "schema_to_use", "")),
+            "ctx_tokens": self.FULL_CTX_TOKENS,
+        }
+        return f"[system][WORKFLOW]\n{self._cli_render(data)}"
+
+    def _cli_show_fast_workflow(self, target: str = "fast-workflow") -> str:
+        """Render FastTurnBasedWorkflow adaptive-buffer diagnostics when available."""
+        wf = self._cli_get_workflow()
+        if wf is None:
+            return "[system][ERROR] No active workflow registered."
+        if not hasattr(wf, "get_fast_workflow_observability"):
+            return f"[system][ERROR] Active workflow {type(wf).__name__} does not expose FastTurnBasedWorkflow diagnostics."
+        try:
+            data = wf.get_fast_workflow_observability()
+        except Exception as exc:
+            return f"[system][ERROR] Failed to collect fast workflow diagnostics: {exc}"
+
+        key = (target or "fast-workflow").lower().strip()
+        if key in ["hot-actions", "hot_actions"]:
+            data = {
+                "hot_actions": data.get("hot_actions"),
+                "scores": {name: data.get("scores", {}).get(name) for name in data.get("hot_actions", [])},
+                "config": data.get("config"),
+            }
+        elif key in ["action-usage", "action_usage", "usage"]:
+            data = {
+                "usage_counts": data.get("usage_counts"),
+                "success_counts": data.get("success_counts"),
+                "failure_counts": data.get("failure_counts"),
+                "recent_actions": data.get("recent_actions"),
+            }
+        elif key in ["action-buffer", "action_buffer", "buffer"]:
+            data = {
+                "hot_actions": data.get("hot_actions"),
+                "cold_action_count": data.get("cold_action_count"),
+                "cold_aliases": data.get("cold_aliases"),
+                "last_agent_prompt_size": data.get("last_agent_prompt_size"),
+                "last_fast_path": data.get("last_fast_path"),
+            }
+        elif key in ["action-validation-errors", "action_validation_errors", "validation-errors", "validation_errors"]:
+            data = {"recent_validation_errors": data.get("recent_validation_errors")}
+        return f"[system][FAST WORKFLOW {key}]\n{self._cli_render(data)}"
+
+    def _cli_switch_main_agent(self, target_name: str) -> Tuple[bool, str]:
+        """Promote a worker to main agent and demote the old main to worker.
+
+        Returns (ERROR, PROMPT). This is intended to run from the user/operator
+        command path between actor turns.
+        """
+        target_name = (target_name or "").strip()
+        if not target_name:
+            return True, "[system][ERROR] Usage: \\>set main-agent <worker_name>"
+
+        current_main = self.agent
+        current_main_name = getattr(current_main, "name", None)
+        if target_name in ["main", "primary", current_main_name]:
+            data = {
+                "status": "no-op",
+                "main_agent": current_main_name,
+                "worker_agents": list(getattr(self, "workers", {}).keys()),
+                "message": f"Agent '{target_name}' is already the main agent." if target_name == current_main_name else "Use a worker agent name to switch main agent.",
+            }
+            return False, f"[system][MAIN AGENT SWITCH]\n{self._cli_render(data)}"
+
+        if target_name not in getattr(self, "workers", {}):
+            data = {
+                "error": "unknown target agent or target is not a worker",
+                "requested": target_name,
+                "main_agent": current_main_name,
+                "worker_agents": list(getattr(self, "workers", {}).keys()),
+            }
+            return True, f"[system][ERROR][MAIN AGENT SWITCH]\n{self._cli_render(data)}"
+
+        before = {
+            "main_agent": current_main_name,
+            "worker_agents": list(self.workers.keys()),
+            "WF_MEMBERS": list(getattr(self, "WF_MEMBERS", [])),
+            "WF_ASSISTANTS": list(getattr(self, "WF_ASSISTANTS", [])),
+        }
+
+        promoted = self.workers.pop(target_name)
+        if current_main_name:
+            self.workers[current_main_name] = current_main
+        self.agent = promoted
+
+        old_assistants = set(before["WF_ASSISTANTS"]) | {current_main_name, target_name}
+        assistant_names = [self.agent.name] + list(self.workers.keys())
+        preserved_members = []
+        for member in getattr(self, "WF_MEMBERS", []):
+            if member == "system" or member in old_assistants or member in assistant_names:
+                continue
+            if member not in preserved_members:
+                preserved_members.append(member)
+
+        self.workers_names = list(self.workers.keys())
+        self.WF_ASSISTANTS = assistant_names
+        self.WF_MEMBERS = []
+        for member in ["system"] + assistant_names + preserved_members:
+            if member and member not in self.WF_MEMBERS:
+                self.WF_MEMBERS.append(member)
+        self.ROLEs["system"] = "system"
+        self.ROLEs["sys"] = "system"
+        for name in assistant_names:
+            self.ROLEs[name] = "assistant"
+
+        wf = self._cli_get_workflow()
+        if wf is not None:
+            wf.agent = self.agent
+            wf.workers = self.workers
+            wf.WF_MEMBERS = self.WF_MEMBERS
+            wf.WF_ASSISTANTS = self.WF_ASSISTANTS
+            wf.ROLEs = self.ROLEs
+            if getattr(wf, "WORKFLOW_TURN", None) == target_name:
+                wf.WORKFLOW_TURN = self.agent.name
+            if hasattr(wf, "save_session_state"):
+                wf.save_session_state()
+
+        after = {
+            "main_agent": getattr(self.agent, "name", None),
+            "worker_agents": list(self.workers.keys()),
+            "WF_MEMBERS": list(getattr(self, "WF_MEMBERS", [])),
+            "WF_ASSISTANTS": list(getattr(self, "WF_ASSISTANTS", [])),
+            "workflow_synced": wf is not None,
+        }
+        data = {"status": "switched", "before": before, "after": after}
+        return False, f"[system][MAIN AGENT SWITCH]\n{self._cli_render(data)}"
+
+    def _cli_handle_wolf_command(self, command_text: str) -> Tuple[bool, str, bool]:
+        """Return (ERROR, PROMPT, BREAK) for a WOLF CLI command."""
+        try:
+            parts = shlex.split(command_text)
+        except Exception as exc:
+            return True, f"[system][ERROR][CMD FORMAT] {exc}", False
+        if not parts:
+            return True, "[system][ERROR][CMD FORMAT]: Empty command", False
+        cmd = parts[0].lower()
+        args = parts[1:]
+        wf = self._cli_get_workflow()
+
+        if cmd in ["help", "?"]:
+            return False, self._cli_help_text(), False
+        if cmd in ["quit", "exit", "bye"]:
+            return False, "[system]: Good Bye", True
+        if cmd in ["clear", "cls", "clean"]:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            return False, "", False
+
+        if cmd == "show":
+            if not args:
+                return True, "[system][ERROR] Missing show target. Try \\>help.", False
+            target = args[0].lower()
+            if target in ["chat", "history", "context", "hist", "ctx", "chat_history", "chat-history"]:
+                self.show_ctx()
+                return False, "", False
+            if target in ["agents", "agent-list", "agent_list"]:
+                data = {name: self._cli_agent_summary(agent) for name, agent in self._cli_all_agents().items()}
+                return False, f"[system][AGENTS]\n{self._cli_render(data)}", False
+            if target == "agent":
+                if len(args) < 2:
+                    return True, "[system][ERROR] Usage: \\>show agent <name|main>", False
+                name = self.agent.name if args[1] in ["main", "primary"] else args[1]
+                agent = self._cli_all_agents().get(name)
+                if agent is None:
+                    return True, f"[system][ERROR] Unknown agent '{name}'. Known: {list(self._cli_all_agents())}", False
+                return False, f"[system][AGENT {name}]\n{self._cli_render(self._cli_agent_summary(agent))}", False
+            if target in ["workflow", "wf"]:
+                return False, self._cli_show_workflow(), False
+            if target in [
+                "fast-workflow", "fast_workflow", "hot-actions", "hot_actions",
+                "action-usage", "action_usage", "action-buffer", "action_buffer",
+                "action-validation-errors", "action_validation_errors",
+                "validation-errors", "validation_errors"
+            ]:
+                return False, self._cli_show_fast_workflow(target), False
+            if target == "prompt":
+                if len(args) < 2:
+                    return True, "[system][ERROR] Usage: \\>show prompt system|behavior|rules|infra", False
+                return False, self._cli_show_prompt(args[1]), False
+            if target in ["system", "sys", "behavior", "behaviour", "heavior", "rules", "infra", "infrastructure"]:
+                return False, self._cli_show_prompt(target), False
+            if target in ["actions", "action-space", "action_space"]:
+                return False, self._cli_show_actions(args[1:]), False
+            if target == "action":
+                if len(args) < 2:
+                    return True, "[system][ERROR] Usage: \\>show action <action_name>", False
+                return False, self._cli_show_action(args[1]), False
+            return True, f"[system][ERROR] Unknown show target '{target}'. Try \\>help.", False
+
+        if cmd == "set":
+            if not args:
+                return True, "[system][ERROR] Missing set target. Try \\>help.", False
+            target = args[0].lower()
+            if target in ["main-agent", "main_agent", "main"]:
+                if len(args) < 2:
+                    return True, "[system][ERROR] Usage: \\>set main-agent <worker_name>", False
+                err, msg = self._cli_switch_main_agent(args[1])
+                return err, msg, False
+            if target == "agent":
+                if len(args) < 3:
+                    return True, "[system][ERROR] Usage: \\>set agent <name|main> key=value ...", False
+                name = self.agent.name if args[1] in ["main", "primary"] else args[1]
+                agent = self._cli_all_agents().get(name)
+                if agent is None:
+                    return True, f"[system][ERROR] Unknown agent '{name}'. Known: {list(self._cli_all_agents())}", False
+                try:
+                    updates = self._cli_parse_kv_pairs(args[2:])
+                    changed = agent.reconfigure(**updates) if hasattr(agent, "reconfigure") else updates
+                    if not hasattr(agent, "reconfigure"):
+                        for k, v in updates.items():
+                            setattr(agent, k, v)
+                    return False, f"[system][AGENT UPDATED {name}]\n{self._cli_render(self._cli_redact(changed))}", False
+                except Exception as exc:
+                    return True, f"[system][ERROR] Failed to update agent '{name}': {exc}", False
+            if target == "prompt":
+                if wf is None:
+                    return True, "[system][ERROR] No active workflow registered.", False
+                if len(args) < 3:
+                    return True, "[system][ERROR] Usage: \\>set prompt system|behavior|rules|infra file=<path>", False
+                which = args[1].lower()
+                try:
+                    updates = self._cli_parse_kv_pairs(args[2:])
+                    file_path = updates.get("file") or updates.get("path")
+                    if not file_path:
+                        return True, "[system][ERROR] Prompt set requires file=<path>.", False
+                    if which in ["system", "sys"]:
+                        wf.update_workflow_agent_sys_prompt(str(file_path), log_console=False)
+                    elif which in ["behavior", "behaviour", "heavior"]:
+                        wf.update_agent_behaviour(str(file_path), log_console=False)
+                    elif which in ["rules", "rule"]:
+                        wf.update_workflow_rules(str(file_path), log_console=False)
+                    elif which in ["infra", "infrastructure"]:
+                        self.update_infra_description(str(file_path))
+                    else:
+                        return True, f"[system][ERROR] Unknown prompt target '{which}'.", False
+                    if hasattr(wf, "save_session_state"):
+                        wf.save_session_state()
+                    return False, f"[system][PROMPT UPDATED] {which} file={file_path}", False
+                except Exception as exc:
+                    return True, f"[system][ERROR] Failed to update prompt: {exc}", False
+            if target in ["fast-workflow", "fast_workflow", "fast"]:
+                if wf is None:
+                    return True, "[system][ERROR] No active workflow registered.", False
+                if not hasattr(wf, "configure_fast_workflow"):
+                    return True, f"[system][ERROR] Active workflow {type(wf).__name__} does not support fast-workflow configuration.", False
+                if len(args) < 2:
+                    return True, r"[system][ERROR] Usage: \>set fast-workflow key=value ...", False
+                try:
+                    updates = self._cli_parse_kv_pairs(args[1:])
+                    changed = wf.configure_fast_workflow(**updates)
+                    if hasattr(wf, "save_session_state"):
+                        wf.save_session_state()
+                    return False, f"[system][FAST WORKFLOW UPDATED]\n{self._cli_render(changed)}", False
+                except Exception as exc:
+                    return True, f"[system][ERROR] Failed to update fast workflow config: {exc}", False
+            return True, f"[system][ERROR] Unknown set target '{target}'. Try \\>help.", False
+
+        if cmd == "reload":
+            if wf is None:
+                return True, "[system][ERROR] No active workflow registered.", False
+            target = args[0].lower() if args else "prompts"
+            try:
+                reloaded = []
+                if target in ["prompts", "all"]:
+                    wf.update_workflow_agent_sys_prompt(log_console=False); reloaded.append("system")
+                    wf.update_agent_behaviour(log_console=False); reloaded.append("behavior")
+                    wf.update_workflow_rules(log_console=False); reloaded.append("rules")
+                    self.update_infra_description(); reloaded.append("infra")
+                elif target == "prompt" and len(args) > 1:
+                    sub = args[1].lower()
+                    if sub in ["system", "sys"]:
+                        wf.update_workflow_agent_sys_prompt(log_console=False); reloaded.append("system")
+                    elif sub in ["behavior", "behaviour", "heavior"]:
+                        wf.update_agent_behaviour(log_console=False); reloaded.append("behavior")
+                    elif sub in ["rules", "rule"]:
+                        wf.update_workflow_rules(log_console=False); reloaded.append("rules")
+                    elif sub in ["infra", "infrastructure"]:
+                        self.update_infra_description(); reloaded.append("infra")
+                    else:
+                        return True, f"[system][ERROR] Unknown reload prompt target '{sub}'.", False
+                else:
+                    return True, "[system][ERROR] Usage: \\>reload prompts OR \\>reload prompt system|behavior|rules|infra", False
+                if hasattr(wf, "save_session_state"):
+                    wf.save_session_state()
+                return False, f"[system][RELOADED] {reloaded}", False
+            except Exception as exc:
+                return True, f"[system][ERROR] Reload failed: {exc}", False
+
+        if cmd in ["switch", "promote"]:
+            if not args:
+                return True, "[system][ERROR] Usage: \\>switch main <worker_name> OR \\>switch agent <worker_name>", False
+            target = args[0].lower()
+            if target in ["main", "main-agent", "main_agent", "agent"]:
+                if len(args) < 2:
+                    return True, "[system][ERROR] Usage: \\>switch main <worker_name>", False
+                err, msg = self._cli_switch_main_agent(args[1])
+                return err, msg, False
+            err, msg = self._cli_switch_main_agent(args[0])
+            return err, msg, False
+
+        if cmd in ["actions", "action-space", "action_space"]:
+            if wf is None:
+                return True, "[system][ERROR] No active workflow registered.", False
+            if not args or args[0].lower() in ["show", "list"]:
+                return False, self._cli_show_actions(args[1:] if args else []), False
+            if args[0].lower() != "use" or len(args) < 2:
+                return True, "[system][ERROR] Usage: \\>actions use all|safe|write|dev|action1,action2", False
+            policy = " ".join(args[1:]).strip()
+            presets = {
+                "safe": ["send_message", "read_file", "check_context_utilization", "list_memory_categories"],
+                "write": ["send_message", "read_file", "check_context_utilization", "list_memory_categories", "write_file"],
+                "dev": ["send_message", "read_file", "check_context_utilization", "list_memory_categories", "write_file", "run_syscall"],
+            }
+            try:
+                if policy.lower() == "all":
+                    wf.set_wf_action_space(None)
+                else:
+                    names = presets.get(policy.lower()) or [x.strip() for x in policy.replace(" ", ",").split(",") if x.strip()]
+                    wf.set_wf_action_space(names)
+                if hasattr(wf, "save_session_state"):
+                    wf.save_session_state()
+                return False, self._cli_show_actions([]), False
+            except Exception as exc:
+                return True, f"[system][ERROR] Failed to set action space: {exc}", False
+
+        return True, f"[system][ERROR][CMD FORMAT]: Unknown WOLF command: {cmd}. Try \\>help.", False
+
     def process_user_input(self, user_prompt: str):
-        """Process user input with support for \>, !>, and @ commands."""
+        r"""Process user input with support for \>, !>, / commands, and @ routing."""
         BREAK, IS_CMD, ERROR, INTERLOCUTOR, PROMPT = False, False, False, "system", None
         prompt = user_prompt.strip().lower()
         original_prompt = user_prompt.strip()
-        
+
         # Handle exit commands
         if prompt.startswith(("exit", "quit", "/bye", "/exit", "/quit")):
             IS_CMD, BREAK = True, True
-            PROMPT = f"[system]: Good Bye"
-        
+            PROMPT = "[system]: Good Bye"
+
         # Handle clear commands
         elif prompt.startswith(("clear", "cls")):
             IS_CMD = True
             os.system('cls' if os.name == 'nt' else 'clear')
-        
+
         # Handle WOLF function commands (\>)
         elif original_prompt.startswith("\\>"):
             IS_CMD = True
-            cmd = prompt[2:].strip().split()
-            if not cmd:
-                PROMPT = f"[system][ERROR][CMD FORMAT]: Empty \\> command"
-                ERROR = True
-            elif cmd[0] in ["quit", "exit", "bye"]:
-                PROMPT = f"[system]: Good Bye"
-                BREAK = True
-            elif cmd[0] in ["clear", "cls", "clean"]:
-                os.system('cls' if os.name == 'nt' else 'clear')
-            elif cmd[0] == "show":
-                if len(cmd) > 1:
-                    if cmd[1] in ["chat", "history", "context", "hist", "ctx", "chat_history", "chat-history"]:
-                        self.show_ctx()
-                        if len(cmd) > 2:
-                            PROMPT = f"[system][WARN][CMD FORMAT]: BAD \\>show {cmd[1]} command does not take extra arguments: {cmd[2:]}"
-                    elif cmd[1] in ["updated-chat", "updated-history", "updated-context", "updated-hist", "updated-ctx", "updated-chat_history", "updated-chat-history"]:
-                        if len(cmd) >= 2:
-                            try:
-                                cmd2, console_head = cmd[1].strip().split("=")
-                                cmd2 = cmd2.strip()
-                                if cmd2 in ["head", "idx", "console", "console_head", "console-head", "console_idx"]:
-                                    try:
-                                        head = int(console_head)
-                                        self.show_updated_history(head)
-                                    except Exception as cmd_int_err:
-                                        PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} {cmd[1]} command: {cmd[2]}=??:\n {console_head} is not an integer: {cmd_int_err}"
-                                        ERROR = True
-                            except Exception as cmd2_err:
-                                PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} {cmd[1]} command format: {cmd2_err}"
-                                ERROR = True
-                    else:
-                        PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} command format: Extra arguments {cmd[1:]}"
-                        ERROR = True
-                else:
-                    PROMPT = f"[system][ERROR][CMD FORMAT]: BAD \\>{cmd[0]} command format: Missing extra arguments"
-                    ERROR = True
-            else:
-                PROMPT = f"[system][ERROR][CMD FORMAT]: Unknown WOLF command: {cmd[0]}"
-                ERROR = True
-        
+            ERROR, PROMPT, BREAK = self._cli_handle_wolf_command(original_prompt[2:].strip())
+
         # Handle terminal commands (!>)
         elif original_prompt.startswith("!>"):
             IS_CMD = True
             terminal_cmd = original_prompt[2:].strip()
             if not terminal_cmd:
-                PROMPT = f"[system][ERROR][CMD FORMAT]: Empty !> terminal command"
+                PROMPT = "[system][ERROR][CMD FORMAT]: Empty !> terminal command"
                 ERROR = True
             else:
                 try:
@@ -432,49 +913,17 @@ class BaseInfrastructure:
                     output = result.stdout if result.stdout else result.stderr
                     PROMPT = f"[system][TERMINAL OUTPUT]:\n{output}"
                 except subprocess.TimeoutExpired:
-                    PROMPT = f"[system][ERROR]: Terminal command timed out after 30 seconds"
+                    PROMPT = "[system][ERROR]: Terminal command timed out after 30 seconds"
                     ERROR = True
                 except Exception as e:
                     PROMPT = f"[system][ERROR]: Failed to execute terminal command: {e}"
                     ERROR = True
-        
+
         # Handle old-style / commands for backward compatibility
         elif prompt.startswith("/"):
             IS_CMD = True
-            cmd = prompt[1:].strip().split()
-            if cmd[0] in ["quit", "exit", "bye"]:
-                PROMPT = f"[system]: Good Bye"
-                BREAK = True
-            elif cmd[0] in ["clear", "cls", "clean"]:
-                os.system('cls' if os.name == 'nt' else 'clear')
-            elif cmd[0] == "show":
-                if len(cmd) > 1:
-                    if cmd[1] in ["chat", "history", "context", "hist", "ctx", "chat_history", "chat-history"]:
-                        self.show_ctx()
-                        if len(cmd) > 2:
-                            PROMPT = f"[system][WARN][CMD FORMAT]: BAD />show {cmd[1]} command does not take extra arguments: {cmd[2:]}"
-                    elif cmd[1] in ["updated-chat", "updated-history", "updated-context", "updated-hist", "updated-ctx", "updated-chat_history", "updated-chat-history"]:
-                        if len(cmd) >= 2:
-                            try:
-                                cmd2, console_head = cmd[1].strip().split("=")
-                                cmd2 = cmd2.strip()
-                                if cmd2 in ["head", "idx", "console", "console_head", "console-head", "console_idx"]:
-                                    try:
-                                        head = int(console_head)
-                                        self.show_updated_history(head)
-                                    except Exception as cmd_int_err:
-                                        PROMPT = f"[system][ERROR][CMD FORMAT]: BAD />{cmd[0]} {cmd[1]} command: {cmd[2]}=??:\n {console_head} is not an integer: {cmd_int_err}"
-                                        ERROR = True
-                            except Exception as cmd2_err:
-                                PROMPT = f"[system][ERROR][CMD FORMAT]: BAD />{cmd[0]} {cmd[1]} command format: {cmd2_err}"
-                                ERROR = True
-                    else:
-                        PROMPT = f"[system][ERROR][CMD FORMAT]: BAD />{cmd[0]} command format: Extra arguments {cmd[1:]}"
-                        ERROR = True
-                else:
-                    PROMPT = f"[system][ERROR][CMD FORMAT]: BAD />{cmd[0]} command format: Missing extra arguments"
-                    ERROR = True
-        
+            ERROR, PROMPT, BREAK = self._cli_handle_wolf_command(original_prompt[1:].strip())
+
         # Handle @ interlocutor commands
         elif prompt.startswith("@"):
             cmd = user_prompt.strip().split()
@@ -483,11 +932,11 @@ class BaseInfrastructure:
                 PROMPT = f"[system][INPUT ERROR]: BAD @interlocutor command:\n Interlocutor {INTERLOCUTOR} not in WF-MEMBERS: {self.WF_MEMBERS}"
                 ERROR = True
             PROMPT = user_prompt.strip()[len(cmd[0]):]
-        
+
         # Regular user input
         else:
             PROMPT = user_prompt.strip()
-        
+
         return BREAK, IS_CMD, ERROR, INTERLOCUTOR, PROMPT
 
 

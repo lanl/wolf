@@ -106,7 +106,12 @@ class TurnBasedWorkflow(BaseWorkflow):
         if isinstance(response, dict) and "action" in response:
             bad_format, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(response, actor)
             if bad_format:
-                self.WORKFLOW_TURN = name
+                # Validation failures should fail closed to the user rather than
+                # handing the turn back to the same actor. Returning to ``name``
+                # here can create a response-validation loop: the same actor sees
+                # the same context plus the validation error and may emit the same
+                # invalid action repeatedly.
+                self.WORKFLOW_TURN = "user"
                 self.update_history(
                     actor="system",
                     content=err_msg,
@@ -140,7 +145,9 @@ class TurnBasedWorkflow(BaseWorkflow):
                 action={"action": "system_error"},
                 log_console=True,
             )
-            self.WORKFLOW_TURN = name
+            # Invalid non-action payloads should also fail closed to the user,
+            # not immediately re-enter the same actor turn.
+            self.WORKFLOW_TURN = "user"
 
     # -----------------------------------------------------------------
     # Core workflow loop – now can optionally restrict actions
@@ -149,7 +156,7 @@ class TurnBasedWorkflow(BaseWorkflow):
 
     def run(self, user_name: str = "user",
             action_names: Optional[List[str]] = None,
-            wolf_commands = ['show', 'clear', 'quit', 'exit', 'bye', 'cls'],
+            wolf_commands = ['help', 'show', 'set', 'reload', 'actions', 'clear', 'quit', 'exit', 'bye', 'cls'],
             wf_first_turn = "user",
             log_console: bool = True):
         """Execute the workflow. If *action_names* is provided, only those 
@@ -158,6 +165,7 @@ class TurnBasedWorkflow(BaseWorkflow):
         """
         # Determine the actions union and schema for this run
         self.set_wf_action_space(action_names)
+        self.infra.cli_workflow = self
         self.WF_USER = user_name
         self.infra.ROLEs[user_name] = "user"
         self.WORKFLOW_TURN = wf_first_turn
@@ -209,7 +217,7 @@ class TurnBasedWorkflow(BaseWorkflow):
             # ---------------------------------------------------------
             # MAIN AGENT TURN
             # ---------------------------------------------------------
-            if turn in ["system", "assistant", "agent", self.agent.name.strip().lower()]:
+            if turn in ["system", "assistant", "agent", self.agent.name.strip().lower(), None]:
                 self._handle_actor_turn(self.agent, self.agent.name)
                 continue
 

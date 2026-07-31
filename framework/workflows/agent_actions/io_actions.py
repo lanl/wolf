@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic import ConfigDict
 
 from framework.utils.io_tools import read_file, write_file, run_syscall
@@ -39,10 +39,26 @@ class ReadFileAction(AgentAction):
         return
 
 class WriteFileActionArgs(BaseModel):
+    """Payload for write_file.
+
+    The model-facing schema should advertise ``file_path``.  Older prompts and
+    saved sessions may still emit the legacy ``path`` key, so a pre-validator
+    maps ``path`` to ``file_path`` for compatibility without using a Pydantic
+    alias that would make generated examples show the wrong key.
+    """
+
     model_config = ConfigDict(populate_by_name=True)
-    file_path: str = Field(..., alias="path", description="/path/of/file")
+    file_path: str = Field(..., description="/path/of/file")
     content: str = Field(description="Text written into the file")
     append: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_path_key(cls, data):
+        if isinstance(data, dict) and "file_path" not in data and "path" in data:
+            data = dict(data)
+            data["file_path"] = data.pop("path")
+        return data
 
 class WriteFileAction(AgentAction):
     action: Literal["write_file"] = "write_file"

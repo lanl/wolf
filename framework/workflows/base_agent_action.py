@@ -18,12 +18,13 @@ class AgentAction(BaseModel):
     """
 
     action: str = Field(..., description="Discriminator – the LLM must set this: Type of action the agent wants to take")
-    description: str = Field(default=None, description="Description of the action")
-    payload: dict = Field(description="Parameters/Arguments of the action")
-    payload_schema: str = Field(default=None, description="Schema for the action payload")
+    description: Optional[str] = Field(default=None, description="Description of the action")
+    payload: Any = Field(description="Parameters/Arguments of the action")
+    payload_schema: Optional[str] = Field(default=None, description="Schema for the action payload")
     #yield_motion_to: str | None = None
-    yield_motion_to: Optional[str]  = Field(default="entity(user, agent.worker...) who's turn is next",
-                                            description="entity(user, agent.worker...) who's turn is next")
+    yield_motion_to: Optional[str]  = Field(default="user", description="entity(user, agent, worker...) who's turn it is to speak or take the next action")
+    purpose: str = Field(description="reasons for taking the action")
+    expectations: str = Field(description="expected outcome/results")
     def execute(self, infra: Any = None) -> Any:  # pragma: no cover
         """Default implementation does nothing.
         Concrete actions should return whatever is appropriate for the

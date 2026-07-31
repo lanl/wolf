@@ -4,9 +4,40 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+*.pyc
 # C extensions
 *.so
+
+# -------------------------
+# Site-specifics
+# -------------------------
+*_lanl*
+*_sandia*
+*_snl*
+*_llnl*
+
+# -------------------------
+# WOLF Backups
+# -------------------------
+*.wfbk
+*.bk
+*.Baks*
+*.bak
+*.backup
+*.hold*
+*.wfbk.*
+*.wfbk_*
+*.wfbk2*
+*.wfbk3*
+*.wfbk4*
+*.working*
+*_dev.py
+*.dev
+*_v1*.py
+*_v2*.py
+*_v3*.py
+*_v4*.py
+
 
 # -------------------------
 # Packaging / build artifacts
@@ -101,11 +132,6 @@ solvers/
 standar_wf/
 .chainlit/   # prefer directory form over *.chainlit
 
-#-------------------------
-# Institutional files
-#-------------------------
-*lanl*
-*llnl*
-*sandia*
-*DOE*
-*DOW*
+# If `service/` contains source you want tracked, do NOT ignore it.
+# service/
+

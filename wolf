@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-PYTHONPATH=./ python ./runners/interactive.py
+PYTHONPATH=./ uv run python -m framework.cli.wolf_app "$@"
