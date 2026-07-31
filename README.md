@@ -1,8 +1,8 @@
-# Cerberus / WOLF
+# WOLF
 
-**Cerberus** is the development cousin of the production **WOLF** application. Historically, WOLF has meant the **Workflow Orchestration Language Framework**. As the project evolves, WOLF also names the **Workflow Orchestration Learning Framework**: a philosophy and runtime direction for agents that learn from workflows, tools, users, environments, and their own operational traces.
+Historically, WOLF has meant the **Workflow Orchestration Language Framework**. As the project evolves, WOLF also names the **Workflow Orchestration Learning Framework**: a philosophy and runtime direction for agents that learn from workflows, tools, users, environments, and their own operational traces.
 
-Cerberus / WOLF is an agentic AI framework for building interactive, turn-based workflows where users, LLM-backed agents, worker agents, tools, knowledgebases, and sandboxed execution environments collaborate through structured actions.
+WOLF is an agentic AI framework for building interactive, turn-based workflows where users, LLM-backed agents, worker agents, tools, knowledgebases, and sandboxed execution environments collaborate through structured actions.
 
 Much of the repository still uses **WOLF** terminology in code, prompts, configuration, commands, and documentation. In practice, this repository should be understood as the active development branch of the WOLF-style runtime.
 
@@ -10,7 +10,7 @@ Much of the repository still uses **WOLF** terminology in code, prompts, configu
 
 ## Table of Contents
 
-1. [What is Cerberus / WOLF?](#what-is-cerberus--wolf)
+1. [What is WOLF?](#what-is-wolf)
 2. [WOLF Philosophy](#wolf-philosophy)
 3. [Core Mental Model](#core-mental-model)
 4. [Repository Highlights](#repository-highlights)
@@ -33,9 +33,9 @@ Much of the repository still uses **WOLF** terminology in code, prompts, configu
 
 ---
 
-## What is Cerberus / WOLF?
+## What is WOLF?
 
-Cerberus / WOLF provides a composable runtime for agentic workflows. Instead of allowing agents to respond with arbitrary free text, the active workflow expects agents to emit validated JSON actions. Those actions are discovered dynamically from the framework, validated with Pydantic models, executed through the local infrastructure layer, and routed back to the user, system, another agent, or an external sandbox.
+WOLF provides a composable runtime for agentic workflows. Instead of allowing agents to respond with arbitrary free text, the active workflow expects agents to emit validated JSON actions. Those actions are discovered dynamically from the framework, validated with Pydantic models, executed through the local infrastructure layer, and routed back to the user, system, another agent, or an external sandbox.
 
 The framework supports:
 
@@ -148,13 +148,11 @@ git clone ssh://git@re-git.lanl.gov:10022/mada/wolf.git
 cd wolf
 ```
 
-> Note: Although this development repository is referred to as Cerberus in some contexts, many commands, paths, prompts, and code objects still use the WOLF name.
 
 ---
 
 ### 2. Install the environment
-
-Cerberus / WOLF can be installed using several Python environment workflows. The older Conda-only setup is still supported, but the repository now includes `pyproject.toml`, so `uv`, `pip`, and other PEP 517/518-compatible tools can be used as well.
+WOLF can be installed using several Python environment workflows. The older Conda-only setup is still supported, but the repository now includes `pyproject.toml`, so `uv`, `pip`, and other PEP 517/518-compatible tools can be used as well.
 
 Python 3.13 or newer is recommended unless your branch or deployment environment specifies otherwise.
 
