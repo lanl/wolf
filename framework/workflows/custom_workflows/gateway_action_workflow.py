@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
-from framework.utils.io_tools import console
+from framework.utils.io_tools import WOLF_PATH, console
 from framework.utils.json_parsing import robust_jsonfy
 from framework.utils.multimodal_input import combine_prompt_with_user_content
 from framework.workflows.base_workflow import BaseWorkflow
@@ -40,9 +40,9 @@ class GatewayActionWorkflow(BaseWorkflow):
         session: BaseSession | str | None = None,
         infra: BaseInfrastructure | None = None,
         actions_union: Any = FullActions,
-        wf_rules_file: str | None = "config/preferences/rules/workflow/basewf.md",
-        wf_agent_behaviour_file: str | None = "config/preferences/behaviour/workflow/basewf.md",
-        wf_agent_sys_prompt_file: str | None = "config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md",
+        wf_rules_file: str | None = str(WOLF_PATH / "config/preferences/rules/workflow/basewf.md"),
+        wf_agent_behaviour_file: str | None = str(WOLF_PATH / "config/preferences/behaviour/workflow/basewf.md"),
+        wf_agent_sys_prompt_file: str | None = str(WOLF_PATH / "config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md"),
         wf_user: str = "user",
         wf_turn: Any = None,
     ):

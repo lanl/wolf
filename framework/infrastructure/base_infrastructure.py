@@ -43,7 +43,7 @@ class BaseInfrastructure:
         traces_vector_store: Any = None,
         summaries_vector_store: Any = None,
         db_client: Any = None,
-        infra_description_file = WOLF_REPO / "framework/infrastructure/config/base_infra_description.md",
+        infra_description_file = str(WOLF_PATH / "framework/infrastructure/config/base_infra_description.md"),
         input_processor: Any = None,
         input_processor_config: Any = None
     ):

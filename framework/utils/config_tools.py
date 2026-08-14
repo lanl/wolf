@@ -11,7 +11,7 @@ from chromadb.config import Settings
 
 # UTILs
 from framework.utils.io_tools import console, image_to_ascii
-from framework.utils.io_tools import WOLF_REPO, USER_ENV_VARs
+from framework.utils.io_tools import WOLF_PATH, USER_ENV_VARs
 from framework.utils.machines_ssl_config import conform_machine_ssl_certs
 from framework.utils.multimodal_input import normalize_capabilities
 
