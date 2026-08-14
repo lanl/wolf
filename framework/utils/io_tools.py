@@ -21,7 +21,9 @@ console = Console()
 
 CONTAINER_HANDLES = ["```json", "```python", "```js", "```html", "```java",]
 
-WOLF_PATH = Path(framework.__path__[0]).parent.resolve()
+WOLF_PATH = root \
+    if Path.cwd().resolve() != (root := Path(framework.__path__[0]).parent.resolve()) \
+    else Path()
 
 # ------------------------------------------------------------------
 # Helper I/O functions – replace these with your real implementations
