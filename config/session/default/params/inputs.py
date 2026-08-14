@@ -1,8 +1,9 @@
+from framework.utils.io_utils import WOLF_PATH
 from pathlib import Path
 """
 session_params = {"tiktoken_cache_dir": (Path.cwd() / ".tiktoken_cache").resolve(),
                   "curl_ca_bundle_file": None,
-                  "banner_image_file": f"{(Path.cwd() / 'config/preferences/banner').resolve()}/WOLF.png".strip(),
+                  "banner_image_file": f"{(WOLF_PATH / 'config/preferences/banner').resolve()}/WOLF.png".strip(),
                   "banner_image_color": "purple",
                   "banner_image_width": 100,
                   "universes":[],
@@ -22,8 +23,9 @@ session_params = {"tiktoken_cache_dir": (Path.cwd() / ".tiktoken_cache").resolve
                   "verbose":0
                   }
 """
+
 session_params = {"tiktoken_cache_dir": (Path.cwd() / ".tiktoken_cache").resolve(),
-                  "banner_image_file": f"{(Path.cwd() / 'config/preferences/banner').resolve()}/WOLF.png".strip(),
+                  "banner_image_file": f"{(WOLF_PATH / 'config/preferences/banner').resolve()}/WOLF.png".strip(),
                   "banner_image_color": "purple",
                   "banner_image_width": 100,
                   "universes":[],

@@ -11,7 +11,7 @@ from chromadb.config import Settings
 
 # UTILs
 from framework.utils.io_tools import console, image_to_ascii
-from framework.utils.io_tools import USER_ENV_VARs
+from framework.utils.io_tools import WOLF_REPO, USER_ENV_VARs
 from framework.utils.machines_ssl_config import conform_machine_ssl_certs
 from framework.utils.multimodal_input import normalize_capabilities
 
@@ -84,7 +84,8 @@ def load_session_certs(session_params):
 
 def show_banner(session_params):
     console.print("|=================================================================================|")
-    image_to_ascii(session_params.get('banner_image_file','config/preferences/banner/WOLF.png'),
+    image_to_ascii(session_params.get('banner_image_file',
+                                      WOLF_PATH / 'config/preferences/banner/WOLF.png'),
                    width=session_params.get('banner_image_width', 100),
                    flag=session_params.get('banner_image_color', 'purple')
                    )

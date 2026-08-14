@@ -14,9 +14,14 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.console import Console
+
+import framework
+
 console = Console()
 
 CONTAINER_HANDLES = ["```json", "```python", "```js", "```html", "```java",]
+
+WOLF_PATH = Path(framework.__path__[0]).parent.resolve()
 
 # ------------------------------------------------------------------
 # Helper I/O functions – replace these with your real implementations
