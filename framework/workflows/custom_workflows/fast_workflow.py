@@ -18,7 +18,7 @@ from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
 from framework.workflows.enhanced_input import interactive_input_line_wrapped
 from framework.workflows.base_workflow import BaseWorkflow
-from framework.workflows.action_registry import get_default_action_registry
+from framework.workflows.action_registry import get_default_action_registry, payload_example_for_action
 from framework.utils.multimodal_input import combine_prompt_with_user_content
 
 
@@ -411,20 +411,21 @@ class FastTurnBasedWorkflow(BaseWorkflow):
 
     @classmethod
     def _payload_example(cls, action_cls: type) -> dict:
-        schema = action_cls.model_json_schema()
-        payload_schema = schema.get("properties", {}).get("payload", {})
-        example = cls._example_for_schema(payload_schema, schema)
-        return example if isinstance(example, dict) else {}
+        # Delegate to the canonical registry renderer. Workflows should not own
+        # action-specific schema/example construction because actions are
+        # auto-discovered and may define mutually-exclusive payload alternatives.
+        return payload_example_for_action(action_cls)
 
     @classmethod
     def _payload_json_schema(cls, action_cls: type) -> str:
-        payload_schema_text = cls._field_default(action_cls, "payload_schema", "").strip()
-        if payload_schema_text:
-            return payload_schema_text
+        # Targeted second-step prompts should use the same canonical example as
+        # HOT ACTIONS. Legacy payload_schema strings are often hand-written and
+        # can drift from the Pydantic payload model.
         try:
             return json.dumps(cls._payload_example(action_cls), indent=2, sort_keys=True)
         except Exception:
-            return "{}"
+            payload_schema_text = cls._field_default(action_cls, "payload_schema", "").strip()
+            return payload_schema_text or "{}"
 
     @classmethod
     def _hot_action_block(cls, action_name: str, action_cls: type) -> str:
@@ -731,6 +732,48 @@ class FastTurnBasedWorkflow(BaseWorkflow):
         self.update_history(actor="system", content=err_msg, action={"action": "system_info"}, log_console=True)
 
     # -----------------------------------------------------------------
+    # User routing helpers
+    # -----------------------------------------------------------------
+    def _default_user_interlocutor(self) -> str:
+        """Return the implicit target for unaddressed user messages.
+
+        Product semantics:
+        - At session start, unaddressed input goes to the main agent.
+        - After a valid explicit @worker route, later unaddressed input goes to
+          that last-addressed agent.
+        - If the remembered target is stale/unavailable, fall back to main.
+        """
+        main_name = getattr(self.agent, "name", "assistant") or "assistant"
+        last = getattr(self, "LAST_AGENT_SPOKEN_TO", None)
+        active = {main_name, "assistant", "agent"} | set(getattr(self, "workers", {}).keys())
+        if last in active:
+            if last in {"assistant", "agent"}:
+                return main_name
+            return last
+        return main_name
+
+    def _resolve_user_interlocutor(self, interlocutor: str):
+        """Resolve parsed user interlocutor into a live agent route.
+
+        ``BaseInfrastructure.process_user_input`` historically returns
+        ``INTERLOCUTOR='system'`` for regular unaddressed user input.  Treat
+        that as the implicit/default route instead of a stale route error.
+        Keep explicit invalid @agent names as errors.
+        """
+        route = (interlocutor or "").strip()
+        if route in {"", "system", "sys"}:
+            route = self._default_user_interlocutor()
+
+        main_name = getattr(self.agent, "name", "assistant") or "assistant"
+        if route in [main_name, "assistant", "agent"]:
+            self.LAST_AGENT_SPOKEN_TO = main_name
+            return self.agent, main_name, None
+        if route in getattr(self, "workers", {}):
+            self.LAST_AGENT_SPOKEN_TO = route
+            return self.workers[route], route, None
+        return None, route, f"[system][INPUT ERROR]: Interlocutor {route} is not an active agent route. Active workers: {list(getattr(self, 'workers', {}).keys())}; main: {main_name}"
+
+    # -----------------------------------------------------------------
     # Core workflow loop
     # -----------------------------------------------------------------
     def run(self, user_name: str = "user",
@@ -743,7 +786,10 @@ class FastTurnBasedWorkflow(BaseWorkflow):
         self.infra.cli_workflow = self
         self.WF_USER = user_name
         self.infra.ROLEs[user_name] = "user"
-        self.WORKFLOW_TURN = wf_first_turn
+        if not getattr(self, "WORKFLOW_TURN", None):
+            self.WORKFLOW_TURN = wf_first_turn or "user"
+        if not getattr(self, "LAST_AGENT_SPOKEN_TO", None):
+            self.LAST_AGENT_SPOKEN_TO = self.agent.name
 
         while True:
             turn = self.WORKFLOW_TURN.strip().lower()
@@ -770,7 +816,12 @@ class FastTurnBasedWorkflow(BaseWorkflow):
                         console.print(WF_PROMPT)
                         self.console_log(WF_PROMPT)
                     else:
-                        target_actor = self.workers.get(INTERLOCUTOR, self.agent)
+                        target_actor, resolved_interlocutor, route_error = self._resolve_user_interlocutor(INTERLOCUTOR)
+                        if route_error:
+                            console.print(route_error)
+                            self.console_log(route_error)
+                            self.WORKFLOW_TURN = self.WF_USER
+                            continue
                         input_bundle = self.infra.prepare_user_input_for_agent(WF_PROMPT, agent=target_actor)
                         self.update_history(
                             actor=self.WF_USER,
@@ -778,7 +829,7 @@ class FastTurnBasedWorkflow(BaseWorkflow):
                             action={"action": "user_input"},
                             log_console=log_console,
                         )
-                        self.WORKFLOW_TURN = INTERLOCUTOR
+                        self.WORKFLOW_TURN = resolved_interlocutor
                 continue
 
             if turn in ["system", "assistant", "agent", self.agent.name.strip().lower()]:

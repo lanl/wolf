@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en" data-theme="zen">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WOLF Gateway</title>
+  <link rel="stylesheet" href="/static/styles.css?v=collab-v1-join-inline-20260821" />
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+  <div id="app" class="gateway-shell">
+    <aside class="sidebar glass">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">◈</div>
+        <div><strong>WOLF Gateway</strong><span>Cerberus orchestration console</span></div>
+      </div>
+      <nav class="nav" aria-label="Gateway sections">
+        <button class="nav-item is-active" data-page="connect">Connect</button>
+        <button class="nav-item" data-page="chat" disabled>Chat</button>
+        <button class="nav-item" data-page="agent" disabled>Agent</button>
+        <button class="nav-item" data-page="policy" disabled>Policy</button>
+        <button class="nav-item" data-page="orchestration" disabled>Kanban</button>
+        <button class="nav-item" data-page="infrastructure" disabled>Infrastructure</button>
+        <button class="nav-item" data-page="collaboration" disabled>Collaboration</button>
+        <button class="nav-item" data-page="events" disabled>Events</button>
+      </nav>
+      <div class="sidebar-card">
+        <span class="eyebrow">Status</span>
+        <div class="status-line"><span id="statusDot" class="dot offline"></span><strong id="statusText">Disconnected</strong></div>
+        <small id="sessionSummary">Authenticate to begin.</small>
+      </div>
+      <div class="sidebar-footer">
+        <label>Theme<select id="themeSelect"><option value="zen">Zen / Kiyoshi</option><option value="wolf">Wolf Blue</option><option value="ivory">Ivory Nebula</option></select></label>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar glass">
+        <div><p class="eyebrow">Gateway web UI</p><h1 id="pageTitle">Connect</h1></div>
+        <div class="top-actions">
+          <button id="refreshButton" class="ghost" type="button">Refresh</button>
+          <button id="disconnectButton" class="ghost danger" type="button" disabled>Disconnect</button>
+        </div>
+      </header>
+
+      <section class="page is-active" data-panel="connect">
+        <div class="grid two">
+          <form id="authForm" class="card glass stack">
+            <div><p class="eyebrow">Step 1</p><h2>Authenticate</h2><p class="muted">Use the gateway auth endpoint, then select or create a session.</p></div>
+            <label>Gateway URL<input id="gatewayUrl" type="url" placeholder="http://127.0.0.1:8000" /></label>
+            <div class="grid two compact"><label>Username<input id="username" autocomplete="username" placeholder="admin" /></label><label>Password<input id="password" type="password" autocomplete="current-password" placeholder="password" /></label></div>
+            <button class="primary" type="submit">Authenticate</button>
+          </form>
+          <form id="sessionForm" class="card glass stack">
+            <div><p class="eyebrow">Step 2</p><h2>Session</h2><p class="muted">Connect a websocket participant to an existing or generated session.</p></div>
+            <label>Known sessions<select id="sessionSelect"><option value="">Authenticate first…</option></select></label>
+            <label>Or create/session id<input id="sessionIdInput" placeholder="auto-generated when empty" /></label>
+            <div class="row wrap"><button id="newSessionButton" class="ghost" type="button">Generate ID</button><button id="connectButton" class="primary" type="submit" disabled>Connect session</button></div>
+          </form>
+        </div>
+      </section>
+
+      <section class="page" data-panel="chat" hidden>
+        <div class="chat-layout">
+          <section class="card glass chat-card">
+            <div class="system-notice-bar" aria-label="System notice controls"><button id="toggleSystemNotices" class="message-filter-pill" type="button" aria-pressed="false" title="Show or hide compact gateway/system notices">System notices hidden</button><span id="systemNoticeSummary" class="system-notice-summary">No system notices.</span></div>
+            <div id="messages" class="messages" aria-live="polite"></div>
+            <form id="chatForm" class="composer">
+              <textarea id="messageInput" rows="3" placeholder="Send a message to the gateway session…"></textarea>
+              <div class="row between wrap">
+                <label class="check"><input id="forceNewRoot" type="checkbox" /> Force new root task</label>
+                <button class="primary" type="submit">Send</button>
+              </div>
+            </form>
+          </section>
+          <aside class="card glass stack side-panel">
+            <div><p class="eyebrow">Run controls</p><h2>Session tools</h2></div>
+            <button id="resetSessionButton" class="ghost danger" type="button">Reset context</button>
+            <button id="requestSnapshotButton" class="ghost" type="button">Request orchestration snapshot</button>
+            <pre id="connectionDetails" class="mini-pre">Not connected.</pre>
+          </aside>
+        </div>
+      </section>
+
+      <section class="page" data-panel="agent" hidden>
+        <form id="agentForm" class="card glass stack">
+          <div class="row between wrap"><div><p class="eyebrow">Agent</p><h2>Runtime parameters</h2><p class="muted">PATCH updates recreate the runtime except policy-only fields.</p></div><div class="row wrap"><button id="loadPresetsButton" class="ghost" type="button">Load presets</button><button id="fetchParamsButton" class="ghost" type="button">Fetch params</button><button class="primary" type="submit">Save params</button></div></div>
+          <div class="grid three"><label>Preset<select id="presetSelect"><option value="">Load presets…</option></select></label><label>Model<input id="model" /></label><label>Provider URL<input id="hostAddress" /></label><label>Host port<input id="hostPort" type="number" min="1" max="65535" /></label><label>API version<input id="apiVersion" /></label><label>API key env var<input id="apiKeyVar" /></label><label>API key<input id="apiKey" type="password" placeholder="blank keeps existing" /></label><label>Agent name<input id="agentName" /></label><label>Verbose<input id="verbose" type="number" min="0" max="5" /></label><label>Mode<select id="mode"><option value="single_step">single_step</option><option value="wolf_loop">wolf_loop</option></select></label><label>Max steps<input id="maxSteps" type="number" min="1" max="100" /></label><label>Context window<input id="ctxWindow" type="number" min="1" /></label></div>
+          <div class="grid four"><label class="check"><input id="orchEnabled" type="checkbox" /> Enable orchestration</label><label>Legacy worker count<input id="orchWorkers" type="number" min="1" max="64" /></label><label>Max active tasks<input id="orchMaxActive" type="number" min="1" /></label><label>Max total tasks<input id="orchMaxTotal" type="number" min="1" /></label><label>GUI command timeout (sec)<input id="guiCommandTimeout" type="number" min="1" max="3600" placeholder="60" /></label></div>
+          <label>Capabilities<input id="capabilities" placeholder="text, structured_output, vision" /></label>
+          <section class="pool-editor">
+            <div class="row between wrap"><div><p class="eyebrow">Agent pool profiles</p><p class="muted">Define resource profiles and target counts for the session-local orchestration worker pool.</p></div><div class="row wrap"><button id="fetchPoolButton" class="ghost" type="button">Fetch pool</button><button id="addProfileButton" class="ghost" type="button">Add profile</button><button id="savePoolButton" class="primary" type="button">Save pool mix</button></div></div>
+            <div id="poolProfileRows" class="profile-rows"></div>
+          </section>
+          <label>System prompt<textarea id="sysPrompt" rows="5"></textarea></label>
+          <details><summary>Raw current params</summary><pre id="paramsRaw" class="mini-pre"></pre></details>
+        </form>
+      </section>
+
+      <section class="page" data-panel="policy" hidden>
+        <form id="policyForm" class="card glass stack">
+          <div class="row between wrap"><div><p class="eyebrow">Policy</p><h2>Permissions and tools</h2></div><div class="row wrap"><button id="fetchPolicyButton" class="ghost" type="button">Fetch policy</button><button class="primary" type="submit">Save policy</button></div></div>
+          <div class="grid three"><label>Action policy<select id="actionPolicy"><option>limited</option><option>safe</option><option>write</option><option>dev</option><option>advanced</option><option>master</option><option>custom</option></select></label><label>Syscall timeout<input id="syscallTimeout" type="number" min="1" max="120" /></label><label class="check"><input id="enableWrite" type="checkbox" /> Enable write_file</label><label class="check"><input id="enableSyscall" type="checkbox" /> Enable run_syscall</label><label class="check"><input id="enableGuiCapture" type="checkbox" /> Enable GUI capture</label><label class="check"><input id="syscallShell" type="checkbox" /> Allow shell</label></div>
+          <label>Allowed actions<input id="actionNames" placeholder="send_message, read_file" /></label><label>Syscall allowlist<input id="syscallAllow" placeholder="pwd, ls, grep" /></label>
+          <pre id="policyRaw" class="mini-pre"></pre>
+        </form>
+      </section>
+
+      <section class="page" data-panel="orchestration" hidden>
+        <div class="stack">
+          <div class="card glass row between wrap"><div><p class="eyebrow">Orchestration</p><h2>Workflow Kanban</h2><p id="kanbanSubtitle" class="muted">No snapshot loaded.</p></div><div class="row wrap"><button id="refreshKanbanButton" class="ghost" type="button">Refresh snapshot</button><button id="liveKanbanButton" class="ghost" type="button">Request live update</button></div></div>
+          <div class="metrics"><div class="metric glass"><span>Tasks</span><strong id="metricTasks">0</strong></div><div class="metric glass"><span>Active</span><strong id="metricActive">0</strong></div><div class="metric glass"><span>Done</span><strong id="metricDone">0</strong></div><div class="metric glass"><span>Agents</span><strong id="metricAgents">0</strong></div></div>
+          <div id="kanbanBoard" class="kanban-board"></div>
+          <section class="card glass stack"><div class="row between wrap"><div><p class="eyebrow">Task graph</p><h2>DAG / subtree view</h2><p class="muted">Parent-child, dependency, and waiting edges for the current snapshot.</p></div></div><div id="taskGraph" class="task-graph empty">No graph loaded.</div></section>
+          <section class="card glass stack"><div class="row between wrap"><div><p class="eyebrow">Selected task</p><h2 id="taskTitle">No task selected</h2></div><div class="row wrap"><button id="refreshTaskDetailButton" class="ghost" type="button">Refresh detail</button><button id="taskReassessParentButton" class="ghost" type="button">Ask parent to reassess</button><button data-task-action="replan" class="ghost task-action" type="button">Replan</button><button data-task-action="retry_subtree" class="ghost task-action" type="button">Retry subtree</button><button data-task-action="cancel_subtree" class="ghost danger task-action" type="button">Cancel subtree</button><button data-task-action="pause" class="ghost task-action" type="button">Pause</button><button data-task-action="resume" class="ghost task-action" type="button">Resume</button><button data-task-action="retry" class="ghost task-action" type="button">Retry</button><button data-task-action="cancel" class="ghost danger task-action" type="button">Cancel</button></div></div><form id="taskMessageForm" class="row"><input id="taskMessageInput" placeholder="Message selected task…" /><button class="primary" type="submit">Send</button></form><div id="taskDetail" class="task-detail-panel mini-pre">Select a card.</div></section>
+        </div>
+      </section>
+
+
+      <section class="page" data-panel="infrastructure" hidden>
+        <div class="stack infrastructure-page">
+          <div class="card glass row between wrap">
+            <div><p class="eyebrow">Infrastructure</p><h2>Runtime locality map</h2><p id="infraSubtitle" class="muted">No infrastructure snapshot loaded.</p></div>
+            <div class="row wrap"><button id="refreshInfrastructureButton" class="ghost" type="button">Refresh infrastructure</button></div>
+          </div>
+          <div class="metrics infrastructure-metrics">
+            <div class="metric glass"><span>Tasks</span><strong id="infraMetricTasks">0</strong></div>
+            <div class="metric glass"><span>Workers</span><strong id="infraMetricWorkers">0</strong></div>
+            <div class="metric glass"><span>KBs</span><strong id="infraMetricKbs">0</strong></div>
+            <div class="metric glass"><span>TBs</span><strong id="infraMetricTbs">0</strong></div>
+            <div class="metric glass"><span>Tools</span><strong id="infraMetricTools">0</strong></div>
+            <div class="metric glass"><span>Universes</span><strong id="infraMetricUniverses">0</strong></div>
+            <div class="metric glass"><span>VStores</span><strong id="infraMetricVstores">0</strong></div>
+            <div class="metric glass"><span>Artifacts</span><strong id="infraMetricArtifacts">0</strong></div>
+            <div class="metric glass"><span>Warnings</span><strong id="infraMetricWarnings">0</strong></div>
+            <div class="metric glass"><span>Audit events</span><strong id="infraMetricAuditEvents">0</strong></div>
+          </div>
+          <section class="card glass stack"><div><p class="eyebrow">Overview</p><h2>Gateway and orchestration infrastructure</h2></div><div id="infraOverview" class="infra-overview empty">Load a snapshot to inspect runtime infrastructure.</div></section>
+          <section class="card glass stack"><div><p class="eyebrow">Warnings</p><h2>Safety and locality notices</h2><p class="muted">Highlights missing shared clients, generic collection names, rebuild flags, and snapshot errors.</p></div><div id="infraWarnings" class="infra-warning-list empty">No infrastructure warnings.</div></section>
+          <section class="card glass stack"><div><p class="eyebrow">Audit</p><h2>Task infrastructure event summary</h2><p class="muted">Aggregates task-local infrastructure event counts, severity, and recent redacted audit records.</p></div><div id="infraAuditSummary" class="infra-audit-summary empty">No task infrastructure events.</div></section>
+          <section class="card glass stack"><div><p class="eyebrow">Worker clones</p><h2>Task-local Gateway worker sessions</h2><p class="muted">Shows task-local workflow clones, context/memory counts, db_client inheritance, and resource counts.</p></div><div id="infraWorkerSessions" class="infra-table empty">No worker sessions.</div></section>
+          <section class="card glass stack"><div><p class="eyebrow">Task infrastructure</p><h2>Task-local state directories</h2></div><div id="infraTaskInfras" class="infra-table empty">No task infrastructure rows.</div></section>
+          <section class="card glass stack"><div><p class="eyebrow">Resources</p><h2>KB / TB / Tool / Universe / VStore inventory</h2></div><div id="infraResourceInventory" class="infra-resource-grid empty">No resources discovered.</div></section>
+          <section class="card glass stack"><div><p class="eyebrow">Locality</p><h2>Ownership and usage edges</h2></div><div id="infraLocalityEdges" class="infra-edge-list empty">No locality edges.</div></section>
+          <section class="card glass stack"><details><summary>Raw infrastructure snapshot JSON</summary><pre id="infraRaw" class="mini-pre"></pre></details></section>
+        </div>
+      </section>
+
+
+      <section class="page" data-panel="collaboration" hidden>
+        <div class="stack collaboration-page">
+          <div class="card glass row between wrap">
+            <div><p class="eyebrow">Collaboration</p><h2>Participants, invites, and join approvals</h2><p id="collabSubtitle" class="muted">No collaboration snapshot loaded.</p></div>
+            <div class="row wrap"><button id="refreshCollaborationButton" class="ghost" type="button">Refresh collaboration</button></div>
+          </div>
+          <div class="metrics collaboration-metrics">
+            <div class="metric glass"><span>Participants</span><strong id="collabMetricParticipants">0</strong></div>
+            <div class="metric glass"><span>Active</span><strong id="collabMetricActive">0</strong></div>
+            <div class="metric glass"><span>Invites</span><strong id="collabMetricInvites">0</strong></div>
+            <div class="metric glass"><span>Pending joins</span><strong id="collabMetricPending">0</strong></div>
+            <div class="metric glass"><span>A2A peers</span><strong id="collabMetricA2A">0</strong></div>
+            <div class="metric glass"><span>Audit events</span><strong id="collabMetricAudit">0</strong></div>
+          </div>
+          <section class="card glass stack">
+            <div class="row between wrap"><div><p class="eyebrow">Participants</p><h2>Current session roster</h2><p class="muted">Shows client type, role, auth mode, activity, and permissions.</p></div><button id="fetchParticipantsButton" class="ghost" type="button">Refresh participants</button></div>
+            <div id="collabParticipants" class="collab-table empty">No participants loaded.</div>
+            <form id="participantMessageForm" class="collab-form participant-message-form">
+              <label>Message<input id="participantMessageInput" placeholder="Message another participant or the session…" /></label>
+              <label>To participant<input id="participantMessageTo" placeholder="optional participant id" /></label>
+              <label>To role<input id="participantMessageRole" placeholder="optional role" /></label>
+              <label>Visibility<select id="participantMessageVisibility"><option value="broadcast">broadcast</option><option value="direct">direct</option><option value="private">private</option></select></label>
+              <button class="primary" type="submit">Send participant message</button>
+            </form>
+          </section>
+          <section class="card glass stack">
+            <div><p class="eyebrow">Invites</p><h2>Create a limited invite</h2><p class="muted">Raw invite tokens are shown only in the creation response. Existing invite lists use redacted previews.</p></div>
+            <form id="createInviteForm" class="collab-form">
+              <label>Role<select id="inviteRole"><option value="human">human</option><option value="observer">observer</option><option value="assistant_agent">assistant_agent</option><option value="tool_agent">tool_agent</option><option value="controller">controller</option><option value="gui_client">gui_client</option><option value="tui_client">tui_client</option></select></label>
+              <label>TTL seconds<input id="inviteTtl" type="number" min="30" value="3600" /></label>
+              <label>Max uses<input id="inviteMaxUses" type="number" min="1" value="1" /></label>
+              <label>Participant hint<input id="inviteParticipantHint" placeholder="optional participant id" /></label>
+              <button class="primary" type="submit">Create invite</button>
+            </form>
+            <div id="collabInviteCreated" class="collab-created empty">No invite created in this browser session.</div>
+            <div class="row between wrap"><h2>Active/recent invites</h2><button id="fetchInvitesButton" class="ghost" type="button">Refresh invites</button></div>
+            <div id="collabInvites" class="collab-table empty">No invites loaded.</div>
+          </section>
+          <section class="card glass stack">
+            <div class="row between wrap"><div><p class="eyebrow">Join requests</p><h2>Approval queue</h2><p class="muted">Tokenless join attempts can be approved with a bounded role or rejected.</p></div><button id="fetchJoinRequestsButton" class="ghost" type="button">Refresh requests</button></div>
+            <div id="collabJoinRequests" class="collab-table empty">No join requests loaded.</div>
+          </section>
+          <section class="card glass stack">
+            <div class="row between wrap"><div><p class="eyebrow">A2A</p><h2>External agent peers</h2><p class="muted">Non-WOLF A2A-compatible agents admitted by invite or approval. Peer tokens are never shown after handshake.</p></div></div>
+            <div id="collabA2APeers" class="collab-table a2a-peer-table empty">No A2A peers loaded.</div>
+            <form id="a2aTaskRequestForm" class="a2a-task-form">
+              <label>Peer<select id="a2aTaskPeer"><option value="">Select an A2A peer</option></select></label>
+              <label>Task/request id<input id="a2aTaskId" placeholder="optional task id" /></label>
+              <label class="span-2">Passive request<textarea id="a2aTaskContent" rows="3" placeholder="Ask this A2A peer to perform a passive task. The peer must poll /a2a/peers/{peer_id}/tasks or receive the direct event."></textarea></label>
+              <button class="primary" type="submit">Queue A2A task</button>
+            </form>
+            <div id="collabA2ATasks" class="collab-table a2a-task-table empty">No A2A task requests loaded.</div>
+          </section>
+          <section class="card glass stack">
+            <div class="row between wrap"><div><p class="eyebrow">Audit</p><h2>Collaboration history</h2><p class="muted">Recent redacted collaboration, invite, approval, participant-message, permission, and A2A events.</p></div></div>
+            <div id="collabAudit" class="collab-audit empty">No collaboration audit events loaded.</div>
+          </section>
+          <section class="card glass stack"><details><summary>Raw collaboration snapshot JSON</summary><pre id="collabRaw" class="mini-pre"></pre></details></section>
+        </div>
+      </section>
+
+      <section class="page" data-panel="events" hidden><section class="card glass stack"><div class="row between wrap"><div><p class="eyebrow">Events</p><h2>Gateway event stream</h2></div><button id="clearEventsButton" class="ghost" type="button">Clear</button></div><div id="eventLog" class="event-log" role="log" aria-live="polite"></div></section></section>
+    </main>
+    <div id="toast" class="toast" hidden></div>
+  </div>
+  <script src="/static/system_notices.js?v=collab-v1-join-inline-20260821"></script>
+  <script src="/static/app.js?v=collab-v1-join-inline-20260821"></script>
+</body>
+</html>

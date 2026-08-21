@@ -6,13 +6,27 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from framework.workflows.base_agent_action import AgentAction
+from framework.workflows.agent_actions.formatting_utils import coerce_bool, normalize_text_payload_dict, resolve_text_source
 
 
 DEFAULT_GUI_URL = "http://127.0.0.1:8765"
 CONTROL_TOKEN_HEADER = "X-Wolf-Gui-Token"
+
+
+def _normalize_gui_bool_fields(data: dict[str, Any], *names: str) -> dict[str, Any]:
+    for name in names:
+        if name in data:
+            data[name] = coerce_bool(data[name])
+    return data
+
+
+def _normalize_panel_dict(panel: dict[str, Any]) -> dict[str, Any]:
+    out = dict(panel)
+    _normalize_gui_bool_fields(out, "open")
+    return normalize_text_payload_dict(out, target="content_html", required=False)
 
 
 def _gui_base_url(explicit: Optional[str] = None) -> str:
@@ -67,6 +81,8 @@ class GuiNotifyPayload(GuiBasePayload):
 
 
 class GuiCreateDashboardPayload(GuiBasePayload):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"name": "Agent Dashboard", "layout": "grid", "description": "...", "open": False}]})
+
     id: Optional[str] = None
     name: str = Field(default="Agent Dashboard", description="Dashboard display name")
     layout: str = Field(default="grid", description="Dashboard layout, usually grid")
@@ -80,8 +96,15 @@ class GuiCreateDashboardPayload(GuiBasePayload):
     host_status: str = "unknown"
     open: bool = Field(default=False, description="If true, open the dashboard after creating it")
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bools(cls, data: Any):
+        return _normalize_gui_bool_fields(dict(data), "open") if isinstance(data, dict) else data
+
 
 class GuiDashboardPanelPayload(GuiBasePayload):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"title": "Panel", "kind": "html", "content_html_lines": ["<h1>Hello</h1>"], "open": True}]})
+
     id: Optional[str] = None
     dashboard_id: Optional[str] = Field(default=None, description="Target dashboard id. If omitted, the active/latest dashboard is used or a new one is created")
     dashboard_name: Optional[str] = Field(default=None, description="Name to use if a dashboard must be created implicitly")
@@ -90,6 +113,8 @@ class GuiDashboardPanelPayload(GuiBasePayload):
     kind: str = Field(default="html", description="Panel kind, e.g. html, url, app, report, chart, log")
     url: str = Field(default="about:blank", description="Panel iframe URL when content_html is not supplied")
     content_html: Optional[str] = Field(default=None, description="Inline HTML content for the panel")
+    content_html_lines: Optional[List[str]] = Field(default=None, description="Safer multiline HTML transport; joined with newline characters")
+    content_html_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 HTML content")
     layout: Dict[str, Any] = Field(default_factory=dict, description="Optional panel layout hints")
     source: str = "agent"
     universe: Optional[str] = None
@@ -101,14 +126,36 @@ class GuiDashboardPanelPayload(GuiBasePayload):
     host_status: str = "unknown"
     open: bool = Field(default=False, description="If true, open the dashboard after adding the panel")
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bools(cls, data: Any):
+        return _normalize_gui_bool_fields(dict(data), "open") if isinstance(data, dict) else data
+
+    @model_validator(mode="after")
+    def normalize_content_html_transport(self):
+        self.content_html = resolve_text_source(
+            text=self.content_html,
+            lines=self.content_html_lines,
+            base64_text=self.content_html_base64,
+            field_label="content_html",
+            required=False,
+        )
+        self.content_html_lines = None
+        self.content_html_base64 = None
+        return self
+
 
 class GuiUpdateDashboardPanelPayload(GuiBasePayload):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"panel_id": "panel_...", "content_html_lines": ["<h1>Updated</h1>"], "status": "ready", "open": False}]})
+
     panel_id: str = Field(..., description="Panel id to update")
     name: Optional[str] = None
     title: Optional[str] = None
     kind: Optional[str] = None
     url: Optional[str] = None
     content_html: Optional[str] = None
+    content_html_lines: Optional[List[str]] = None
+    content_html_base64: Optional[str] = None
     layout: Optional[Dict[str, Any]] = None
     status: Optional[str] = None
     source: Optional[str] = None
@@ -120,12 +167,32 @@ class GuiUpdateDashboardPanelPayload(GuiBasePayload):
     host_status: Optional[str] = None
     open: bool = Field(default=False, description="If true, open the dashboard after updating the panel")
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bools(cls, data: Any):
+        return _normalize_gui_bool_fields(dict(data), "open") if isinstance(data, dict) else data
+
+    @model_validator(mode="after")
+    def normalize_content_html_transport(self):
+        self.content_html = resolve_text_source(
+            text=self.content_html,
+            lines=self.content_html_lines,
+            base64_text=self.content_html_base64,
+            field_label="content_html",
+            required=False,
+        )
+        self.content_html_lines = None
+        self.content_html_base64 = None
+        return self
+
 
 class GuiOpenDashboardPayload(GuiBasePayload):
     dashboard_id: Optional[str] = Field(default=None, description="Dashboard id to open. If omitted, open the active/latest dashboard")
 
 
 class GuiPublishDashboardPayload(GuiBasePayload):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"name": "Dashboard", "panels": [{"title": "Panel", "kind": "html", "content_html_lines": ["<h1>Hello</h1>"]}], "open": True}]})
+
     name: str = Field(default="Agent Dashboard", description="Dashboard display name")
     panels: List[Dict[str, Any]] = Field(default_factory=list, description="Panels to add to the dashboard")
     layout: str = "grid"
@@ -138,6 +205,15 @@ class GuiPublishDashboardPayload(GuiBasePayload):
     workflow: Optional[str] = None
     host_status: str = "unknown"
     open: bool = Field(default=True, description="Open dashboard after publishing")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_panels_and_bools(cls, data: Any):
+        if isinstance(data, dict):
+            data = _normalize_gui_bool_fields(dict(data), "open")
+            if isinstance(data.get("panels"), list):
+                data["panels"] = [_normalize_panel_dict(p) if isinstance(p, dict) else p for p in data["panels"]]
+        return data
 
 
 class GuiRegisterAppPayload(GuiBasePayload):
@@ -154,6 +230,11 @@ class GuiRegisterAppPayload(GuiBasePayload):
     host_status: str = "unknown"
     open: bool = Field(default=False, description="If true, open the app after registering")
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bools(cls, data: Any):
+        return _normalize_gui_bool_fields(dict(data), "open") if isinstance(data, dict) else data
+
 
 class GuiOpenAppPayload(GuiBasePayload):
     app_id: Optional[str] = Field(default=None, description="Registered app id to open")
@@ -161,6 +242,11 @@ class GuiOpenAppPayload(GuiBasePayload):
 
 
 class GuiGetVisualContextPayload(GuiBasePayload):
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bools(cls, data: Any):
+        return _normalize_gui_bool_fields(dict(data), "include_dom_excerpt", "include_layout", "include_annotations") if isinstance(data, dict) else data
+
     include_dom_excerpt: bool = Field(default=True, description="Include same-origin/inline DOM or text excerpts when available")
     include_layout: bool = Field(default=True, description="Include viewport, panel bounds, and visible-surface layout metadata")
     include_annotations: bool = Field(default=True, description="Include current workspace annotations")
@@ -218,7 +304,7 @@ class GuiAddDashboardPanelAction(AgentAction):
     action: Literal["gui_add_dashboard_panel"] = "gui_add_dashboard_panel"
     description: Literal["Add a panel to a GUI dashboard"] = "Add a panel to a GUI dashboard"
     payload: GuiDashboardPanelPayload
-    payload_schema: str = '{"dashboard_id": "optional", "title": "Panel", "kind": "html", "url": "about:blank", "content_html": "<html>...</html>", "open": true}'
+    payload_schema: str = '{"dashboard_id": "optional", "title": "Panel", "kind": "html", "url": "about:blank", "content_html_lines": ["<html>...</html>"], "open": true}'
 
     def execute(self, infra: Any = None) -> Dict[str, Any]:
         data = self.payload.model_dump(exclude_none=True)
@@ -236,7 +322,7 @@ class GuiUpdateDashboardPanelAction(AgentAction):
     action: Literal["gui_update_dashboard_panel"] = "gui_update_dashboard_panel"
     description: Literal["Update an existing GUI dashboard panel"] = "Update an existing GUI dashboard panel"
     payload: GuiUpdateDashboardPanelPayload
-    payload_schema: str = '{"panel_id": "panel_...", "content_html": "<html>updated</html>", "status": "ready", "open": false}'
+    payload_schema: str = '{"panel_id": "panel_...", "content_html_lines": ["<html>updated</html>"], "status": "ready", "open": false}'
 
     def execute(self, infra: Any = None) -> Dict[str, Any]:
         data = self.payload.model_dump(exclude_none=True)
@@ -268,7 +354,7 @@ class GuiPublishDashboardAction(AgentAction):
     action: Literal["gui_publish_dashboard"] = "gui_publish_dashboard"
     description: Literal["Create, populate, and optionally open a GUI dashboard in one action"] = "Create, populate, and optionally open a GUI dashboard in one action"
     payload: GuiPublishDashboardPayload
-    payload_schema: str = '{"name": "Dashboard", "panels": [{"title": "Panel", "kind": "html", "content_html": "<html>...</html>"}], "open": true}'
+    payload_schema: str = '{"name": "Dashboard", "panels": [{"title": "Panel", "kind": "html", "content_html_lines": ["<html>...</html>"]}], "open": true}'
 
     def execute(self, infra: Any = None) -> Dict[str, Any]:
         data = self.payload.model_dump(exclude_none=True)

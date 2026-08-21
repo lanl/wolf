@@ -3,6 +3,8 @@
   "use strict";
 
   const STORAGE_KEY = "wolfGatewayStateV3";
+  const PRESET_STORAGE_KEY = "wolf.gateway.agentPresets.v1";
+  const PRESET_SELECTED_KEY = "wolf.gateway.selectedAgentPreset.v1";
   const $ = (id) => document.getElementById(id);
 
   const els = {
@@ -29,6 +31,11 @@
     createSession: $("wolfGatewayCreateSession"),
     showParams: $("wolfGatewayShowParams"),
     saveParams: $("wolfGatewaySaveParams"),
+    loadPresets: $("wolfGatewayLoadPresets"),
+    applyPreset: $("wolfGatewayApplyPreset"),
+    applyCommitPreset: $("wolfGatewayApplyCommitPreset"),
+    agentPresetSelect: $("wolfGatewayAgentPresetSelect"),
+    agentPresetSummary: $("wolfGatewayPresetSummary"),
     showPolicy: $("wolfGatewayShowPolicy"),
     savePolicy: $("wolfGatewaySavePolicy"),
     resetSession: $("wolfGatewayResetSession"),
@@ -44,6 +51,11 @@
     cfgVerbose: $("wolfCfgVerbose"),
     cfgMode: $("wolfCfgMode"),
     cfgMaxSteps: $("wolfCfgMaxSteps"),
+    cfgOrchestrationEnabled: $("wolfCfgOrchestrationEnabled"),
+    cfgOrchestrationWorkerCount: $("wolfCfgOrchestrationWorkerCount"),
+    cfgOrchestrationMaxActiveTasks: $("wolfCfgOrchestrationMaxActiveTasks"),
+    cfgOrchestrationMaxTotalTasks: $("wolfCfgOrchestrationMaxTotalTasks"),
+    cfgGuiCommandTimeout: $("wolfCfgGuiCommandTimeout"),
     cfgCtxWindow: $("wolfCfgCtxWindow"),
     cfgActionPolicy: $("wolfCfgActionPolicy"),
     cfgEnableWrite: $("wolfCfgEnableWrite"),
@@ -143,7 +155,9 @@
     return [
       els.cfgModel, els.cfgHostAddress, els.cfgHostPort, els.cfgApiVersion, els.cfgApiKey,
       els.cfgApiKeyVar, els.cfgAgentName, els.cfgVerbose, els.cfgMode, els.cfgMaxSteps,
-      els.cfgCtxWindow, els.cfgActionPolicy, els.cfgEnableWrite, els.cfgEnableSyscall,
+      els.cfgOrchestrationEnabled, els.cfgOrchestrationWorkerCount,
+      els.cfgOrchestrationMaxActiveTasks, els.cfgOrchestrationMaxTotalTasks,
+      els.cfgGuiCommandTimeout, els.cfgCtxWindow, els.cfgActionPolicy, els.cfgEnableWrite, els.cfgEnableSyscall,
       els.cfgEnableGuiCapture,
       els.cfgSyscallShell, els.cfgSyscallTimeout, els.cfgCapabilities, els.cfgActionNames,
       els.cfgSyscallAllow, els.cfgSysPrompt,
@@ -207,6 +221,11 @@
     setValue(els.cfgVerbose, params.verbose ?? "");
     setValue(els.cfgMode, params.mode || "single_step");
     setValue(els.cfgMaxSteps, params.max_steps ?? 1);
+    setValue(els.cfgOrchestrationEnabled, params.orchestration_enabled || false);
+    setValue(els.cfgOrchestrationWorkerCount, params.orchestration_worker_count ?? 1);
+    setValue(els.cfgOrchestrationMaxActiveTasks, params.orchestration_max_active_tasks ?? 4);
+    setValue(els.cfgOrchestrationMaxTotalTasks, params.orchestration_max_total_tasks ?? 128);
+    setValue(els.cfgGuiCommandTimeout, params.gui_command_timeout_seconds ?? 60);
     setValue(els.cfgCtxWindow, params.ctx_window_length ?? "");
     setValue(els.cfgCapabilities, csv(params.capabilities));
     setValue(els.cfgSysPrompt, params.sys_prompt || "");
@@ -272,6 +291,15 @@
     out.mode = els.cfgMode?.value || "single_step";
     const maxSteps = numberOrNull(els.cfgMaxSteps?.value);
     if (maxSteps !== null) out.max_steps = maxSteps;
+    out.orchestration_enabled = Boolean(els.cfgOrchestrationEnabled?.checked);
+    const orchestrationWorkerCount = numberOrNull(els.cfgOrchestrationWorkerCount?.value);
+    if (orchestrationWorkerCount !== null) out.orchestration_worker_count = orchestrationWorkerCount;
+    const orchestrationMaxActiveTasks = numberOrNull(els.cfgOrchestrationMaxActiveTasks?.value);
+    if (orchestrationMaxActiveTasks !== null) out.orchestration_max_active_tasks = orchestrationMaxActiveTasks;
+    const orchestrationMaxTotalTasks = numberOrNull(els.cfgOrchestrationMaxTotalTasks?.value);
+    if (orchestrationMaxTotalTasks !== null) out.orchestration_max_total_tasks = orchestrationMaxTotalTasks;
+    const guiCommandTimeout = numberOrNull(els.cfgGuiCommandTimeout?.value);
+    if (guiCommandTimeout !== null) out.gui_command_timeout_seconds = guiCommandTimeout;
     out.ctx_window_length = numberOrNull(els.cfgCtxWindow?.value);
     out.capabilities = parseCsv(els.cfgCapabilities?.value) || [];
     if (els.cfgSysPrompt?.value.trim()) out.sys_prompt = els.cfgSysPrompt.value;
@@ -570,21 +598,311 @@
     return typeof window.wolfGuiAgentCaptureAllowed === "function" ? window.wolfGuiAgentCaptureAllowed() : Boolean(els.allowAgentCapture?.checked);
   }
 
-  function collectWorkspaceCaptureUrls(payload = {}) {
-    const urls = Array.isArray(payload.urls) ? payload.urls.slice() : [];
-    if (urls.length) return urls;
+  function isCapturableHttpUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return false;
     try {
-      const vc = typeof window.wolfGuiCurrentVisualContext === "function" ? window.wolfGuiCurrentVisualContext() : {};
+      const url = new URL(raw, window.location.href);
+      return url.protocol === "http:" || url.protocol === "https:";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function normalizeCaptureUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    try {
+      const url = new URL(raw, window.location.href);
+      return (url.protocol === "http:" || url.protocol === "https:") ? url.href : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function extractHttpUrlsFromText(text) {
+    const raw = String(text || "");
+    if (!raw) return [];
+    const found = [];
+    const push = (candidate) => {
+      const normalized = normalizeCaptureUrl(candidate);
+      if (normalized && !found.includes(normalized)) found.push(normalized);
+    };
+    const attrRe = /(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+    let match;
+    while ((match = attrRe.exec(raw))) push(match[1]);
+    const urlRe = /https?:\/\/[^\s"'<>\)]+/gi;
+    while ((match = urlRe.exec(raw))) push(match[0]);
+    return found;
+  }
+
+  function panelIdentifier(panel) {
+    return panel?.id || panel?.panel_id || panel?.key || panel?.title || panel?.name || "unknown_panel";
+  }
+
+  function mergeLiveVisualContextForRenderedCapture(body = {}) {
+    // Rendered scopes need the full live geometry (annotation_targets,
+    // visible_surfaces, viewport, dashboard_panels). Agents sometimes pass a
+    // minimized visual_context containing only annotation_pixel_box; preserve
+    // those explicit fields but enrich from the current browser GUI context.
+    let live = null;
+    try {
+      live = typeof window.wolfGuiCurrentVisualContext === "function" ? window.wolfGuiCurrentVisualContext() : null;
+    } catch (_) {
+      live = null;
+    }
+    const partial = (body && typeof body.visual_context === "object" && body.visual_context) ? body.visual_context : {};
+    const merged = { ...(live || {}), ...(partial || {}) };
+    if (live?.annotation_targets && !partial.annotation_targets) merged.annotation_targets = live.annotation_targets;
+    if (live?.annotations && !partial.annotations) merged.annotations = live.annotations;
+    if (live?.visible_surfaces && !partial.visible_surfaces) merged.visible_surfaces = live.visible_surfaces;
+    if (live?.viewport && !partial.viewport) merged.viewport = live.viewport;
+    if (live?.dashboard_panels && !partial.dashboard_panels) merged.dashboard_panels = live.dashboard_panels;
+    if (live?.active_dashboard && !partial.active_dashboard) merged.active_dashboard = live.active_dashboard;
+    if (live?.workspace && !partial.workspace) merged.workspace = live.workspace;
+    return merged;
+  }
+
+  function liveCaptureClip(body = {}, visualContext = {}) {
+    const scope = String(body.capture_scope || "full_gui");
+    const viewport = visualContext?.viewport || {};
+    const surfaces = visualContext?.visible_surfaces || {};
+    const vw = Number(viewport.width || window.innerWidth || 1);
+    const vh = Number(viewport.height || window.innerHeight || 1);
+    const boxToClip = (box) => {
+      if (!box || !Number(box.width) || !Number(box.height)) return null;
+      return {
+        x: Math.max(0, Number(box.x || 0)),
+        y: Math.max(0, Number(box.y || 0)),
+        width: Math.max(1, Number(box.width || 0)),
+        height: Math.max(1, Number(box.height || 0)),
+        viewport_width: vw,
+        viewport_height: vh,
+      };
+    };
+    if (scope === "full_gui") return null;
+    if (scope === "active_dashboard") return boxToClip(surfaces?.dashboard_workspace?.bounding_box) || null;
+    if (scope === "workspace") return boxToClip(surfaces?.workspace_frame?.bounding_box || surfaces?.dashboard_workspace?.bounding_box) || null;
+    if (scope === "annotation_regions") {
+      const target = Array.isArray(visualContext?.annotation_targets) ? visualContext.annotation_targets[0] : null;
+      return boxToClip(target?.pixel_box || visualContext?.annotation_pixel_box || visualContext?.pixel_box) || null;
+    }
+    return null;
+  }
+
+  async function dataUrlFromBlob(blob) {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(reader.error || new Error("Could not read captured image blob"));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function requestLiveClientCaptureFromUser(body = {}) {
+    // Browsers require navigator.mediaDevices.getDisplayMedia() to be called
+    // from a transient user activation (a real click/key gesture). A websocket
+    // gui_command is not a user gesture, so we park the command and present a
+    // local capture button. The button's click handler then calls
+    // captureLiveClientSurface() directly.
+    return new Promise((resolve, reject) => {
+      const timeoutMs = Math.max(15000, Number(body?.live_capture_timeout_ms || 120000));
+      const existing = document.getElementById("wolfLiveCapturePrompt");
+      if (existing) existing.remove();
+
+      const prompt = document.createElement("div");
+      prompt.id = "wolfLiveCapturePrompt";
+      prompt.setAttribute("role", "dialog");
+      prompt.setAttribute("aria-live", "assertive");
+      prompt.style.cssText = [
+        "position:fixed",
+        "z-index:2147483647",
+        "right:18px",
+        "bottom:18px",
+        "width:min(420px,calc(100vw - 36px))",
+        "padding:14px",
+        "border:1px solid rgba(251,191,36,0.75)",
+        "border-radius:16px",
+        "background:rgba(15,23,42,0.96)",
+        "color:#e5f3ff",
+        "box-shadow:0 24px 80px rgba(0,0,0,0.45), 0 0 0 4px rgba(251,191,36,0.16)",
+        "font:14px/1.4 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+      ].join(";");
+
+      const title = document.createElement("div");
+      title.textContent = "Agent requests live GUI capture";
+      title.style.cssText = "font-weight:750;margin-bottom:6px;color:#fde68a";
+      const msg = document.createElement("div");
+      msg.textContent = "Click Capture live GUI, then choose this Wolf GUI tab/window in the browser sharing picker. This is required by browser security rules.";
+      msg.style.cssText = "margin-bottom:12px;color:#dbeafe";
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:8px;justify-content:flex-end;align-items:center";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "Use backend fallback";
+      cancel.style.cssText = "padding:8px 10px;border-radius:10px;border:1px solid rgba(148,163,184,0.45);background:rgba(255,255,255,0.06);color:#e5f3ff;cursor:pointer";
+      const capture = document.createElement("button");
+      capture.type = "button";
+      capture.textContent = "Capture live GUI";
+      capture.style.cssText = "padding:8px 12px;border-radius:10px;border:1px solid rgba(34,197,94,0.75);background:rgba(34,197,94,0.22);color:#dcfce7;font-weight:700;cursor:pointer";
+      row.append(cancel, capture);
+      prompt.append(title, msg, row);
+      document.body.appendChild(prompt);
+      try { capture.focus({ preventScroll: true }); } catch (_) {}
+
+      let settled = false;
+      const cleanup = () => {
+        try { clearTimeout(timer); } catch (_) {}
+        try { prompt.remove(); } catch (_) {}
+      };
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+      const timer = setTimeout(() => {
+        finish(reject, new Error(`Timed out waiting for user to approve live GUI capture after ${Math.round(timeoutMs / 1000)}s.`));
+      }, timeoutMs);
+
+      cancel.addEventListener("click", () => {
+        finish(reject, new Error("User chose backend replay fallback instead of live GUI capture."));
+      }, { once: true });
+
+      capture.addEventListener("click", () => {
+        capture.disabled = true;
+        cancel.disabled = true;
+        capture.textContent = "Opening browser picker…";
+        // Do not await before calling captureLiveClientSurface; it must invoke
+        // getDisplayMedia inside this click activation chain.
+        captureLiveClientSurface(body).then(
+          (result) => finish(resolve, result),
+          (error) => finish(reject, error instanceof Error ? error : new Error(String(error)))
+        );
+      }, { once: true });
+    });
+  }
+
+  async function captureLiveClientSurface(body = {}) {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      throw new Error("Live browser-surface capture is not supported by this browser.");
+    }
+    const visualContext = mergeLiveVisualContextForRenderedCapture(body);
+    addMessage("system", "Live GUI capture requested. Choose this Wolf GUI tab/window in the browser sharing picker.", { compact: true, live_capture_notice: true });
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { cursor: "always", displaySurface: "browser" },
+      audio: false,
+    });
+    try {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      await new Promise((resolve, reject) => {
+        video.onloadedmetadata = resolve;
+        video.onerror = () => reject(new Error("Could not initialize live capture video stream"));
+      });
+      await video.play();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+      const sourceW = video.videoWidth || window.innerWidth || 1;
+      const sourceH = video.videoHeight || window.innerHeight || 1;
+      const clip = liveCaptureClip(body, visualContext);
+      const scaleX = sourceW / Number(clip?.viewport_width || visualContext?.viewport?.width || window.innerWidth || sourceW);
+      const scaleY = sourceH / Number(clip?.viewport_height || visualContext?.viewport?.height || window.innerHeight || sourceH);
+      let sx = 0, sy = 0, sw = sourceW, sh = sourceH;
+      if (clip) {
+        sx = Math.max(0, Math.min(sourceW - 1, Math.round(Number(clip.x || 0) * scaleX)));
+        sy = Math.max(0, Math.min(sourceH - 1, Math.round(Number(clip.y || 0) * scaleY)));
+        sw = Math.max(1, Math.min(sourceW - sx, Math.round(Number(clip.width || sourceW) * scaleX)));
+        sh = Math.max(1, Math.min(sourceH - sy, Math.round(Number(clip.height || sourceH) * scaleY)));
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas 2D context is unavailable for live capture.");
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("Could not encode live capture image.");
+      const imageData = await dataUrlFromBlob(blob);
+      const upload = await httpJson("POST", `/api/gui/capture/live?session_id=${encodeURIComponent(state.sessionId || "default")}`, {
+        image_data: imageData,
+        format: "png",
+        capture_scope: body.capture_scope || "full_gui",
+        source_url: window.location.href,
+        width: sw,
+        height: sh,
+        metadata: {
+          ...(body.metadata || {}),
+          capture_mode: "live_client_surface",
+          live_capture_clip: clip,
+          live_capture_source_size: { width: sourceW, height: sourceH },
+          live_visual_context: visualContext,
+          user_permission: "granted_via_getDisplayMedia",
+        },
+      });
+      return {
+        ok: true,
+        status: "success",
+        capture_mode: "live_client_surface",
+        capture_scope: body.capture_scope || "full_gui",
+        count: 1,
+        results: [upload],
+        rendered_gui_url: window.location.href,
+        skipped_targets: [],
+      };
+    } finally {
+      try { stream.getTracks().forEach((track) => track.stop()); } catch (_) {}
+    }
+  }
+
+  function collectWorkspaceCaptureTargets(payload = {}) {
+    const requestedPanelIds = new Set((Array.isArray(payload.panel_ids) ? payload.panel_ids : []).map((v) => String(v)));
+    const urls = [];
+    const skipped_targets = [];
+    const addUrl = (candidate, meta = {}) => {
+      const normalized = normalizeCaptureUrl(candidate);
+      if (normalized) {
+        if (!urls.includes(normalized)) urls.push(normalized);
+        return true;
+      }
+      const raw = String(candidate || "").trim();
+      if (raw) skipped_targets.push({ ...meta, value: raw, reason: "not_capturable_http_url" });
+      return false;
+    };
+
+    if (Array.isArray(payload.urls) && payload.urls.length) {
+      payload.urls.forEach((url, index) => addUrl(url, { source: "payload.urls", index }));
+      return { urls, skipped_targets, visual_context: payload.visual_context || null };
+    }
+
+    let vc = payload.visual_context || null;
+    try {
+      if (!vc && typeof window.wolfGuiCurrentVisualContext === "function") vc = window.wolfGuiCurrentVisualContext();
       const panels = [];
       if (Array.isArray(vc?.dashboard_panels)) panels.push(...vc.dashboard_panels);
       if (Array.isArray(vc?.dashboard?.panels)) panels.push(...vc.dashboard.panels);
       if (Array.isArray(vc?.active_dashboard?.panels)) panels.push(...vc.active_dashboard.panels);
       for (const panel of panels) {
-        const url = panel?.url || panel?.iframe?.src || panel?.iframe?.url;
-        if (url && !urls.includes(url)) urls.push(url);
+        const panelId = String(panelIdentifier(panel));
+        if (requestedPanelIds.size && !requestedPanelIds.has(panelId)) {
+          skipped_targets.push({ source: "visual_context.dashboard_panels", panel_id: panelId, reason: "panel_not_requested" });
+          continue;
+        }
+        const before = urls.length;
+        addUrl(panel?.url, { source: "panel.url", panel_id: panelId });
+        addUrl(panel?.iframe?.src, { source: "panel.iframe.src", panel_id: panelId });
+        addUrl(panel?.iframe?.url, { source: "panel.iframe.url", panel_id: panelId });
+        extractHttpUrlsFromText(panel?.inline_html_excerpt).forEach((url, index) => addUrl(url, { source: "panel.inline_html_excerpt", panel_id: panelId, index }));
+        extractHttpUrlsFromText(panel?.iframe?.src).forEach((url, index) => addUrl(url, { source: "panel.iframe.src_embedded", panel_id: panelId, index }));
+        if (urls.length === before) skipped_targets.push({ source: "visual_context.dashboard_panels", panel_id: panelId, reason: "no_capturable_http_url_found" });
+        if (urls.length >= Number(payload.max_panels || 6)) break;
       }
-    } catch (_) {}
-    return urls;
+    } catch (err) {
+      skipped_targets.push({ source: "visual_context", reason: "collection_error", error: String(err?.message || err) });
+    }
+    return { urls: urls.slice(0, Number(payload.max_panels || 6)), skipped_targets, visual_context: vc };
   }
 
   async function executeGatewayGuiCommand(event) {
@@ -640,9 +958,38 @@
       } else if (action === "gui_capture_workspace") {
         if (!agentCaptureAllowedForGateway()) throw new Error("Agent screenshot capture disabled by user. Turn on 'Allow agent capture' to permit gui_capture_workspace.");
         const body = { ...payload };
-        if (!Array.isArray(body.urls) || !body.urls.length) body.urls = collectWorkspaceCaptureUrls(payload);
         if (!body.visual_context && typeof window.wolfGuiCurrentVisualContext === "function") body.visual_context = window.wolfGuiCurrentVisualContext();
-        result = await httpJson("POST", `/api/gui/capture/workspace?session_id=${encodeURIComponent(state.sessionId || "default")}`, body);
+        if (!body.capture_scope) body.capture_scope = Array.isArray(body.urls) && body.urls.length ? "url_list" : (Array.isArray(body.panel_ids) && body.panel_ids.length ? "selected_panels" : "active_dashboard_panels");
+        if (["url_list", "active_dashboard_panels", "selected_panels"].includes(body.capture_scope)) {
+          const collected = collectWorkspaceCaptureTargets(body);
+          body.urls = collected.urls;
+          if (!body.visual_context && collected.visual_context) body.visual_context = collected.visual_context;
+          body.metadata = { ...(body.metadata || {}), capture_target_collection: { skipped_targets: collected.skipped_targets, resolved_url_count: collected.urls.length } };
+          if (!body.urls.length) {
+            result = { ok: false, status: "no_targets", capture_scope: body.capture_scope, count: 0, results: [], skipped_targets: collected.skipped_targets, error: "No capturable HTTP(S) URL targets found for requested GUI workspace capture scope." };
+          } else {
+            result = await httpJson("POST", `/api/gui/capture/workspace?session_id=${encodeURIComponent(state.sessionId || "default")}`, body);
+          }
+        } else if (["workspace", "active_dashboard", "full_gui", "annotation_regions"].includes(body.capture_scope)) {
+          // Prefer a permissioned screenshot of the user's actual live browser
+          // surface. This avoids the older backend replay path, which opens a
+          // separate browser and may not match the visible GUI tab. If browser
+          // permission is denied/unavailable, fall back to backend replay and
+          // report that fallback in the result metadata.
+          body.visual_context = mergeLiveVisualContextForRenderedCapture(body);
+          body.metadata = { ...(body.metadata || {}), rendered_scope_forwarded_by: "browser_gateway", live_visual_context_merged: true, preferred_capture_mode: "live_client_surface" };
+          try {
+            result = await requestLiveClientCaptureFromUser(body);
+          } catch (liveError) {
+            const liveMessage = String(liveError?.message || liveError);
+            addMessage("system", `Live GUI capture unavailable; falling back to backend replay capture: ${liveMessage}`, { compact: true, tone: "warning", live_capture_fallback: true });
+            body.metadata = { ...(body.metadata || {}), live_client_capture_error: liveMessage, fallback_capture_mode: "backend_replay" };
+            result = await httpJson("POST", `/api/gui/capture/workspace?session_id=${encodeURIComponent(state.sessionId || "default")}`, body);
+            result = { ...(result || {}), live_client_capture_error: liveMessage, capture_mode: result?.capture_mode || "backend_replay" };
+          }
+        } else {
+          result = { ok: false, status: "unsupported_scope", capture_scope: body.capture_scope, count: 0, results: [], skipped_targets: [], error: `Unsupported capture scope '${body.capture_scope}'. Use url_list, active_dashboard_panels, selected_panels, workspace, active_dashboard, full_gui, or annotation_regions.` };
+        }
       } else if (action === "gui_get_dom") {
         result = {
           title: document.title,
@@ -804,7 +1151,8 @@
             pull_action: "gui_get_visual_context",
             capture_actions: ["gui_capture_url", "gui_capture_workspace"],
             permission_toggle_id: "allow-agent-inspect",
-            cross_origin_iframe_pixels: agentCaptureAllowedForGateway() ? "backend_capture_action_available" : false,
+            cross_origin_iframe_pixels: agentCaptureAllowedForGateway() ? "live_client_surface_or_backend_capture_available" : false,
+            live_client_surface_capture: agentCaptureAllowedForGateway() && Boolean(navigator.mediaDevices?.getDisplayMedia),
             same_origin_iframe_dom_excerpt: "best_effort"
           },
           timestamp: new Date().toISOString()
@@ -921,6 +1269,83 @@
     return payload;
   }
 
+  let agentPresets = [];
+
+  function loadCachedPresets() {
+    try {
+      const raw = window.localStorage?.getItem(PRESET_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function cachePresets(presets = []) {
+    try { window.localStorage?.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets || [])); } catch (_) {}
+  }
+
+  function selectedPresetId() {
+    return String(els.agentPresetSelect?.value || window.localStorage?.getItem(PRESET_SELECTED_KEY) || "");
+  }
+
+  function renderPresetSelect(presets = agentPresets) {
+    agentPresets = Array.isArray(presets) ? presets : [];
+    if (!els.agentPresetSelect) return;
+    const previous = selectedPresetId();
+    els.agentPresetSelect.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = agentPresets.length ? "Select an agent config preset…" : "No presets loaded";
+    els.agentPresetSelect.appendChild(placeholder);
+    agentPresets.forEach((preset) => {
+      const opt = document.createElement("option");
+      opt.value = preset.id || `${preset.source_file || "preset"}::${preset.key || preset.model || "unnamed"}`;
+      opt.textContent = preset.display_name || opt.value;
+      try { opt.title = JSON.stringify(preset.params || preset, null, 2); } catch (_) {}
+      els.agentPresetSelect.appendChild(opt);
+    });
+    if (previous && agentPresets.some((p) => p.id === previous)) els.agentPresetSelect.value = previous;
+    if (els.agentPresetSummary) {
+      els.agentPresetSummary.textContent = agentPresets.length
+        ? `${agentPresets.length} preset(s) loaded from project JSON files.`
+        : "Presets are read from ./llms.json, ./sample_llm_config.json, and ./JSONs/*.json.";
+    }
+  }
+
+  function currentPreset() {
+    const id = selectedPresetId();
+    return agentPresets.find((preset) => preset.id === id) || null;
+  }
+
+  async function loadAgentPresets() {
+    const data = await httpJson("GET", "/agent-config-presets");
+    agentPresets = Array.isArray(data.presets) ? data.presets : [];
+    cachePresets(agentPresets);
+    renderPresetSelect(agentPresets);
+    if (els.feedback) els.feedback.textContent = `Loaded ${agentPresets.length} agent config preset(s).`;
+    const errorNote = Array.isArray(data.errors) && data.errors.length ? ` (${data.errors.length} file warning(s))` : "";
+    addMessage("system", `Agent config presets loaded: ${agentPresets.length}${errorNote}.`, { compact: true, gateway_result: data });
+    return data;
+  }
+
+  function applyAgentPresetToForm(preset = currentPreset()) {
+    if (!preset) throw new Error("Select an agent config preset first.");
+    const params = sanitizeRedacted({ ...(preset.params || {}) });
+    currentParams = { ...currentParams, ...params };
+    applyParamsToForm(currentParams);
+    if (els.paramsEditor) els.paramsEditor.value = JSON.stringify(currentParams, null, 2);
+    try { window.localStorage?.setItem(PRESET_SELECTED_KEY, preset.id || ""); } catch (_) {}
+    if (els.feedback) els.feedback.textContent = `Applied preset ${preset.display_name || preset.id} to the form.`;
+    addMessage("system", `Applied agent config preset: ${preset.display_name || preset.id}`, { compact: true, gateway_result: preset });
+    return params;
+  }
+
+  async function applyAndCommitAgentPreset() {
+    applyAgentPresetToForm();
+    await saveParams();
+  }
+
   async function showParams() {
     if (!state.sessionId) throw new Error("Select/connect a session first.");
     const params = await httpJson("GET", `/sessions/${encodeURIComponent(state.sessionId)}/params`);
@@ -1008,6 +1433,8 @@
     if (ev.target === els.overlay) { ev.preventDefault(); ev.stopPropagation(); close(); }
   }, true);
 
+  renderPresetSelect(loadCachedPresets());
+
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") close();
     if (ev.ctrlKey && ev.shiftKey && String(ev.key || "").toLowerCase() === "g") { ev.preventDefault(); open(); }
@@ -1021,6 +1448,10 @@
   els.createSession?.addEventListener("click", (ev) => { ev.preventDefault(); createSession(); }, true);
   els.showParams?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await showParams(); } catch (error) { if (els.feedback) els.feedback.textContent = `Fetch agent params failed: ${error.message}`; } }, true);
   els.saveParams?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await saveParams(); } catch (error) { if (els.feedback) els.feedback.textContent = `Commit agent params failed: ${error.message}`; } }, true);
+  els.loadPresets?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await loadAgentPresets(); } catch (error) { if (els.feedback) els.feedback.textContent = `Load presets failed: ${error.message}`; addMessage("system", `Load presets failed: ${error.message}`, { tone: "error" }); } }, true);
+  els.applyPreset?.addEventListener("click", (ev) => { ev.preventDefault(); try { applyAgentPresetToForm(); } catch (error) { if (els.feedback) els.feedback.textContent = `Apply preset failed: ${error.message}`; } }, true);
+  els.applyCommitPreset?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await applyAndCommitAgentPreset(); } catch (error) { if (els.feedback) els.feedback.textContent = `Apply + Commit preset failed: ${error.message}`; } }, true);
+  els.agentPresetSelect?.addEventListener("change", () => { try { window.localStorage?.setItem(PRESET_SELECTED_KEY, els.agentPresetSelect.value || ""); } catch (_) {} });
   els.showPolicy?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await showPolicy(); } catch (error) { if (els.feedback) els.feedback.textContent = `Fetch policy params failed: ${error.message}`; } }, true);
   els.savePolicy?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await savePolicy(); } catch (error) { if (els.feedback) els.feedback.textContent = `Commit policy params failed: ${error.message}`; } }, true);
   els.resetSession?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await resetSession(); } catch (error) { if (els.feedback) els.feedback.textContent = `Reset failed: ${error.message}`; } }, true);
@@ -1120,4 +1551,338 @@
     refreshLocks();
     setTab(active, { silent: true });
   });
+})();
+
+
+// Gateway orchestration Kanban controller
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const STORAGE_KEY = "wolfGatewayStateV3";
+  const cols = [
+    { id: "pending", title: "Pending", statuses: ["pending", "ready", "blocked"] },
+    { id: "active", title: "Active", statuses: ["running", "waiting", "paused"] },
+    { id: "done", title: "Done", statuses: ["completed"] },
+    { id: "failed", title: "Failed", statuses: ["failed", "cancelled"] }
+  ];
+  let snapshot = null;
+  let selectedTaskId = "";
+  let taskDetails = {};
+  let attachedSocket = null;
+
+  function state() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); }
+    catch (_) { return {}; }
+  }
+  function connected() {
+    const ws = window.wolfGatewaySocket;
+    return Boolean(ws && ws.readyState === WebSocket.OPEN && state().sessionId);
+  }
+  function esc(v) {
+    return String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  }
+  function shortId(v) {
+    const s = String(v || "");
+    return s.length > 18 ? `${s.slice(0, 8)}…${s.slice(-6)}` : s;
+  }
+  function taskId(task) { return String(task?.id || task?.task_id || task?.node_id || ""); }
+  function statusOf(task) { return String(task?.status || task?.state || "pending").toLowerCase() || "pending"; }
+  function taskName(task) { return String(task?.spec?.name || task?.name || task?.title || task?.task_name || taskId(task) || "Task"); }
+  function taskObjective(task) { return String(task?.spec?.objective || task?.objective || task?.description || task?._last_event_content || ""); }
+  function tasks() { return Array.isArray(snapshot?.tasks) ? snapshot.tasks : []; }
+  function agents() { return Array.isArray(snapshot?.agent_pool) ? snapshot.agent_pool : (Array.isArray(snapshot?.agents) ? snapshot.agents : []); }
+  function setText(id, value) { const el = $(id); if (el) el.textContent = String(value ?? ""); }
+  function setNotice(text, tone) {
+    const el = $("wolfKanbanNotice");
+    if (!el) return;
+    el.textContent = text || "";
+    el.className = `wolf-kanban-notice ${tone || ""}`.trim();
+  }
+  function sessionEndpoint(path) {
+    const st = state();
+    if (!st.gatewayUrl || !st.token || !st.sessionId) throw new Error("Connect a gateway session first.");
+    const base = String(st.gatewayUrl).replace(/\/+$/, "");
+    return `${base}/sessions/${encodeURIComponent(st.sessionId)}${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(st.token)}`;
+  }
+  async function taskHttp(method, taskIdValue, suffix = "", body = undefined) {
+    const path = `/orchestration/tasks/${encodeURIComponent(taskIdValue)}${suffix}`;
+    const options = { method, cache: "no-store", headers: { "Content-Type": "application/json" } };
+    if (body !== undefined) options.body = JSON.stringify(body || {});
+    const res = await fetch(sessionEndpoint(path), options);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.error || `${res.status} ${res.statusText}`);
+    return data;
+  }
+  function selectedTask() { return tasks().find((t) => taskId(t) === selectedTaskId) || null; }
+  function selectedDetail() {
+    const cached = taskDetails[selectedTaskId] || null;
+    const detailId = cached?.task?.id || cached?.task_id;
+    return detailId && detailId !== selectedTaskId ? null : cached;
+  }
+  function taskTextBlob(task, detail) { try { return JSON.stringify({ task, detail }).toLowerCase(); } catch (_) { return String(task || "").toLowerCase(); } }
+  function taskHasGuiTimeout(task, detail) { return taskTextBlob(task, detail).includes("gui_command_timeout"); }
+  function taskWaitingForGui(task, detail) {
+    const blob = taskTextBlob(task, detail);
+    return ["waiting", "blocked", "needs_user"].includes(statusOf(task)) && (blob.includes("waiting_for_gui_command_result") || blob.includes("gui_command_result"));
+  }
+  function taskHasFailedChildSummary(task, detail) {
+    const summaries = detail?.child_summaries || task?.child_summaries || {};
+    const blob = taskTextBlob(summaries, null);
+    return blob.includes("task failed:") || blob.includes("task_failure") || blob.includes("failed_child") || blob.includes("blockers");
+  }
+  function taskBadges(task, detail) {
+    const badges = [];
+    if (taskWaitingForGui(task, detail)) badges.push(["waiting-gui", "Waiting for GUI"]);
+    if (taskHasGuiTimeout(task, detail)) badges.push(["gui-timeout", "GUI timeout"]);
+    if (taskHasFailedChildSummary(task, detail)) badges.push(["failed-child", "Failed child"]);
+    if (task?.error || detail?.error) badges.push(["task-error-badge", "Error"]);
+    return badges;
+  }
+  function renderTaskBadges(task, detail) {
+    const badges = taskBadges(task, detail);
+    return badges.length ? `<span class="wolf-task-badges">${badges.map(([cls, label]) => `<span class="wolf-task-badge ${esc(cls)}">${esc(label)}</span>`).join("")}</span>` : "";
+  }
+  function taskActionAllowed(action, task) {
+    const s = statusOf(task);
+    const terminal = ["completed", "done", "succeeded", "success", "failed", "cancelled", "canceled"].includes(s);
+    if (!task || !selectedTaskId) return false;
+    if (action === "pause") return ["queued", "ready", "pending", "created", "running", "active", "in_progress"].includes(s);
+    if (action === "resume") return ["waiting", "paused", "blocked", "needs_user"].includes(s);
+    if (action === "retry") return terminal;
+    if (action === "cancel") return !terminal && s !== "unknown";
+    if (action === "cancel_subtree") return s !== "unknown" && !["completed", "done", "succeeded", "success"].includes(s);
+    if (action === "retry_subtree") return s !== "unknown";
+    if (action === "replan") return s !== "unknown" && !["cancelled", "canceled"].includes(s);
+    return true;
+  }
+  function updateTaskActionStates() {
+    const task = selectedTask() || selectedDetail()?.task;
+    document.querySelectorAll(".wolf-kanban-task-action").forEach((button) => {
+      const action = button.getAttribute("data-wolf-task-action") || "";
+      const allowed = taskActionAllowed(action, task);
+      button.disabled = !allowed;
+      button.classList.toggle("wolf-task-action-invalid", !allowed);
+      button.title = allowed ? "" : (task ? `Action ${action} is not valid while task is ${statusOf(task)}.` : "Select a task first.");
+    });
+    const refreshDetail = $("wolfKanbanRefreshDetail");
+    if (refreshDetail) refreshDetail.disabled = !selectedTaskId;
+  }
+  function renderMapSection(title, value) {
+    const entries = value && typeof value === "object" ? Object.entries(value) : [];
+    if (!entries.length) return "";
+    return `<section class="wolf-detail-section"><h5>${esc(title)}</h5>${entries.map(([k, v]) => `<article><div class="wolf-summary-row-head"><strong>${esc(shortId(k))}</strong><button class="wolf-gateway-ghost wolf-detail-task-link" type="button" data-open-task-detail="${esc(k)}">Open task</button></div><p>${esc(typeof v === "string" ? v : JSON.stringify(v, null, 2))}</p></article>`).join("")}</section>`;
+  }
+  function renderListSection(title, value, limit = 6) {
+    const items = Array.isArray(value) ? value.slice(-limit) : [];
+    if (!items.length) return "";
+    return `<section class="wolf-detail-section"><h5>${esc(title)}</h5>${items.map((v, i) => `<article><strong>${esc(String(v?.role || v?.kind || v?.type || `item ${i + 1}`))}</strong><p>${esc(typeof v === "string" ? v : JSON.stringify(v, null, 2))}</p></article>`).join("")}</section>`;
+  }
+  async function fetchTaskDetail(taskIdValue = selectedTaskId) {
+    if (!taskIdValue) return null;
+    const detail = await taskHttp("GET", taskIdValue);
+    taskDetails[taskIdValue] = detail;
+    selectedTaskId = taskIdValue;
+    render();
+    return detail;
+  }
+  function openTaskDetail(taskIdValue) {
+    if (!taskIdValue) return;
+    selectedTaskId = String(taskIdValue);
+    render();
+    fetchTaskDetail(selectedTaskId).catch((err) => setNotice(`Task detail failed: ${err.message || err}`, "error"));
+  }
+  async function taskAction(action) {
+    const task = selectedTask() || selectedDetail()?.task;
+    if (!selectedTaskId || !task) return setNotice("Select a task first.", "warning");
+    if (!taskActionAllowed(action, task)) return setNotice(`Action ${action} is not valid while task is ${statusOf(task)}.`, "warning");
+    const body = { reason: `${action} from WOLF GUI Kanban` };
+    if (action === "replan") body.prompt = "Please reassess and replan this task using current child summaries, failures, blockers, artifacts, and remaining objective. Choose whether to create new subtasks, retry failed work, continue with caveats, ask the user, or complete.";
+    if (action === "retry_subtree") body.include_completed = false;
+    if (action === "cancel_subtree") body.include_root = true;
+    await taskHttp("POST", selectedTaskId, `/${action}`, body);
+    setNotice(`${action} requested for ${shortId(selectedTaskId)}.`);
+    await refreshSnapshot({ quiet: true }).catch(() => {});
+    await fetchTaskDetail(selectedTaskId).catch(() => {});
+  }
+  function graphPayload() {
+    if (snapshot?.task_graph) return snapshot.task_graph;
+    const list = tasks();
+    const edges = [];
+    list.forEach((task) => {
+      const id = taskId(task);
+      const spec = task.spec || {};
+      if (spec.parent_id || task.parent_id) edges.push({ from: spec.parent_id || task.parent_id, to: id, kind: "parent_child" });
+      (spec.dependencies || task.dependencies || []).forEach((dep) => edges.push({ from: dep, to: id, kind: "dependency" }));
+      (task.waiting_on || []).forEach((child) => edges.push({ from: id, to: child, kind: "waiting_on" }));
+    });
+    return { nodes: list.map((task) => ({ id: taskId(task), name: taskName(task), status: statusOf(task), parent_id: task.spec?.parent_id || task.parent_id, depth: task.depth || 0, waiting_on: task.waiting_on || [] })), edges, roots: list.filter((task) => !(task.spec?.parent_id || task.parent_id)).map(taskId) };
+  }
+  function renderTaskGraph() {
+    const el = $("wolfKanbanGraph");
+    if (!el) return;
+    const graph = graphPayload();
+    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    const edges = Array.isArray(graph.edges) ? graph.edges : [];
+    if (!nodes.length) { el.className = "wolf-kanban-graph wolf-kanban-empty"; el.innerHTML = "No graph loaded."; return; }
+    el.className = "wolf-kanban-graph";
+    const nodeHtml = nodes.map((node) => {
+      const id = String(node.id || node.task_id || "");
+      const task = tasks().find((t) => taskId(t) === id) || node;
+      const depth = Math.min(8, Math.max(0, Number(node.depth || task.depth || 0)));
+      const children = edges.filter((e) => e.from === id && e.kind !== "dependency").length;
+      const deps = edges.filter((e) => e.to === id && e.kind === "dependency").length;
+      return `<button type="button" class="wolf-graph-node status-${esc(String(node.status || statusOf(task)))}${id === selectedTaskId ? " is-selected" : ""}" style="--depth:${depth}" data-open-task-detail="${esc(id)}"><span><strong>${esc(node.name || taskName(task))}</strong><em>${esc(shortId(id))}</em></span><span class="wolf-kanban-status">${esc(String(node.status || statusOf(task)))}</span>${renderTaskBadges(task, taskDetails[id])}<small>${children} children · ${deps} deps</small></button>`;
+    }).join("");
+    const edgeHtml = edges.length ? `<div class="wolf-graph-edges"><h5>Edges</h5>${edges.slice(0, 80).map((e) => `<div class="wolf-graph-edge ${esc(e.kind || "edge")}"><span>${esc(shortId(e.from))} → ${esc(shortId(e.to))}</span><em>${esc(e.kind || "edge")}</em></div>`).join("")}${edges.length > 80 ? `<p>${edges.length - 80} more edges hidden.</p>` : ""}</div>` : '<div class="wolf-kanban-empty">No edges</div>';
+    el.innerHTML = `<div class="wolf-graph-nodes">${nodeHtml}</div>${edgeHtml}`;
+    el.querySelectorAll("[data-open-task-detail]").forEach((button) => button.addEventListener("click", () => openTaskDetail(button.getAttribute("data-open-task-detail") || "")));
+  }
+  function inferStatus(event) {
+    const t = String(event?.event_type || event?.status || "").toLowerCase();
+    if (t.includes("completed")) return "completed";
+    if (t.includes("failed")) return "failed";
+    if (t.includes("cancel")) return "cancelled";
+    if (t.includes("started")) return "running";
+    if (t.includes("waiting") || t.includes("input_requested")) return "waiting";
+    if (t.includes("paused")) return "paused";
+    if (t.includes("ready") || t.includes("resumed")) return "ready";
+    if (t.includes("registered")) return "pending";
+    return "";
+  }
+  function applySnapshot(next) {
+    snapshot = { ...(next || {}), tasks: Array.isArray(next?.tasks) ? next.tasks : [] };
+    if (!selectedTaskId && snapshot.last_task_id) selectedTaskId = String(snapshot.last_task_id);
+    if (selectedTaskId && !tasks().some((t) => taskId(t) === selectedTaskId)) selectedTaskId = "";
+    render();
+  }
+  function applyEvent(event) {
+    const taskId = String(event?.task_id || "");
+    if (!snapshot) snapshot = { type: "orchestration_snapshot", enabled: true, started: true, tasks: [], agent_pool: [], timestamp: new Date().toISOString() };
+    snapshot.timestamp = event?.timestamp || event?.event_ts || new Date().toISOString();
+    snapshot.last_event = event;
+    if (!taskId) return render();
+    const list = snapshot.tasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : [];
+    let task = list.find((t) => String(t.id || t.task_id || t.node_id || "") === taskId);
+    if (!task) {
+      task = { id: taskId, status: "pending", spec: { name: `Task ${shortId(taskId)}`, objective: "" }, created_at: snapshot.timestamp };
+      list.push(task);
+    }
+    const inferred = inferStatus(event);
+    const eventType = String(event?.event_type || event?.type || "");
+    const shouldRefreshSnapshot = ["task_completed", "task_failed", "task_cancelled", "agent_released", "parent_resumed"].includes(eventType);
+    if (!task && !inferred) {
+      if (shouldRefreshSnapshot) requestLive({ quiet: true });
+      return render();
+    }
+    if (inferred) task.status = inferred;
+    if (shouldRefreshSnapshot) setTimeout(() => requestLive({ quiet: true }), 80);
+    if (event?.actor) task.owner_agent = event.actor;
+    if (event?.payload?.name) task.spec = { ...(task.spec || {}), name: event.payload.name };
+    task.updated_at = snapshot.timestamp;
+    task._last_event_type = event?.event_type || event?.type || "orchestration_event";
+    task._last_event_content = event?.content || task._last_event_content || "";
+    if (!selectedTaskId) selectedTaskId = taskId;
+    render();
+  }
+  async function refreshSnapshot(options = {}) {
+    const st = state();
+    if (!st.gatewayUrl || !st.token || !st.sessionId) throw new Error("Connect a gateway session first.");
+    const base = String(st.gatewayUrl).replace(/\/+$/, "");
+    const url = `${base}/sessions/${encodeURIComponent(st.sessionId)}/orchestration/snapshot?token=${encodeURIComponent(st.token)}`;
+    const res = await fetch(url, { cache: "no-store" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || data.error || `${res.status} ${res.statusText}`);
+    applySnapshot(data);
+    if (!options.quiet) setNotice("Snapshot refreshed.");
+    return data;
+  }
+  function requestLive(options = {}) {
+    const ws = window.wolfGatewaySocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "orchestration_snapshot_request", timestamp: new Date().toISOString() }));
+    if (!options.quiet) setNotice("Requested live orchestration snapshot.");
+    return true;
+  }
+  function renderDetail(list) {
+    const snap = list.find((t) => taskId(t) === selectedTaskId);
+    const detail = selectedDetail();
+    const task = detail?.task || snap;
+    const body = $("wolfKanbanDetailBody");
+    setText("wolfKanbanDetailTitle", task ? `${taskName(task)} · ${shortId(taskId(task) || selectedTaskId)}` : "No task selected");
+    if (!body) return;
+    if (!task) { body.textContent = list.length ? "Select a card to inspect its current snapshot fields." : "No orchestration tasks are available yet."; updateTaskActionStates(); return; }
+    const id = taskId(task) || selectedTaskId;
+    const spec = task.spec || {};
+    const parentId = spec.parent_id || task.parent_id || task.parent_task_id || "";
+    const parent = parentId ? `<section class="wolf-detail-section"><h5>Parent task</h5><div class="wolf-summary-row-head"><strong>${esc(shortId(parentId))}</strong><button class="wolf-gateway-ghost wolf-detail-task-link" type="button" data-open-task-detail="${esc(parentId)}">Open parent</button></div></section>` : "";
+    const rawDetail = detail ? `<details><summary>Full task detail JSON</summary><pre>${esc(JSON.stringify(detail, null, 2))}</pre></details>` : '<p class="wolf-kanban-muted">Live detail has not been fetched yet. Click Refresh detail.</p>';
+    const rawSnapshot = snap ? `<details><summary>Snapshot JSON</summary><pre>${esc(JSON.stringify(snap, null, 2))}</pre></details>` : "";
+    body.innerHTML = `<div class="wolf-task-detail-head"><span class="wolf-kanban-status">${esc(statusOf(task))}</span><span>${esc(shortId(id))}</span><span>${esc(task.owner_agent_name || task.owner_agent || "unassigned")}</span>${renderTaskBadges(task, detail)}</div>${task.error || detail?.error ? `<div class="wolf-task-error">${esc(task.error || detail?.error)}</div>` : ""}${parent}<section class="wolf-detail-section"><h5>Objective</h5><p>${esc(spec.objective || taskObjective(task) || "No objective")}</p></section>${renderMapSection("Child summaries", detail?.child_summaries || task.child_summaries)}${renderMapSection("Dependency summaries", detail?.dependency_summaries)}${renderListSection("Artifacts", detail?.artifacts)}${renderListSection("Recent local messages", detail?.local_messages, 5)}${renderListSection("Recent events", detail?.events, 5)}${renderListSection("Compressed history", detail?.compressed_history, 5)}<div class="wolf-detail-note">Use Replan, Retry subtree, or Cancel subtree after reviewing failures, child summaries, artifacts, and graph relationships.</div>${rawDetail}${rawSnapshot}`;
+    body.querySelectorAll("[data-open-task-detail]").forEach((button) => button.addEventListener("click", () => openTaskDetail(button.getAttribute("data-open-task-detail") || "")));
+    updateTaskActionStates();
+  }
+  function render() {
+    const list = tasks();
+    const pool = agents();
+    const active = new Set(["ready", "running", "waiting", "paused", "blocked"]);
+    setText("wolfKanbanMetricTasks", list.length);
+    setText("wolfKanbanMetricActive", list.filter((t) => active.has(statusOf(t))).length);
+    setText("wolfKanbanMetricDone", list.filter((t) => statusOf(t) === "completed").length);
+    setText("wolfKanbanMetricAgents", pool.length);
+    setText("wolfKanbanSubtitle", !connected() ? "Connect a gateway session to load orchestration state." : (!snapshot ? "Connected. Refresh or request a live orchestration snapshot." : `${snapshot.enabled ? "Enabled" : "Disabled"} · ${snapshot.started ? "runtime started" : "runtime stopped"} · adapter ${snapshot.adapter || "unknown"}`));
+    const refresh = $("wolfKanbanRefresh"), live = $("wolfKanbanRequestLive");
+    if (refresh) refresh.disabled = !connected();
+    if (live) live.disabled = !connected();
+    if (!snapshot) setNotice(connected() ? "No orchestration snapshot loaded yet." : "Connect a session to inspect orchestration tasks.");
+    else if (!snapshot.enabled) setNotice("Orchestration is disabled for this session. Enable it in Agent parameters and reconnect.", "warning");
+    else setNotice(`Last update: ${snapshot.timestamp || "unknown"}`);
+    const board = $("wolfKanbanBoard");
+    if (!board) return renderDetail(list);
+    board.innerHTML = cols.map((col) => {
+      const colTasks = list.filter((t) => col.statuses.includes(statusOf(t)) || (col.id === "pending" && !cols.some((c) => c.statuses.includes(statusOf(t)))));
+      const cards = colTasks.map((task) => {
+        const id = taskId(task);
+        const status = statusOf(task);
+        const owner = task.owner_agent || task.owner_agent_name || task.leased_agent_name || "unassigned";
+        return `<button type="button" class="wolf-kanban-card status-${esc(status)}${id === selectedTaskId ? " is-selected" : ""}" data-task-id="${esc(id)}"><span class="wolf-kanban-card-head"><strong>${esc(taskName(task))}</strong><em>${esc(shortId(id))}</em></span><span class="wolf-kanban-card-objective">${esc(taskObjective(task)).slice(0, 260) || "No objective in snapshot."}</span><span class="wolf-kanban-card-foot"><span class="wolf-kanban-status">${esc(status)}</span><span>${esc(owner)}</span></span>${renderTaskBadges(task, taskDetails[id])}</button>`;
+      }).join("");
+      return `<section class="wolf-kanban-column" data-column="${esc(col.id)}"><header><span>${esc(col.title)}</span><strong>${colTasks.length}</strong></header><div class="wolf-kanban-column-cards">${cards || '<div class="wolf-kanban-empty">No tasks</div>'}</div></section>`;
+    }).join("");
+    board.querySelectorAll(".wolf-kanban-card[data-task-id]").forEach((card) => card.addEventListener("click", () => openTaskDetail(String(card.getAttribute("data-task-id") || ""))));
+    renderTaskGraph();
+    renderDetail(list);
+    updateTaskActionStates();
+  }
+  function attachSocket() {
+    const ws = window.wolfGatewaySocket;
+    if (!ws || ws === attachedSocket) return;
+    attachedSocket = ws;
+    ws.addEventListener("message", (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg?.type === "orchestration_snapshot") applySnapshot(msg);
+        else if (msg?.type === "orchestration_event") applyEvent(msg);
+      } catch (_) {}
+    });
+  }
+  function wire() {
+    $("wolfKanbanRefresh")?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await refreshSnapshot(); } catch (err) { setNotice(`Snapshot refresh failed: ${err.message || err}`, "error"); } }, true);
+    $("wolfKanbanRequestLive")?.addEventListener("click", (ev) => { ev.preventDefault(); if (!requestLive()) setNotice("Gateway websocket is not open. Reconnect the selected session.", "error"); }, true);
+    $("wolfKanbanRefreshDetail")?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await fetchTaskDetail(); } catch (err) { setNotice(`Task detail refresh failed: ${err.message || err}`, "error"); } }, true);
+    document.querySelectorAll(".wolf-kanban-task-action").forEach((button) => button.addEventListener("click", async (ev) => { ev.preventDefault(); try { await taskAction(button.getAttribute("data-wolf-task-action") || ""); } catch (err) { setNotice(`Task action failed: ${err.message || err}`, "error"); } }, true));
+    const ui = window.WolfGatewayUI;
+    if (ui && typeof ui.connectSession === "function" && !ui.__kanbanWrapped) {
+      const original = ui.connectSession;
+      ui.connectSession = function () { const out = original.apply(this, arguments); setTimeout(() => { attachSocket(); requestLive({ quiet: true }); }, 350); return out; };
+      ui.__kanbanWrapped = true;
+      ui.refreshOrchestrationSnapshot = refreshSnapshot;
+      ui.requestOrchestrationSnapshot = requestLive;
+      ui.orchestrationKanbanSnapshot = () => snapshot;
+    }
+    attachSocket();
+    render();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", wire, { once: true }); else wire();
+  setInterval(() => { attachSocket(); render(); }, 2500);
+  window.WolfGatewayKanban = { refreshSnapshot, requestLive, snapshot: () => snapshot, render };
 })();

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 import requests
 from framework.workflows.base_agent_action import AgentAction
+from framework.workflows.agent_actions.formatting_utils import coerce_bool, coerce_float, resolve_text_list_source, resolve_text_source
 
 # Default timeout for all HTTP requests
 DEFAULT_TIMEOUT = 30
@@ -108,6 +109,8 @@ class UniverseTBSearchToolsAction(AgentAction):
 
 
 class TBExecuteArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "universe": "main", "tb_name": "tools", "tool_name": "tool", "args": ["--help"], "input_lines": ["stdin line"], "timeout": 30, "text": True}]})
+
     #universe_url: str = Field(description="Base URL of the universe")
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")
@@ -120,7 +123,27 @@ class TBExecuteArgs(BaseModel):
     cwd: Optional[str] = Field(default=None, description="Working directory")
     timeout: Optional[float] = Field(default=None, description="Execution timeout in seconds")
     input_data: Optional[str] = Field(default=None, description="Input data to pass to the tool")
+    input_lines: Optional[List[str]] = Field(default=None, description="Safer multiline stdin transport; joined with newline characters")
+    input_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 stdin payload")
     text: bool = Field(default=True, description="Whether to return text output")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_scalars(cls, data: Any):
+        if isinstance(data, dict):
+            data = dict(data)
+            if "text" in data:
+                data["text"] = coerce_bool(data["text"])
+            if "timeout" in data:
+                data["timeout"] = coerce_float(data["timeout"])
+        return data
+
+    @model_validator(mode="after")
+    def normalize_input_transport(self):
+        self.input_data = resolve_text_source(text=self.input_data, lines=self.input_lines, base64_text=self.input_base64, field_label="input_data", required=False)
+        self.input_lines = None
+        self.input_base64 = None
+        return self
 
 
 class UniverseTBExecuteAction(AgentAction):
@@ -138,7 +161,7 @@ class UniverseTBExecuteAction(AgentAction):
                               "env": <dict[string,string]> (optional), 
                               "cwd": <string> (optional), 
                               "timeout": <float> (optional), 
-                              "input_data": <string> (optional), 
+                              "input_data" OR "input_lines" OR "input_base64": <string/list> (optional), 
                               "text": <bool> (optional, default=True)}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
@@ -377,13 +400,24 @@ class UniverseTBStatsAction(AgentAction):
 # Tool Documentation Management
 # ===========================
 class TBAppendDocsArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "universe": "main", "tb_name": "tools", "tool_name": "tool", "text_lines": [["Doc line 1", "Doc line 2"]], "doc_source": "agent"}]})
+
     #universe_url: str = Field(description="Base URL of the universe")
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")
     tb_name: str = Field(description="Name of the toolbox")
     tool_name: str = Field(description="Name of the tool")
-    texts: List[str] = Field(description="List of text documents to add to tool documentation")
+    texts: Optional[List[str]] = Field(default=None, description="List of text documents to add to tool documentation")
+    text_lines: Optional[List[List[str]]] = Field(default=None, description="Safer document transport; each document is a list of lines")
+    texts_base64: Optional[List[str]] = Field(default=None, description="Base64 encoded UTF-8 documentation texts")
     doc_source: str = Field(default="agent", description="Source identifier for the documents")
+
+    @model_validator(mode="after")
+    def normalize_text_transports(self):
+        self.texts = resolve_text_list_source(texts=self.texts, text_lines=self.text_lines, texts_base64=self.texts_base64, field_label="texts", required=True)
+        self.text_lines = None
+        self.texts_base64 = None
+        return self
 
 
 class UniverseTBAppendDocsAction(AgentAction):
@@ -395,7 +429,7 @@ class UniverseTBAppendDocsAction(AgentAction):
                               "universe": <string>: "Name of the universe you are interacting with",
                               "tb_name": <string>, 
                               "tool_name": <string>, 
-                              "texts": <list[string]>, 
+                              "texts" OR "text_lines" OR "texts_base64": <list[string]>, 
                               "doc_source": <string> (optional, default="agent")}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 

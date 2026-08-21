@@ -48,6 +48,60 @@ class ValidatedAction:
     normalized: Dict[str, Any]
 
 
+def jsonable_safe(value: Any) -> Any:
+    """Return a JSON-serializable representation for validation diagnostics.
+
+    Pydantic v2 ValidationError.errors() may include non-serializable objects
+    under ctx, e.g. ValueError(...). Gateway serializes ActionValidationError
+    with model_dump(mode="json"), so details must be JSON-safe.
+    """
+    if isinstance(value, BaseModel):
+        try:
+            return value.model_dump(mode="json")
+        except Exception:
+            return str(value)
+    if isinstance(value, dict):
+        return {str(k): jsonable_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [jsonable_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def validation_error_details(exc: ValidationError) -> Any:
+    try:
+        return jsonable_safe(exc.errors(include_context=False))
+    except TypeError:
+        return jsonable_safe(exc.errors())
+    except Exception:
+        return str(exc)
+
+
+def canonical_action_dict(action_obj: AgentAction) -> Dict[str, Any]:
+    """Build the workflow/event representation from the validated action object.
+
+    This is intentionally post-validation/canonical. If a payload model accepts
+    alternate transports such as message_lines/content_lines/command_args and
+    normalizes them in a Pydantic validator, downstream Gateway/UI code should
+    see the normalized payload, not the raw model response.
+    """
+    payload = getattr(action_obj, "payload", {})
+    if isinstance(payload, BaseModel):
+        payload_data = payload.model_dump(mode="json", by_alias=False, exclude_none=True)
+    elif isinstance(payload, dict):
+        payload_data = jsonable_safe(payload)
+    else:
+        payload_data = jsonable_safe(payload)
+    return {
+        "action": getattr(action_obj, "action", ""),
+        "payload": payload_data if isinstance(payload_data, dict) else {"value": payload_data},
+        "purpose": str(getattr(action_obj, "purpose", "") or ""),
+        "expectations": str(getattr(action_obj, "expectations", "") or ""),
+        "yield_motion_to": getattr(action_obj, "yield_motion_to", None) or "user",
+    }
+
+
 def response_to_dict(response: Any) -> Dict[str, Any] | None:
     """Normalize common provider/Pydantic response shapes to a plain dict."""
     if isinstance(response, dict):
@@ -127,7 +181,7 @@ def validate_action_response(
         return ActionValidationError(
             stage="envelope_validation",
             message="Invalid action envelope.",
-            details=exc.errors(),
+            details=validation_error_details(exc),
             repair_hint="Use top-level keys: action, payload, purpose, expectations, yield_motion_to.",
         )
 
@@ -160,7 +214,7 @@ def validate_action_response(
             stage="payload_validation",
             action=envelope.action,
             message=f"Invalid payload for selected action: {envelope.action}",
-            details=exc.errors(),
+            details=validation_error_details(exc),
             repair_hint=f"Fix only the payload for {envelope.action}; do not change to an unrelated action unless necessary.",
         )
     except Exception as exc:
@@ -171,4 +225,4 @@ def validate_action_response(
             details=str(exc),
         )
 
-    return ValidatedAction(envelope=envelope, spec=spec, action_obj=action_obj, normalized=normalized)
+    return ValidatedAction(envelope=envelope, spec=spec, action_obj=action_obj, normalized=canonical_action_dict(action_obj))

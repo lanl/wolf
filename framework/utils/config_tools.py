@@ -116,6 +116,20 @@ def build_list_agents(session_params):
         )
     return AGENTs
 
+def apply_agent_identity_snapshot(main_agent, workers, snapshot_data: dict):
+    """Apply saved agent names from a session snapshot to rebuilt agents."""
+    agent_info = snapshot_data.get('agent_info') or {}
+    worker_infos = snapshot_data.get('workers_info') or []
+    main_name = agent_info.get('name')
+    if main_name and hasattr(main_agent, 'name'):
+        main_agent.name = main_name
+    for worker, info in zip(workers, worker_infos):
+        name = info.get('name') if isinstance(info, dict) else None
+        if name and hasattr(worker, 'name'):
+            worker.name = name
+    return main_agent, workers
+
+
 def build_list_universes(session_params):
     UNIVs = []
     console.print("|=================================================================================|")
@@ -201,6 +215,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     agents = list(AGENTs.keys())
     main_agent = AGENTs[agents[0]]
     workers = [AGENTs[worker] for worker in agents[1:]] if len(agents) > 1 else []
+    main_agent, workers = apply_agent_identity_snapshot(main_agent, workers, snapshot_data)
     
     # Reconstruct universes
     UNIVs = build_list_universes(session_params)
@@ -263,6 +278,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     
     # Restore infrastructure state
     INFRA.restore(infra_snapshot)
+    INFRA.sync_agent_roster()
     
     # Create workflow with restored infrastructure
     #WF = BaseWorkflow(

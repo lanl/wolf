@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import Literal, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 import copy
 
 from framework.workflows.base_agent_action import AgentAction
@@ -27,6 +27,8 @@ from framework.universes.remote_deployment import RemoteDeploymentManager, Remot
 # Create Universe Action
 # ---------------------------
 class CreateUniverseArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "name": "example_universe", "univ_params": {"kbs": {}, "tbs": {}, "info": {"name": "example_universe", "host": "127.0.0.1", "port": 0, "description": ""}}}]})
+
     system: str = Field(description="System where the universe will be created, e.g., 'local'")
     name: str = Field(description="Name for the new universe")
     #info: dict = Field(

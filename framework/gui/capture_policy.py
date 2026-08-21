@@ -54,7 +54,14 @@ def _is_ip_blocked(ip_text: str, policy: CapturePolicy) -> Optional[str]:
         ip = ipaddress.ip_address(ip_text)
     except ValueError:
         return None
-    if ip.is_loopback and not policy.allow_localhost:
+    if ip.is_loopback:
+        if policy.allow_localhost:
+            # Loopback is only allowed for call sites that have already performed
+            # their own higher-level authorization / user-consent checks, e.g.
+            # rendered Wolf GUI workspace capture after the connected browser has
+            # enabled capture. Do not let the broader private/reserved-network
+            # rule below re-block this explicitly trusted localhost case.
+            return None
         return "localhost/loopback targets are blocked"
     if (ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast) and not policy.allow_private_networks:
         return "private/link-local/reserved network targets are blocked"
@@ -92,7 +99,11 @@ def validate_capture_url(url: str, policy: CapturePolicy | None = None) -> Polic
     if not host:
         return PolicyDecision(False, "URL host is required")
     if host in policy.blocked_hosts:
-        return PolicyDecision(False, f"host '{host}' is blocked", host=host)
+        # Hostname-level localhost is blocked by default. Rendered Wolf GUI
+        # workspace capture may explicitly opt in only after higher-level
+        # authorization and browser-side user-consent checks have already passed.
+        if not (policy.allow_localhost and host in {"localhost", "localhost.localdomain"}):
+            return PolicyDecision(False, f"host '{host}' is blocked", host=host)
     try:
         ipaddress.ip_address(host)
         host_is_ip = True

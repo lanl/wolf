@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import shlex
 import time
 from datetime import datetime
@@ -314,7 +315,7 @@ class GatewayActionWorkflow(BaseWorkflow):
                 self.WORKFLOW_TURN = "user"
                 err_msg = f"[Action validation {validated.stage}] {validated.message}"
                 normalized = response_dict if isinstance(response_dict, dict) else None
-                err_details = validated.model_dump(mode="json")
+                err_details = self._augment_validation_error_details(validated.model_dump(mode="json"), normalized)
                 self.update_history(actor="system", content=err_details, action={"action": "action_validation_error"}, log_console=log_console)
                 events.append(
                     self._event(
@@ -378,7 +379,7 @@ class GatewayActionWorkflow(BaseWorkflow):
                         if isinstance(prepared_validated, ActionValidationError):
                             self.WORKFLOW_TURN = "user"
                             err_msg = f"[Action validation {prepared_validated.stage}] {prepared_validated.message}"
-                            err_details = prepared_validated.model_dump(mode="json")
+                            err_details = self._augment_validation_error_details(prepared_validated.model_dump(mode="json"), prepared)
                             self.update_history(actor="system", content=err_details, action={"action": "action_validation_error"}, log_console=log_console)
                             events.append(
                                 self._event(
@@ -523,6 +524,26 @@ class GatewayActionWorkflow(BaseWorkflow):
                 return dumped
         return None
 
+
+    def _augment_validation_error_details(self, details: Dict[str, Any], normalized: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Add action-specific repair guidance to validation errors surfaced to the GUI/user."""
+        try:
+            out = dict(details or {})
+            action = out.get("action") or ((normalized or {}).get("action") if isinstance(normalized, dict) else None)
+            payload = (normalized or {}).get("payload") if isinstance(normalized, dict) else {}
+            if action == "gui_capture_workspace":
+                bad_scope = payload.get("capture_scope") if isinstance(payload, dict) else None
+                out["repair_hint"] = (
+                    "For gui_capture_workspace use a canonical capture_scope. "
+                    "Use 'annotation_regions' for selected/boxed annotation regions, "
+                    "active_dashboard instead of dashboard for the whole dashboard, "
+                    "or active_dashboard_panels/selected_panels for panel URL captures. "
+                    f"Rejected capture_scope={bad_scope!r}."
+                )
+            return out
+        except Exception:
+            return details
+
     def _should_defer_gui_action(self, action_name: Optional[str]) -> bool:
         action = str(action_name or "")
         if not action.startswith("gui_"):
@@ -574,27 +595,47 @@ class GatewayActionWorkflow(BaseWorkflow):
             payload = {}
 
         raw_payload_gui_url = str(payload.get("gui_url") or "").strip()
-        sentinel_gui_urls = {"default", "auto", "browser", "gui", "local", "none", "null"}
-        payload_gui_url_is_sentinel = raw_payload_gui_url.lower().rstrip("/") in sentinel_gui_urls
-
-        # Preserve an explicit model-provided real URL, but do not preserve
-        # sentinel/default words. Models sometimes emit gui_url="default" to mean
-        # "use the connected GUI"; using that string literally creates invalid
-        # URLs such as "default/api/gui/dashboards/publish".
-        if raw_payload_gui_url and not payload_gui_url_is_sentinel:
-            return normalized
+        normalized_payload_gui_url = raw_payload_gui_url.lower().rstrip("/")
+        sentinel_gui_urls = {
+            "default",
+            "auto",
+            "browser",
+            "gui",
+            "local",
+            "none",
+            "null",
+            "current",
+            "connected",
+            "active",
+            "this",
+            "same",
+            "workspace",
+            "wolf_gui",
+            "wolf-gui",
+        }
+        payload_gui_url_is_sentinel = normalized_payload_gui_url in sentinel_gui_urls
 
         policy = getattr(self, "gateway_action_policy", {}) or {}
         gui_url = str(policy.get("gui_url") or "").strip().rstrip("/")
 
         prepared = dict(normalized)
         prepared_payload = dict(payload)
+
+        # Direct GUI actions execute inside the gateway process, so gui_url is an
+        # internal transport endpoint, not an agent-authored semantic parameter.
+        # Prefer the connected/resolved GUI URL whenever available. This prevents
+        # model placeholders like "current" and invented localhost ports such as
+        # http://127.0.0.1:3000 from being used literally.
         if gui_url:
             prepared_payload["gui_url"] = gui_url
         elif payload_gui_url_is_sentinel:
             # No resolved GUI URL is available. Remove the sentinel so
             # gui_actions.py can use WOLF_GUI_URL / DEFAULT_GUI_URL fallback.
             prepared_payload.pop("gui_url", None)
+        elif raw_payload_gui_url:
+            # No resolved GUI URL exists and the model supplied an actual URL.
+            # Preserve it as a last-resort explicit endpoint.
+            return normalized
         else:
             return normalized
         prepared["payload"] = prepared_payload
@@ -625,9 +666,7 @@ class GatewayActionWorkflow(BaseWorkflow):
             return False, "run_syscall is disabled by the current gateway action policy."
 
         payload = getattr(action_obj, "payload", None)
-        command = getattr(payload, "command", None)
         timeout = int(getattr(payload, "timeout", 30) or 30)
-        shell = bool(getattr(payload, "shell", False))
 
         max_timeout = int(policy.get("syscall_max_timeout", 10) or 10)
         if timeout > max_timeout:
@@ -636,20 +675,34 @@ class GatewayActionWorkflow(BaseWorkflow):
             except Exception:
                 pass
 
+        # The run_syscall action now supports three mutually-exclusive command
+        # transports: legacy command, command_args, and script_lines.  Gateway
+        # guardrails must inspect the resolved subprocess form rather than only
+        # payload.command, otherwise valid command_args payloads look empty.
+        try:
+            if hasattr(payload, "subprocess_args"):
+                command_obj, shell = payload.subprocess_args()
+            else:
+                command_obj = getattr(payload, "command", None)
+                shell = bool(getattr(payload, "shell", False))
+        except Exception as exc:
+            return False, f"run_syscall command could not be resolved safely: {exc}"
+
+        shell = bool(shell)
         if shell and not policy.get("syscall_allow_shell", False):
             return False, "run_syscall with shell=True is disabled by the current gateway action policy. Use a simple command/list form."
 
-        if isinstance(command, list):
-            parts = [str(p) for p in command]
+        if isinstance(command_obj, list):
+            parts = [str(p) for p in command_obj]
             command_text = " ".join(parts)
         else:
-            command_text = str(command or "")
+            command_text = str(command_obj or "")
             try:
-                parts = shlex.split(command_text)
+                parts = shlex.split(command_text) if not shell else [command_text]
             except Exception as exc:
                 return False, f"run_syscall command could not be parsed safely: {exc}"
 
-        if not parts:
+        if not parts or not str(parts[0]).strip():
             return False, "run_syscall command is empty."
 
         # Reject shell composition/metacharacters even when shell=False; this
@@ -680,11 +733,29 @@ class GatewayActionWorkflow(BaseWorkflow):
                 out.append({"entry": str(entry)})
         return out
 
+    def _message_content_from_payload(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            return message
+        lines = payload.get("message_lines")
+        if isinstance(lines, list):
+            return "\n".join(str(line) for line in lines)
+        encoded = payload.get("message_base64")
+        if isinstance(encoded, str) and encoded:
+            try:
+                return base64.b64decode(encoded.encode("ascii"), validate=True).decode("utf-8")
+            except Exception:
+                return ""
+        return ""
+
     def _result_content(self, action_name: str, normalized: Dict[str, Any], result: Any, history_delta: List[Dict[str, Any]]) -> str:
         if action_name == "send_message":
             payload = normalized.get("payload", {})
-            if isinstance(payload, dict):
-                return str(payload.get("message", ""))
+            message = self._message_content_from_payload(payload)
+            if message:
+                return message
         if result is not None:
             return str(result)
         if history_delta:

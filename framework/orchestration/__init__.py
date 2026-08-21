@@ -12,3 +12,6 @@ from .runtime import AsyncWorkflowRuntime
 from .task_infra import LocalTaskState, SharedResources, TaskInfrastructure, TaskInfrastructureFactory
 
 __all__ = [k for k in list(globals().keys()) if not k.startswith('_')]
+
+from .profiles import AgentFactory, AgentProfile, default_agent_profiles, normalize_mix, normalize_profiles
+from .pool_controller import AgentPoolController

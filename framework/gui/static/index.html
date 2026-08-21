@@ -154,7 +154,7 @@
   <div class="wolf-gateway-modal" role="dialog" aria-modal="true" aria-labelledby="wolfGatewayTitle">
     <div class="wolf-gateway-header">
       <div>
-        <p class="wolf-gateway-kicker">Wolf</p>
+        <p class="wolf-gateway-kicker">Wolf / Cerberus</p>
         <h2 id="wolfGatewayTitle">Connect to gateway</h2>
       </div>
       <button id="wolfGatewayCloseButton" class="wolf-gateway-icon" type="button" aria-label="Close gateway dialog" onclick="window.WolfGatewayUI ? window.WolfGatewayUI.close() : (document.getElementById('wolfGatewayOverlay')?.classList.add('wolf-gateway-hidden'))">×</button>
@@ -163,6 +163,7 @@
       <button class='wolf-gateway-tab is-active' type='button' data-gateway-tab='connect' aria-selected='true'><span aria-hidden='true'>🔌</span><span>Connect</span></button>
       <button class='wolf-gateway-tab' type='button' data-gateway-tab='agent' aria-selected='false'><span aria-hidden='true'>🧠</span><span>Agent</span></button>
       <button class='wolf-gateway-tab' type='button' data-gateway-tab='policy' aria-selected='false'><span aria-hidden='true'>🛡️</span><span>Policy</span></button>
+      <button class='wolf-gateway-tab' type='button' data-gateway-tab='kanban' aria-selected='false'><span aria-hidden='true'>▦</span><span>Kanban</span></button>
     </nav>
     <form id='wolfGatewayForm' class='wolf-gateway-form'>
       <div class='wolf-gateway-page-stack'>
@@ -172,7 +173,7 @@
               <p class='wolf-gateway-section-kicker'>Step 1</p>
               <h3>Authenticate and choose a session</h3>
             </div>
-            <p>Connect to a WOLF gateway, then select or create the WOLF session that will drive this workspace.</p>
+            <p>Connect to a Cerberus gateway, then select or create the Wolf session that will drive this workspace.</p>
           </div>
           <div class='wolf-gateway-card-grid'>
             <label class='wolf-gateway-config-wide'>Gateway URL
@@ -227,6 +228,19 @@
               <button id='wolfGatewaySaveParams' class='wolf-gateway-ghost' type='button'>Commit agent params</button>
               <button id='wolfGatewayResetSession' class='wolf-gateway-ghost' type='button'>Reset context</button>
             </div>
+            <div class='wolf-gateway-preset-row' aria-label='Agent config presets'>
+              <label class='wolf-gateway-config-wide'>Agent config preset
+                <select id='wolfGatewayAgentPresetSelect'>
+                  <option value=''>Load presets…</option>
+                </select>
+              </label>
+              <div class='wolf-gateway-actions-inline wolf-gateway-preset-actions'>
+                <button id='wolfGatewayLoadPresets' class='wolf-gateway-ghost' type='button'>Load presets</button>
+                <button id='wolfGatewayApplyPreset' class='wolf-gateway-ghost' type='button'>Apply to form</button>
+                <button id='wolfGatewayApplyCommitPreset' class='wolf-gateway-primary' type='button'>Apply + Commit</button>
+              </div>
+              <p id='wolfGatewayPresetSummary' class='wolf-gateway-help wolf-gateway-config-wide'>Presets are read from ./llms.json, ./sample_llm_config.json, and ./JSONs/*.json.</p>
+            </div>
             <div id='wolfGatewayConfigForm' class='wolf-gateway-config-form wolf-gateway-agent-form'>
               <label>Model
                 <input id='wolfCfgModel' type='text' placeholder='model name' autocomplete='off' />
@@ -260,6 +274,21 @@
               </label>
               <label>Safety step limit
                 <input id='wolfCfgMaxSteps' type='number' min='1' max='20' step='1' />
+              </label>
+              <label>Enable orchestration
+                <input id='wolfCfgOrchestrationEnabled' type='checkbox' />
+              </label>
+              <label>Orchestration workers
+                <input id='wolfCfgOrchestrationWorkerCount' type='number' min='1' max='32' step='1' placeholder='1' />
+              </label>
+              <label>Max active tasks
+                <input id='wolfCfgOrchestrationMaxActiveTasks' type='number' min='1' max='256' step='1' placeholder='4' />
+              </label>
+              <label>Max total tasks
+                <input id='wolfCfgOrchestrationMaxTotalTasks' type='number' min='1' max='10000' step='1' placeholder='128' />
+              </label>
+              <label>GUI command timeout (sec)
+                <input id='wolfCfgGuiCommandTimeout' type='number' min='1' max='3600' step='1' placeholder='60' />
               </label>
               <label>Context window
                 <input id='wolfCfgCtxWindow' type='number' min='1' step='1' placeholder='optional' />
@@ -323,6 +352,65 @@
               <textarea id='wolfGatewayPolicyEditor' class='wolf-gateway-params-editor' rows='8' spellcheck='false' placeholder='Raw policy params JSON. Commit sends only policy-related keys.'></textarea>
             </details>
           </details>
+        </section>
+
+        <section class='wolf-gateway-page wolf-gateway-kanban-page' data-gateway-panel='kanban' hidden>
+          <div class='wolf-gateway-page-head wolf-kanban-page-head'>
+            <div>
+              <p class='wolf-gateway-section-kicker'>Orchestration</p>
+              <h3>Workflow Kanban</h3>
+            </div>
+            <p>Visualise session orchestration tasks by lifecycle state. Cards update from orchestration websocket events and the snapshot API.</p>
+          </div>
+          <section class='wolf-kanban-shell' aria-label='Orchestration workflow kanban'>
+            <div class='wolf-kanban-toolbar'>
+              <div class='wolf-kanban-title-block'>
+                <span class='wolf-kanban-orb' aria-hidden='true'></span>
+                <div>
+                  <strong>Task control board</strong>
+                  <span id='wolfKanbanSubtitle'>Connect a session with orchestration enabled.</span>
+                </div>
+              </div>
+              <div class='wolf-kanban-actions'>
+                <button id='wolfKanbanRefresh' class='wolf-gateway-ghost' type='button'>Refresh snapshot</button>
+                <button id='wolfKanbanRequestLive' class='wolf-gateway-ghost' type='button'>Request live update</button>
+              </div>
+            </div>
+            <div class='wolf-kanban-metrics' aria-label='Orchestration summary metrics'>
+              <div class='wolf-kanban-metric'><span>Tasks</span><strong id='wolfKanbanMetricTasks'>0</strong></div>
+              <div class='wolf-kanban-metric'><span>Active</span><strong id='wolfKanbanMetricActive'>0</strong></div>
+              <div class='wolf-kanban-metric'><span>Completed</span><strong id='wolfKanbanMetricDone'>0</strong></div>
+              <div class='wolf-kanban-metric'><span>Agents</span><strong id='wolfKanbanMetricAgents'>0</strong></div>
+            </div>
+            <div id='wolfKanbanNotice' class='wolf-kanban-notice'>No orchestration snapshot loaded yet.</div>
+            <div id='wolfKanbanBoard' class='wolf-kanban-board' aria-live='polite'></div>
+            <section class='wolf-kanban-graph-panel' aria-label='Orchestration task graph'>
+              <div>
+                <p class='wolf-gateway-section-kicker'>Task graph</p>
+                <h4>DAG / subtree view</h4>
+              </div>
+              <div id='wolfKanbanGraph' class='wolf-kanban-graph wolf-kanban-empty'>No graph loaded.</div>
+            </section>
+            <aside class='wolf-kanban-detail' aria-label='Selected task detail'>
+              <div class='wolf-kanban-detail-head'>
+                <div>
+                  <p class='wolf-gateway-section-kicker'>Selected task</p>
+                  <h4 id='wolfKanbanDetailTitle'>No task selected</h4>
+                </div>
+                <div class='wolf-kanban-task-actions' aria-label='Selected orchestration task actions'>
+                  <button id='wolfKanbanRefreshDetail' class='wolf-gateway-ghost' type='button'>Refresh detail</button>
+                  <button data-wolf-task-action='replan' class='wolf-gateway-ghost wolf-kanban-task-action' type='button'>Replan</button>
+                  <button data-wolf-task-action='retry_subtree' class='wolf-gateway-ghost wolf-kanban-task-action' type='button'>Retry subtree</button>
+                  <button data-wolf-task-action='cancel_subtree' class='wolf-gateway-ghost wolf-kanban-task-action danger' type='button'>Cancel subtree</button>
+                  <button data-wolf-task-action='pause' class='wolf-gateway-ghost wolf-kanban-task-action' type='button'>Pause</button>
+                  <button data-wolf-task-action='resume' class='wolf-gateway-ghost wolf-kanban-task-action' type='button'>Resume</button>
+                  <button data-wolf-task-action='retry' class='wolf-gateway-ghost wolf-kanban-task-action' type='button'>Retry</button>
+                  <button data-wolf-task-action='cancel' class='wolf-gateway-ghost wolf-kanban-task-action danger' type='button'>Cancel</button>
+                </div>
+              </div>
+              <div id='wolfKanbanDetailBody' class='wolf-kanban-detail-body'>Select a card to inspect its current snapshot fields.</div>
+            </aside>
+          </section>
         </section>
       </div>
 

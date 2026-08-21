@@ -430,6 +430,47 @@ class BaseInfrastructure:
         except Exception:
             return str(value)
 
+    def sync_agent_roster(self) -> Dict[str, Any]:
+        """Synchronize routing/member metadata with live agent objects.
+
+        Resume can restore stale WF_MEMBERS/ROLEs from a snapshot while the live
+        agent objects were rebuilt separately. The live objects are the source
+        of truth for routing; this method rebuilds member metadata so @ routing
+        and workflow state cannot diverge from ``self.agent``/``self.workers``.
+        """
+        main_name = getattr(self.agent, "name", "assistant") or "assistant"
+        normalized_workers: Dict[str, Any] = {}
+        for key, worker in list(getattr(self, "workers", {}).items()):
+            name = getattr(worker, "name", None) or str(key)
+            if name == main_name:
+                continue
+            normalized_workers[name] = worker
+        self.workers = normalized_workers
+        self.workers_names = list(normalized_workers.keys())
+        self.WF_ASSISTANTS = [main_name] + self.workers_names
+        preserved = []
+        for member in getattr(self, "WF_MEMBERS", []):
+            if member in {"system", "sys"} or member in self.WF_ASSISTANTS:
+                continue
+            if self.ROLEs.get(member) == "user" and member not in preserved:
+                preserved.append(member)
+        self.WF_MEMBERS = []
+        for member in ["system"] + self.WF_ASSISTANTS + preserved:
+            if member and member not in self.WF_MEMBERS:
+                self.WF_MEMBERS.append(member)
+        new_roles = {k: v for k, v in getattr(self, "ROLEs", {}).items() if v == "user"}
+        new_roles["system"] = "system"
+        new_roles["sys"] = "system"
+        for name in self.WF_ASSISTANTS:
+            new_roles[name] = "assistant"
+        self.ROLEs = new_roles
+        return {
+            "main_agent": main_name,
+            "worker_agents": list(self.workers_names),
+            "WF_MEMBERS": list(self.WF_MEMBERS),
+            "WF_ASSISTANTS": list(self.WF_ASSISTANTS),
+        }
+
     def _cli_all_agents(self) -> Dict[str, Any]:
         agents = {self.agent.name: self.agent}
         agents.update(self.workers)
@@ -1074,6 +1115,8 @@ and with '!>' to run terminal commands.
         if "infra_description_file" in snapshot_data:
             self.infra_description_file = snapshot_data["infra_description_file"]
             self.update_infra_description()
+
+        self.sync_agent_roster()
         
         console.print("[INFRASTRUCTURE] State restored from snapshot")
 

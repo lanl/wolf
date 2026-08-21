@@ -1043,6 +1043,67 @@ function currentVisualContext() {
     };
   }) : [];
 
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const rectsIntersect = (a, b) => {
+    if (!a || !b || !a.visible || !b.visible) return false;
+    return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+  };
+  const pointInRect = (point, rect) => {
+    if (!point || !rect || !rect.visible) return false;
+    return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+  };
+  const annotationPixelGeometry = (annotation) => {
+    const x = clamp(Number(annotation.x || 0), 0, 1) * window.innerWidth;
+    const y = clamp(Number(annotation.y || 0), 0, 1) * window.innerHeight;
+    if (annotation.kind === 'rect') {
+      const w = Math.max(0, Number(annotation.w || 0) * window.innerWidth);
+      const h = Math.max(0, Number(annotation.h || 0) * window.innerHeight);
+      return {
+        point: { x: Math.round(x + w / 2), y: Math.round(y + h / 2) },
+        box: {
+          x: Math.round(x),
+          y: Math.round(y),
+          width: Math.round(w),
+          height: Math.round(h),
+          visible: w > 0 && h > 0,
+        },
+      };
+    }
+    return {
+      point: { x: Math.round(x), y: Math.round(y) },
+      box: {
+        x: Math.round(Math.max(0, x - 12)),
+        y: Math.round(Math.max(0, y - 12)),
+        width: 24,
+        height: 24,
+        visible: true,
+      },
+    };
+  };
+  const annotationTargets = (state.annotations || []).map((annotation, index) => {
+    const geometry = annotationPixelGeometry(annotation);
+    const matchedPanels = panels.filter((panel) => {
+      const box = panel.bounding_box;
+      return annotation.kind === 'rect' ? rectsIntersect(geometry.box, box) : pointInRect(geometry.point, box);
+    }).map((panel) => ({
+      panel_id: panel.id,
+      panel_key: panel.key,
+      panel_title: panel.title,
+      panel_index: panel.index,
+      bounding_box: panel.bounding_box,
+    }));
+    const surface = matchedPanels.length ? 'dashboard_panel' : (dashboard ? 'dashboard_workspace' : 'workspace_frame');
+    return {
+      ...annotation,
+      index,
+      pixel_point: geometry.point,
+      pixel_box: geometry.box,
+      target_surface: surface,
+      target_panels: matchedPanels,
+      capture_hint: annotation.kind === 'rect' ? 'crop_pixel_box' : 'crop_around_pixel_point',
+    };
+  });
+
   return {
     schema_version: 'wolf_gui_visual_context.v1',
     kind: 'wolf_gui_visual_context',
@@ -1057,14 +1118,16 @@ function currentVisualContext() {
       workspace_state: true,
       viewport_geometry: true,
       annotations: true,
+      annotation_pixel_geometry: true,
+      annotation_panel_association: true,
       dashboard_panel_metadata: true,
       dashboard_inline_html_excerpt: true,
       same_origin_iframe_dom_excerpt: 'best_effort',
-      full_gui_pixel_screenshot: agentCaptureAllowed() ? "backend_capture_action_available" : false,
+      full_gui_pixel_screenshot: agentCaptureAllowed() ? "live_client_surface_or_backend_capture_available" : false,
       cross_origin_iframe_dom: false,
-      cross_origin_iframe_pixels: agentCaptureAllowed() ? "requires_gui_capture_url_or_workspace" : false,
-      backend_capture_action: agentCaptureAllowed() ? 'gui_capture_url/gui_capture_workspace permitted by user toggle' : 'disabled_by_user_toggle',
-      limitation_note: 'The browser can describe the Wolf GUI workspace and same-origin/inline dashboard content. Cross-origin iframe DOM or rendered pixels require the permissioned backend Playwright capture action and the Allow agent capture toggle.'
+      cross_origin_iframe_pixels: agentCaptureAllowed() ? "requires_permissioned_live_client_or_backend_capture" : false,
+      backend_capture_action: agentCaptureAllowed() ? 'gui_capture_url/gui_capture_workspace permitted by user toggle; live client surface capture may prompt for browser sharing permission' : 'disabled_by_user_toggle',
+      limitation_note: 'The browser can describe the Wolf GUI workspace and same-origin/inline dashboard content. Exact live rendered pixels require the Allow agent capture toggle and browser screen/tab sharing permission; backend Playwright replay remains a fallback.'
     },
     viewport: {
       width: window.innerWidth,
@@ -1098,6 +1161,7 @@ function currentVisualContext() {
     dashboards_summary: (state.dashboards || []).map((d) => ({ id: d.id, name: d.name, panel_count: (d.panels || []).length })),
     apps_summary: (state.apps || []).map((a) => ({ id: a.id, name: a.name, url: a.url, kind: a.kind, status: a.host_status || a.status })),
     annotations: state.annotations,
+    annotation_targets: annotationTargets,
     annotation_count: state.annotations.length,
   };
 }

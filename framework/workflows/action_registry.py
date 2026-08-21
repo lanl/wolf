@@ -232,6 +232,13 @@ def _example_for_schema(prop: dict, root: dict, depth: int = 0) -> Any:
         if isinstance(branches, list) and branches:
             branch = next((b for b in branches if isinstance(b, dict) and b.get("type") != "null"), branches[0])
             return _example_for_schema(branch, root, depth + 1)
+    examples = prop.get("examples")
+    if isinstance(examples, list) and examples:
+        return examples[0]
+    if "example" in prop:
+        return prop["example"]
+    if "default" in prop and prop.get("default") is not None:
+        return prop.get("default")
     if "const" in prop:
         return prop["const"]
     if "enum" in prop and prop["enum"]:
@@ -242,8 +249,6 @@ def _example_for_schema(prop: dict, root: dict, depth: int = 0) -> Any:
         return {name: _example_for_schema(child, root, depth + 1) for name, child in props.items()} if isinstance(props, dict) else {}
     if typ == "array":
         return [_example_for_schema(prop.get("items", {}), root, depth + 1)]
-    if "default" in prop and prop.get("default") is not None:
-        return prop.get("default")
     if typ == "integer":
         return int(prop.get("minimum", 1))
     if typ == "number":

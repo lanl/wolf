@@ -1,14 +1,23 @@
-# Wolf GUI (`framework/gui`)
+# Wolf GUI / VUI (`framework/gui`)
 
-Wolf GUI is a **visual-workspace-first** interface for WOLF.
+Wolf GUI is the first implementation of WOLF's emerging **VUI** concept:
+
+> **VUI — Virtual User Interface**: a shared visual and operational workspace where a human and an agent can see, inspect, manipulate, capture, and reason over the same live environment.
 
 Instead of putting chat at the center, Wolf GUI treats the screen as a shared work surface:
 - browser pages,
 - CAD/mesh views,
 - generated dashboards/reports,
-- actionbox-hosted mini-apps.
+- actionbox-hosted mini-apps,
+- permissioned live screenshots of the user's actual visible workspace.
 
 A floating/dockable agent panel sits above that workspace so users and agents can collaborate in context.
+
+Design principle:
+
+> If the user can see it, the agent should be able to request permission to see it. If the user can touch it, the agent should be able to request a safe, auditable way to touch it too.
+
+Positioning note: we should avoid an unqualified public claim that this is "the first in the world" unless supported by an external prior-art survey. What is accurate and defensible is that WOLF's VUI combines capabilities that are rarely, if ever, present together in current agent harnesses: shared GUI workspace state, agent-created dashboards, permissioned live browser-surface capture, artifact feedback into the model loop, gateway workflow continuation, and policy-controlled user consent.
 
 ---
 
@@ -20,7 +29,8 @@ Core model:
 - **Workspace is primary** (what both user and agent are looking at)
 - **Agent panel is control plane** (chat, status, actions)
 - **Agents can open visual surfaces quietly** when relevant
-- **User remains informed** via subtle status events
+- **Agents can request live visual grounding** through explicit user permission
+- **User remains informed and in control** via status events, permission toggles, and browser security prompts
 
 ---
 
@@ -72,7 +82,30 @@ Wolf GUI is the **human-facing visual collaboration surface** on top of those la
 
 ---
 
-## 4) Major features
+## 4) VUI: Virtual User Interface
+
+In WOLF terminology, the GUI is more than a graphical shell. It is the current concrete implementation of a **Virtual User Interface (VUI)**: a virtual shared workspace for human-agent collaboration.
+
+The VUI differs from ordinary CLI/TUI/GUI modes:
+
+- **CLI**: command-line interaction.
+- **TUI**: terminal interaction.
+- **GUI**: graphical workspace interaction.
+- **VUI**: shared human-agent workspace interaction, where visual state, user intent, agent actions, dashboards, captures, artifacts, and workflow events are all first-class participants in the loop.
+
+The VUI goal is co-presence:
+
+- The user can look at a workspace.
+- The agent can be granted access to structured visual context.
+- The agent can create or update dashboards and app surfaces.
+- The agent can request a permissioned live screenshot of the user's actual visible GUI tab/window.
+- The resulting image artifact is fed back into the workflow so the agent reasons over the same pixels the user sees.
+
+This is the distinction from ordinary browser automation or ordinary chat-with-tools: WOLF is not merely letting an agent call tools; it is building a shared operational world where user, agent, tools, screens, universes, captures, and memory are connected.
+
+---
+
+## 5) Major features
 
 ### 4.1 Visual workspace shell
 - Full-screen workspace iframe
@@ -127,11 +160,14 @@ Wolf GUI exposes two explicit workspace-context modes in the chat composer:
 Browser security note:
 - The GUI can always provide structured workspace/panel metadata.
 - Same-origin or inline dashboard content can be inspected on a best-effort basis.
-- Cross-origin iframe DOM and full rendered pixels are not available from normal browser JavaScript; those require a separate capture backend such as Playwright.
+- Cross-origin iframe DOM remains unavailable from normal browser JavaScript.
+- Rendered pixels can be captured in two ways:
+  1. **Preferred**: permissioned live client capture using the browser Screen Capture API (`getDisplayMedia`) after a real user click.
+  2. **Fallback**: backend replay capture using the trusted Playwright-based capture worker.
 
 ---
 
-## 5) Gateway integration: how it works now
+## 6) Gateway integration: how it works now
 
 The GUI gateway modal is now a stricter state machine:
 
@@ -149,7 +185,7 @@ The UI now enforces this flow by disabling controls until prerequisites are met.
 
 ---
 
-## 6) Auth → Sessions → Agent/Policy setup (step-by-step)
+## 7) Auth → Sessions → Agent/Policy setup (step-by-step)
 
 1. Open GUI and click **Gateway**.
 2. Enter:
@@ -174,7 +210,7 @@ Notes:
 
 ---
 
-## 7) API quick reference (GUI server)
+## 8) API quick reference (GUI server)
 
 ### Read/bootstrap
 - `GET /api/gui/health`
@@ -212,7 +248,7 @@ Notes:
 
 ---
 
-## 8) Gateway endpoints used by GUI modal
+## 9) Gateway endpoints used by GUI modal
 
 - `POST /auth/login`
 - `GET /accounts/{account_id}/sessions?token=...`
@@ -224,7 +260,7 @@ Notes:
 
 ---
 
-## 9) Security model
+## 10) Security model
 
 ### GUI mutation token (GUI server)
 Set:
@@ -242,7 +278,7 @@ X-Wolf-Gui-Token: your-secret-token
 
 ---
 
-## 10) Run / launch
+## 11) Run / launch
 
 ### Start GUI
 ```bash
@@ -262,7 +298,7 @@ Expected default:
 
 ---
 
-## 11) Known limitations
+## 12) Known limitations
 
 - GUI runtime state is currently in-memory (not full durable replay yet)
 - Gateway/session UX is improved but can be further refined
@@ -270,7 +306,7 @@ Expected default:
 
 ---
 
-## 12) Files of interest
+## 13) Files of interest
 
 - `framework/gui/__init__.py`
 - `framework/gui/server.py`
@@ -293,10 +329,34 @@ If onboarding as a developer, start with:
 
 ## Permissioned screenshot capture
 
-The composer now separates three visual-context permissions:
+The composer separates three visual-context permissions:
 
 1. **👁 Attach workspace view** pushes structured visual metadata with user messages.
 2. **🔭 Allow agent inspect** allows the agent to request live metadata via `gui_get_visual_context`.
-3. **📸 Allow agent capture** allows the browser client to forward `gui_capture_url` / `gui_capture_workspace` requests to the gateway backend screenshot-capture service.
+3. **📸 Allow agent capture** allows the agent to request screenshot artifacts via `gui_capture_url` / `gui_capture_workspace`.
 
-Screenshot capture is default-off and must be explicitly enabled by the user. The backend still applies URL/SSRF policy and stores captures as temporary image references under `wf_workspace/captures/...`; it does not embed large base64 blobs in chat. Cross-origin iframe pixels are captured by the trusted backend browser worker, not by trying to bypass browser same-origin rules in page JavaScript.
+Screenshot capture is default-off and must be explicitly enabled by the user.
+
+### Live client capture: seeing what the user sees
+
+For rendered workspace scopes such as `full_gui`, `workspace`, `active_dashboard`, and `annotation_regions`, WOLF now prefers **live client-surface capture**:
+
+1. The agent emits a deferred `gui_capture_workspace` command.
+2. The GUI shows a local prompt: **Agent requests live GUI capture**.
+3. The user clicks **Capture live GUI**.
+4. The browser opens its normal tab/window/screen sharing picker through `navigator.mediaDevices.getDisplayMedia()`.
+5. The user chooses the Wolf GUI tab/window.
+6. The GUI captures a PNG from the live rendered browser surface.
+7. The image is uploaded to the gateway endpoint `/api/gui/capture/live`.
+8. The artifact is stored under `wf_workspace/captures/...` and appended back into the workflow as an image reference for agent continuation.
+
+This is the key VUI loop: the agent can reason over the same pixels the user is looking at, without bypassing browser security or silently taking screenshots.
+
+### Backend replay fallback
+
+This **backend replay fallback** preserves the previous Playwright capture path when live client capture is not possible.
+
+
+If live client capture is unavailable, denied, or times out, WOLF falls back to the backend Playwright capture path. Backend replay is useful, but may differ from the visible GUI tab because it renders in a separate browser context. Live client capture is therefore preferred whenever exact visual agreement matters.
+
+The backend still applies URL/SSRF policy for URL captures and stores captures as temporary image references under `wf_workspace/captures/...`; large base64 blobs are not embedded in chat history.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 import requests
 import chromadb
 from framework.data_store.data_models import EmbeddingParams
@@ -12,6 +12,7 @@ from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnow
 from framework.universes.base_universe import CreateKBRequest
 
 from framework.workflows.base_agent_action import AgentAction
+from framework.workflows.agent_actions.formatting_utils import resolve_text_list_source, resolve_text_source
 
 
 # Default timeout for all HTTP requests
@@ -193,11 +194,22 @@ class UniverseKBSearchAction(AgentAction):
 
 
 class KBAppendTextsArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "universe": "main", "kb_name": "kb", "text_lines": [["Document line 1", "Document line 2"]], "doc_source": "agent"}]})
+
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")
     kb_name: str = Field(description="Name of the knowledge base")
-    texts: List[str] = Field(description="List of text documents to add")
+    texts: Optional[List[str]] = Field(default=None, description="List of text documents to add")
+    text_lines: Optional[List[List[str]]] = Field(default=None, description="Safer document transport; each document is a list of lines")
+    texts_base64: Optional[List[str]] = Field(default=None, description="Base64 encoded UTF-8 documents")
     doc_source: str = Field(default="agent", description="Source identifier for the documents")
+
+    @model_validator(mode="after")
+    def normalize_text_transports(self):
+        self.texts = resolve_text_list_source(texts=self.texts, text_lines=self.text_lines, texts_base64=self.texts_base64, field_label="texts", required=True)
+        self.text_lines = None
+        self.texts_base64 = None
+        return self
 
 
 class UniverseKBAppendTextsAction(AgentAction):
@@ -209,7 +221,7 @@ class UniverseKBAppendTextsAction(AgentAction):
                               "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
                               "kb_name": <string>,
-                              "texts": <list[string]>,
+                              "texts" OR "text_lines" OR "texts_base64": <list[string]>,
                               "doc_source": <string> (optional, default="agent")
                               }
                               """
@@ -345,12 +357,23 @@ class UniverseKBAddURLsAction(AgentAction):
 
 
 class KBAddDocumentArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "universe": "main", "kb_name": "kb", "content_lines": ["Document line 1", "Document line 2"], "metadata": {"source": "agent"}, "modality": "text"}]})
+
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")
     kb_name: str = Field(description="Name of the knowledge base")
-    content: str = Field(description="Content of the document (text, base64-encoded data, or file path)")
+    content: Optional[str] = Field(default=None, description="Content of the document")
+    content_lines: Optional[List[str]] = Field(default=None, description="Safer multiline content transport; joined with newline characters")
+    content_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 document content")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata for the document")
     modality: str = Field(default="text", description="Modality type: 'text', 'image', 'audio', 'video', 'table', 'binary'")
+
+    @model_validator(mode="after")
+    def normalize_content_transport(self):
+        self.content = resolve_text_source(text=self.content, lines=self.content_lines, base64_text=self.content_base64, field_label="content", required=True)
+        self.content_lines = None
+        self.content_base64 = None
+        return self
 
 
 class UniverseKBAddDocumentAction(AgentAction):
@@ -362,7 +385,7 @@ class UniverseKBAddDocumentAction(AgentAction):
                             "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                             "universe": <string>: "Name of the universe you are interacting with",
                             "kb_name": <string>,
-                            "content": <string>,
+                            "content" OR "content_lines" OR "content_base64": <string/list>,
                             "metadata": <dict> (optional),
                             "modality": <string> (optional, default="text")}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")

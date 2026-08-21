@@ -1,8 +1,18 @@
-# WOLF
+# Cerberus / WOLF
 
-Historically, WOLF has meant the **Workflow Orchestration Language Framework**. As the project evolves, WOLF also names the **Workflow Orchestration Learning Framework**: a philosophy and runtime direction for agents that learn from workflows, tools, users, environments, and their own operational traces.
+**Cerberus** is the development cousin of the production **WOLF** application. Historically, WOLF has meant the **Workflow Orchestration Language Framework**. As the project evolves, WOLF also names the **Workflow Orchestration Learning Framework**: a philosophy and runtime direction for agents that learn from workflows, tools, users, environments, and their own operational traces.
 
-WOLF is an agentic AI framework for building interactive, turn-based workflows where users, LLM-backed agents, worker agents, tools, knowledgebases, and sandboxed execution environments collaborate through structured actions.
+Most agent systems give models tools.
+
+**WOLF gives agents worlds.**
+
+Cerberus / WOLF is not merely an agent harness. It is a **learning framework**: an infrastructure substrate that agents, harnesses, workflows, and users can inhabit while solving tasks. It provides agents with curated action spaces, memory, context management, knowledgebases, toolboxes, universes/actionboxes, gateway runtimes, and shared visual workspaces so they can interact with environments rather than only call tools.
+
+The core design bet is inspired by Richard Sutton's **Bitter Lesson**: durable progress comes less from hand-encoding every decision and more from building general systems that can learn from computation, search, feedback, and interaction with environments. WOLF therefore emphasizes agents that can explore, discover, exploit, evaluate, remember, and improve their own strategies over time.
+
+WOLF is not competing to be the best wrapper around today's agents.
+
+**WOLF is trying to become the environment in which tomorrow's agents learn how to become better agents.**
 
 Much of the repository still uses **WOLF** terminology in code, prompts, configuration, commands, and documentation. In practice, this repository should be understood as the active development branch of the WOLF-style runtime.
 
@@ -10,45 +20,194 @@ Much of the repository still uses **WOLF** terminology in code, prompts, configu
 
 ## Table of Contents
 
-1. [What is WOLF?](#what-is-wolf)
-2. [WOLF Philosophy](#wolf-philosophy)
-3. [Core Mental Model](#core-mental-model)
-4. [Repository Highlights](#repository-highlights)
-5. [Quick Start](#quick-start)
-6. [Running the Application](#running-the-application)
-7. [Interactive CLI Usage](#interactive-cli-usage)
-8. [Gateway / TUI Workflow Runtime](#gateway--tui-workflow-runtime)
-9. [Architecture Overview](#architecture-overview)
-10. [Structured Actions](#structured-actions)
-11. [Infrastructure Layer](#infrastructure-layer)
-12. [Memory and Context Management](#memory-and-context-management)
-13. [Universes / ActionBoxes](#universes--actionboxes)
-14. [Knowledgebases, Toolboxes, and Vector Stores](#knowledgebases-toolboxes-and-vector-stores)
-15. [Sessions, Persistence, and Resume](#sessions-persistence-and-resume)
-16. [Configuration](#configuration)
-17. [Prompt, Rules, and Behavior Files](#prompt-rules-and-behavior-files)
-18. [Developer Notes](#developer-notes)
-19. [Living Documentation](#living-documentation)
-20. [License](#license)
+1. [What is Cerberus / WOLF?](#what-is-cerberus--wolf)
+2. [Why WOLF is Different](#why-wolf-is-different)
+3. [Levels of Agency](#levels-of-agency)
+4. [WOLF Philosophy](#wolf-philosophy)
+5. [Core Mental Model](#core-mental-model)
+6. [Repository Highlights](#repository-highlights)
+7. [Quick Start](#quick-start)
+8. [Running the Application](#running-the-application)
+9. [Interactive CLI Usage](#interactive-cli-usage)
+10. [Gateway / TUI Workflow Runtime](#gateway--tui-workflow-runtime)
+11. [Architecture Overview](#architecture-overview)
+12. [Structured Actions](#structured-actions)
+13. [Infrastructure Layer](#infrastructure-layer)
+14. [Memory and Context Management](#memory-and-context-management)
+15. [Universes / ActionBoxes](#universes--actionboxes)
+16. [Knowledgebases, Toolboxes, and Vector Stores](#knowledgebases-toolboxes-and-vector-stores)
+17. [Sessions, Persistence, and Resume](#sessions-persistence-and-resume)
+18. [Configuration](#configuration)
+19. [Prompt, Rules, and Behavior Files](#prompt-rules-and-behavior-files)
+20. [Developer Notes](#developer-notes)
+21. [Living Documentation](#living-documentation)
+22. [License](#license)
 
 ---
 
-## What is WOLF?
+## What is Cerberus / WOLF?
 
-WOLF provides a composable runtime for agentic workflows. Instead of allowing agents to respond with arbitrary free text, the active workflow expects agents to emit validated JSON actions. Those actions are discovered dynamically from the framework, validated with Pydantic models, executed through the local infrastructure layer, and routed back to the user, system, another agent, or an external sandbox.
+Cerberus / WOLF provides a composable learning runtime for agentic workflows. Instead of treating an LLM as a text generator attached to tools, WOLF treats an agent as an actor inside an infrastructure-rich environment. The active workflow expects agents to emit validated JSON **actions**. Those actions are discovered dynamically from the framework, validated with Pydantic models, executed through the local infrastructure layer, and routed back to the user, system, another agent, the GUI/VUI, or an external sandboxed universe.
+
+WOLF can be used as a harness, but it is broader than a harness. A harness usually wraps an agent so it can perform a task. WOLF provides the environment, memory, action space, workflow substrate, evaluation traces, and shared work surfaces that let agents and harnesses improve how tasks are performed.
 
 The framework supports:
 
-- **Interactive human-agent workflows** through a CLI application.
+- **Interactive human-agent workflows** through CLI, TUI, GUI, and gateway modes.
 - **Structured agent actions** validated against dynamically discovered schemas.
+- **Action metadata** such as `purpose`, `expectations`, and `yield_motion_to`, allowing intent, success criteria, routing, and policy traces to be inspected after execution.
 - **Session persistence and resume** with workflow snapshots.
 - **Memory and context management** for long-running sessions.
 - **Knowledgebases** backed by vector stores and metadata inventory.
 - **Toolboxes** for discoverable and executable tools.
 - **Universes / ActionBoxes** as external or nested sandbox environments.
+- **VUI / shared visual workspace support** through the GUI, dashboards, visual context, and permissioned live capture.
 - **Workflow selection** through the root `./wolf` application launcher.
 - **Agent-to-agent routing** when worker agents are configured.
 
+---
+
+## Why WOLF is Different
+
+Most agent frameworks today are built around a simple pattern:
+
+```text
+LLM + tools + prompts + orchestration glue
+```
+
+That pattern is useful, but it is not enough.
+
+It gives the agent hands, but not a world.  
+It gives the agent tools, but not a developmental loop.  
+It gives the agent logs, but not a structured memory of intent, expectation, outcome, reward, and policy.
+
+WOLF starts from a different premise:
+
+```text
+Agent + curated action space + environment + memory + evaluation + self-improvement loop
+```
+
+Agents will not become truly powerful merely by being connected to more tools. They become more powerful when they can interact with environments, observe consequences, evaluate strategies, remember what worked, revise their policies, and recursively reduce the impedance between intention and solution.
+
+The difference matters.
+
+### Actions, not just tools
+
+WOLF agents have **actions** instead of merely tools.
+
+A tool is an executable capability.  
+An action is an expression of intent.
+
+A WOLF action includes:
+
+- `action`: what the agent intends to do,
+- `payload`: the operational parameters,
+- `purpose`: why the agent is doing it,
+- `expectations`: what successful execution should produce,
+- `yield_motion_to`: who or what should act next.
+
+That difference is profound.
+
+A sequence of WOLF actions is not just an execution log. It is a decision tree. It is a strategy trace. It is policy made visible. It reveals what the agent tried, why it tried it, what it expected, what actually happened, and where the approach succeeded or failed.
+
+Because actions carry purpose and expectations, they can be evaluated. Because they can be evaluated, they can be scored. Because they can be scored, they can become reward signals. Because they can become reward signals, agents can compare strategies, practice through self-play, and improve.
+
+### Learning from interaction with environments
+
+WOLF is built with Sutton's **Bitter Lesson** in mind. Instead of relying primarily on encoded task-specific decisions, WOLF tries to provide agents with environments they can interact with and learn from.
+
+With a well-curated action space, agents can do more than call tools. They can:
+
+- explore an environment,
+- discover available capabilities,
+- exploit known strategies,
+- compare alternative approaches,
+- evaluate outcomes against explicit expectations,
+- preserve useful experience as memory or wisdom artifacts,
+- improve policies, playbooks, workflows, and action selection over time.
+
+This is especially important for design and discovery tasks, where success may require stepping outside the current method, finding a new representation, or inventing a better policy rather than following a fixed recipe.
+
+### Self-play and policy improvement
+
+Because actions record purpose and expectations, completed task traces can be evaluated by humans, programs, or LLM-as-judge evaluators. A workflow can be scored against objectives such as:
+
+- task success,
+- token use,
+- latency,
+- number of actions,
+- safety margin,
+- reversibility,
+- quality of intermediate artifacts,
+- user satisfaction,
+- robustness across environments,
+- reduction of future impedance.
+
+That score can become a reward signal. The first successful strategy becomes a baseline. The agent can then re-run the task, try an adjusted strategy, compare the result, and keep the better policy. Over time this enables reinforcement-learning-inspired self-play without requiring immediate model weight updates: improvement can occur through memory, policies, playbooks, action-space curation, context strategies, and workflow revisions.
+
+### VUI: the shared working world
+
+The Wolf GUI/VUI is not just a user interface. It is the first concrete expression of WOLF's shared-world model.
+
+If the user can see it, the agent can request permission to see it.  
+If the user can touch it, the agent can request a safe, auditable way to touch it.
+
+The VUI turns visual state into shared operational state. Dashboards, browser surfaces, annotations, captures, artifacts, workflow events, and user intent become part of the agent's environment.
+
+This is not ordinary browser automation. It is not just chat with screenshots. It is the beginning of a shared human-agent workspace where perception, action, evaluation, and learning happen in the same loop.
+
+### Infrastructure for agents and harnesses
+
+WOLF is therefore best understood as a framework that provides infrastructure to agents and harnesses:
+
+- an action schema language,
+- workflow orchestration,
+- local and remote environments,
+- memory and context systems,
+- KB/TB/Universe composition,
+- GUI/VUI shared workspace state,
+- capture artifacts and visual grounding,
+- session persistence,
+- evaluable traces.
+
+A harness can run inside WOLF. An agent can use WOLF. A workflow can be evaluated by WOLF. WOLF is the learning substrate that makes those interactions inspectable, repeatable, and improvable.
+
+---
+
+## Levels of Agency
+
+WOLF is designed around a developmental view of agency. The question is not only:
+
+> Can the agent call a tool?
+
+The deeper question is:
+
+> How much can the agent participate in improving the conditions of its own future success?
+
+The levels are not product claims or rigid boxes. They are maturity milestones: a ladder from passive information access toward agents that diagnose themselves, improve their policies, master environments, and discover new ways to act.
+
+```text
+Knowledge → Communication → Operation → Tool/Workflow Management → Diagnostics → Self-Play → Environment Mastery → Extrapolation
+```
+
+| Level | Name | Meaning |
+| --- | --- | --- |
+| **0** | **Knowledge** | The agent can retrieve, ingest, and use information. |
+| **1** | **Communication** | The agent can clarify, explain, negotiate task contracts, coordinate, and route information. |
+| **2** | **Operation** | The agent can act through tools, files, APIs, workflows, sandboxes, dashboards, and environments. |
+| **2.5** | **Tool and Workflow Management** | The agent can select, compare, document, revise, compose, and improve the means of operation. |
+| **3** | **Self-Awareness and Diagnostics** | The agent can inspect failures, uncertainty, action-space gaps, perception errors, and strategy quality. |
+| **3.3** | **Self-Play and Policy Improvement** | The agent can compare strategies, evaluate reward, practice in sandboxes, and improve policies over repeated attempts. |
+| **4** | **Environment Mastery** | The agent can compose, configure, project, and improve the environments in which it acts. |
+| **5** | **Extrapolation** | The agent can discover new abstractions, workflows, evaluation regimes, and forms of agency beyond the original designer's frame. |
+
+Most tool-use harnesses aim at Level 2: operation.
+
+WOLF is built to make Level 3 and beyond possible. That requires more than tools. It requires evaluable action traces, memory, context, universes/actionboxes, visual grounding, workflow continuation, permissioned shared workspaces, self-play, and policy improvement.
+
+This is why WOLF is a learning framework rather than just a runner. It is infrastructure for developmental agency.
+
+For the full maturity model and philosophy, see [philo.md](./philo.md).
 
 ---
 
@@ -57,6 +216,8 @@ The framework supports:
 Beyond the runtime described in this README, WOLF is also a philosophy for building self-evolving agentic systems.
 
 Current agent frameworks often focus on connecting LLMs to tools, prompts, skills, and workflow glue. WOLF aims to go further: it asks how agents can learn from the environments in which they act, preserve reusable operational wisdom, diagnose their own failure modes, improve their policies, practice through self-play, and co-evolve with their infrastructure.
+
+This philosophy deliberately treats environments as teachers. Users, files, tools, universes, dashboards, captures, failures, rewards, and workflow traces all become part of the curriculum. The framework is designed so agents can eventually evaluate not only *what answer they produced*, but *which action strategy produced it and whether a better strategy can be discovered*.
 
 The guiding thesis is:
 
@@ -82,7 +243,7 @@ At runtime, the system is organized around a few key concepts:
 | **User** | The human participant in the workflow. |
 | **System** | The local sandbox/interface through which actions are executed. |
 | **Infrastructure** | The runtime object that exposes agents, objects, managers, history, context, memory, universes, KBs, and TBs. |
-| **Action** | A Pydantic model subclassing `AgentAction`. Agents must respond with one valid action object. |
+| **Action** | A Pydantic model subclassing `AgentAction`. A structured expression of intent containing operational parameters plus purpose, expectations, and turn-routing metadata. |
 | **Workflow** | The orchestration loop that routes turns between users, agents, workers, and the system. |
 | **Universe / ActionBox** | A sandboxed environment that can host knowledgebases, toolboxes, and executable actions. |
 | **KnowledgeBase / KB** | A searchable document or memory store, typically backed by vector storage. |
@@ -94,15 +255,16 @@ At runtime, the system is organized around a few key concepts:
 A useful high-level flow is:
 
 ```text
-User input
-  -> TurnBasedWorkflow
+User objective / environment state
+  -> Workflow
   -> BaseInfrastructure
   -> ContextManager / MemoryManager / ChatManager
   -> Agent prompt with allowed action schema
-  -> Agent emits JSON action
-  -> Action is validated
-  -> Action executes through infrastructure
+  -> Agent emits JSON action with payload + purpose + expectations
+  -> Action is validated and executed through infrastructure
+  -> Outcome is recorded as trace / memory / artifact
   -> Workflow routes the next turn
+  -> Trace can be evaluated for policy or strategy improvement
 ```
 
 ---
@@ -132,6 +294,7 @@ framework/tooling/                         # Tools and ToolBox implementations
 framework/universes/                       # Universe / ActionBox support
 framework/gateway/                         # Gateway client/server/TUI support
 framework/ui/                              # UI-related clients
+framework/gui/                             # Wolf GUI / VUI shared visual workspace
 framework/orchestration/                   # Adjacent or evolving orchestration subsystem
 sessions/                                  # Example launch/session configs
 wf_workspace/                              # Runtime session directories, snapshots, stores
@@ -148,11 +311,13 @@ git clone git@github.com:lanl/wolf.git
 cd wolf
 ```
 
+> Note: Although this development repository is referred to as Cerberus in some contexts, many commands, paths, prompts, and code objects still use the WOLF name.
 
 ---
 
 ### 2. Install the environment
-WOLF can be installed using several Python environment workflows. The older Conda-only setup is still supported, but the repository now includes `pyproject.toml`, so `uv`, `pip`, and other PEP 517/518-compatible tools can be used as well.
+
+Cerberus / WOLF can be installed using several Python environment workflows. The older Conda-only setup is still supported, but the repository now includes `pyproject.toml`, so `uv`, `pip`, and other PEP 517/518-compatible tools can be used as well.
 
 Python 3.13 or newer is recommended unless your branch or deployment environment specifies otherwise.
 
@@ -660,6 +825,8 @@ It provides the main turn-based loop. On each agent turn, the workflow:
 
 Agents do not respond with arbitrary free text. They respond with JSON actions.
 
+In WOLF, an action is not just a tool call. It is a structured expression of intent. The payload says what parameters to use; the purpose says why the agent chose the action; the expectations say what result would count as success; the routing fields say who should act next. This makes actions useful both for execution and for later evaluation.
+
 Action models live under:
 
 ```text
@@ -672,19 +839,24 @@ Actions are dynamically discovered by:
 framework/workflows/workflow_models.py
 ```
 
-The framework imports action modules, walks subclasses of `AgentAction`, and builds a discriminated Pydantic union. This union becomes the schema shown to agents at runtime.
+The framework imports action modules, walks subclasses of `AgentAction`, and builds a discriminated Pydantic union. This union becomes the schema shown to agents at runtime. The selected action set is the agent's current **action space**.
+
+A curated action space is a policy surface. By changing which actions are available, how they are described, and what expectations are attached to them, WOLF can shape how agents explore, exploit, delegate, inspect, remember, and recover from failure.
 
 Common action areas include:
 
 - Messaging actions, such as `send_message`.
 - File IO actions, such as `read_file` and `write_file`.
 - System actions, such as `run_syscall`.
+- GUI/VUI actions, such as dashboard publishing, visual context inspection, and permissioned capture.
 - Memory and context actions.
 - Universe discovery and health actions.
 - Knowledgebase actions.
 - Toolbox actions.
 - Deployment actions.
 - Playbook/workplan actions.
+
+Because action traces include intent and expectation metadata, they can be scored after the fact. This enables reward-driven improvement of strategies, methods, and policies without requiring every improvement to be hard-coded into the model weights.
 
 ### Adding a new action
 
@@ -786,6 +958,8 @@ The working-memory packet may track:
 ## Universes / ActionBoxes
 
 Universes, also called ActionBoxes, are sandbox environments connected to the system. They can host knowledgebases, toolboxes, and executable actions. They may be local, remote, containerized, or otherwise isolated.
+
+Universes are central to the WOLF learning-frame view: they are environments where agents can discover capabilities, test methods, gather observations, and learn locality-aware policies. A tool call is an isolated operation; a universe is an explorable world with its own state, affordances, constraints, KBs, TBs, and possible rewards.
 
 Relevant files include:
 
@@ -1043,4 +1217,3 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT INCLUDING NEGLIGENCE OR OTHERWISE ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
