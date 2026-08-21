@@ -18,6 +18,7 @@ from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
 from framework.workflows.enhanced_input import interactive_input_line_wrapped
 from framework.workflows.base_workflow import BaseWorkflow
+from framework.workflows.action_registry import get_default_action_registry
 from framework.utils.multimodal_input import combine_prompt_with_user_content
 
 
@@ -204,7 +205,7 @@ class FastTurnBasedWorkflow(BaseWorkflow):
             if canonical in {"default_hot_actions", "always_hot_actions"}:
                 if isinstance(value, str):
                     value = [v.strip() for v in value.replace(";", ",").split(",") if v.strip()]
-                value = [v for v in value if v in ACTIONS]
+                value = [v for v in value if self._action_class(v) is not None]
             elif canonical in {"hot_action_buffer_max", "min_count_to_promote", "recent_window_size", "prompt_schema_token_budget", "second_step_context_entries"}:
                 value = int(value)
             else:
@@ -246,7 +247,7 @@ class FastTurnBasedWorkflow(BaseWorkflow):
                     action_name = action
                 elif isinstance(action, dict):
                     action_name = action.get("action")
-                if action_name in ACTIONS:
+                if self._action_class(action_name) is not None:
                     self._record_action_use(action_name, success=True, from_history=True)
         except Exception:
             self.action_usage_counts = Counter()
@@ -255,7 +256,7 @@ class FastTurnBasedWorkflow(BaseWorkflow):
             self.recent_actions = deque(maxlen=self.RECENT_WINDOW_SIZE)
 
     def _record_action_use(self, action_name: str, success: bool = True, from_history: bool = False) -> None:
-        if action_name not in ACTIONS:
+        if self._action_class(action_name) is None:
             return
         self.action_usage_counts[action_name] += 1
         if success:
@@ -266,7 +267,7 @@ class FastTurnBasedWorkflow(BaseWorkflow):
             self.recent_actions.append(action_name)
 
     def _record_validation_error(self, action_name: str | None, err_msg: str, phase: str) -> None:
-        if action_name in ACTIONS:
+        if self._action_class(action_name) is not None:
             self._record_action_use(action_name, success=False)
         self.action_validation_errors.append({
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -276,14 +277,27 @@ class FastTurnBasedWorkflow(BaseWorkflow):
         })
         self.action_validation_errors = self.action_validation_errors[-100:]
 
+    def _registry(self):
+        registry = getattr(self, "action_registry", None)
+        if registry is None:
+            registry = get_default_action_registry()
+            self.action_registry = registry
+        return registry
+
+    def _action_class(self, action_name: str | None):
+        if not action_name:
+            return None
+        spec = self._registry().get(action_name)
+        return spec.action_cls if spec is not None else None
+
     def _active_action_names(self) -> List[str]:
+        registry = self._registry()
         if self.action_names_to_use:
-            return [name for name in self.action_names_to_use if name in ACTIONS]
-        return list(ACTION_NAMES)
+            return [name for name in self.action_names_to_use if registry.get(name) is not None]
+        return registry.names()
 
     def _active_actions_map(self) -> dict:
-        active_names = set(self._active_action_names())
-        return {name: cls for name, cls in ACTIONS.items() if name in active_names}
+        return {name: self._action_class(name) for name in self._active_action_names() if self._action_class(name) is not None}
 
     def _action_score(self, name: str) -> float:
         default_boost = self.DEFAULT_BOOST if name in self.DEFAULT_HOT_ACTIONS else 0.0
@@ -315,7 +329,7 @@ class FastTurnBasedWorkflow(BaseWorkflow):
         for name in ranked:
             if len(hot) >= max(1, int(self.HOT_ACTION_BUFFER_MAX)):
                 break
-            action_cls = ACTIONS.get(name)
+            action_cls = self._action_class(name)
             if action_cls is None:
                 continue
             block = self._hot_action_block(name, action_cls)
@@ -431,7 +445,8 @@ class FastTurnBasedWorkflow(BaseWorkflow):
             "- If you need a COLD ACTION schema, emit only the exact action name or alias (e.g. C03). The workflow will ask one targeted follow-up.",
             "- Do not add surrounding prose or Markdown.",
             "- Complete action top-level fields: action, payload, purpose, expectations, yield_motion_to.",
-            "",
+            "- The entity (user/agent) taking the current action decides who's turn it is next by 'yield_motion_to' to the entry who's turn is next.",
+            "    So,  yield_motion_to to yourself,  to continue/keep working. Avoid yield_motion_to to 'system' or 'null'",
             f"HOT ACTIONS WITH PAYLOAD EXAMPLES (adaptive, max={self.HOT_ACTION_BUFFER_MAX}, token_budget={self.PROMPT_SCHEMA_TOKEN_BUDGET}):",
             "*** HOT ACTIONS START ***",
         ]
@@ -470,7 +485,9 @@ class FastTurnBasedWorkflow(BaseWorkflow):
         return "\n".join(rendered)
 
     def _targeted_action_prompt(self, action_name: str, validation_error: str | None = None) -> str:
-        action_cls = ACTIONS[action_name]
+        action_cls = self._action_class(action_name)
+        if action_cls is None:
+            raise KeyError(f"Unknown action for targeted prompt: {action_name}")
         payload_schema = self._payload_json_schema(action_cls)
         error_block = f"\nPrevious validation error to fix:\n{validation_error}\n" if validation_error else ""
         prompt = (
@@ -485,6 +502,8 @@ class FastTurnBasedWorkflow(BaseWorkflow):
             "*** Recent Context End ***\n\n"
             "Emit exactly one valid JSON action object and no surrounding prose or Markdown.\n"
             "Top-level fields must be: action, payload, purpose, expectations, yield_motion_to.\n"
+            "The entity (user/agent) taking the current action decides who's turn it is next by 'yield_motion_to' to the entry who's turn is next.\n" 
+            "So, yield_motion_to yourself to continue/keep working uninterupted. Avoid yield_motion_to to 'system' or 'null'.\n"
             f"The top-level action field must be {action_name!r}.\n"
             "Payload schema/example:\n"
             f"{payload_schema}\n"
@@ -560,6 +579,25 @@ class FastTurnBasedWorkflow(BaseWorkflow):
         diagnostics = self.context_manager.get_context_diagnostics()
         active_names = self._active_action_names()
 
+        ctx_diagnostics = self.context_manager.get_context_diagnostics()
+        #[HINT] ctx_diagnostics = {
+        #    "current_ctx_tokens": self.current_ctx_tokens,
+        #    "max_ctx_tokens": self.max_ctx_tokens,
+        #    "utilization": utilization,
+        #    "utilization_pct": utilization * 100,
+        #    "should_rebuild": self.should_rebuild(),
+        #    "rebuild_threshold": self.rebuild_threshold,
+        #    "num_entries": len(self.current_ctx),
+        #    "avg_tokens_per_entry": avg_tokens,
+        #    "rebuild_count": self.rebuild_count,
+        #    "total_appends": self.total_appends,
+        #    "context_version": self.context_version,
+        #    "last_rebuild": self.last_rebuild_timestamp,
+        #    "snapshots_available": len(self.context_history)
+        #}
+        CTX_INFO = f"[Context Window][Diagnostics][Utilization: {round(diagnostics['utilization_pct'], 2)}% ({diagnostics['current_ctx_tokens']}/{diagnostics['max_ctx_tokens']}) tks | System Forced rebuild @{100.0*ctx_diagnostics['rebuild_threshold']}%]"
+
+        #print(f"[!!!!!] ACTION SPACE : {self._hybrid_action_prompt()}")
         AGENT_PROMPT = (
             f"{self.agent_role_prompt}\n\n"
             "Below is the context formed from the current chat history:\n"
@@ -573,6 +611,9 @@ class FastTurnBasedWorkflow(BaseWorkflow):
             f"{self.AGENT_BEHAVIOUR}\n"
             f"*** Best Practices End *** \n"
             f"*** WORKFLOW RULES Start *** \n"
+            "*** Context Window Hygen:***\n"
+            f"{CTX_INFO}\n"
+            "[NOTE] Higher context window utilization (above 40 % ) results in degraded ability to make good decisions.\n"
             f"{self.WF_RULES}\n"
             "*** WORKFLOW RULES End *** \n\n"
             f"{self._hybrid_action_prompt()}\n"
@@ -641,10 +682,16 @@ class FastTurnBasedWorkflow(BaseWorkflow):
         # Targeted second-step prompt. This is intentionally much smaller than
         # the first prompt: no full context, no hot buffer, no cold inventory.
         action_prompt = self._targeted_action_prompt(next_action_name, validation_error=validation_error)
-        payload_schema = self._payload_json_schema(ACTIONS[next_action_name])
+        target_action_cls = self._action_class(next_action_name)
+        if target_action_cls is None:
+            self._record_validation_error(next_action_name, "Unknown selected action", phase="targeted_unknown_action")
+            self.WORKFLOW_TURN = "user"
+            self.update_history(actor="system", content=f"[ERROR] Unknown selected action: {next_action_name}", action={"action": "system_error"}, log_console=True)
+            return
+        payload_schema = self._payload_json_schema(target_action_cls)
 
         if "structured_output" in getattr(actor, "capabilities", []):
-            response = actor.get_structured_output(user_prompt=action_prompt, output_format=self.Actions)
+            response = actor.get_structured_output(user_prompt=action_prompt, output_format=target_action_cls)
         else:
             bad_format, response, raw_response, result = actor.format_agent_response(action_prompt, payload_schema)
             if bad_format:

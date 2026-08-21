@@ -379,6 +379,30 @@ class GuiRuntime:
         self.emit("dashboard_created", asdict(dashboard))
         return asdict(dashboard)
 
+    def _truthy(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _should_open_after_panel_add(self, data: Dict[str, Any], panel: DashboardPanel, dashboard: Dashboard) -> bool:
+        """Decide whether adding a dashboard panel should make that dashboard visible.
+
+        Agent/actionbox dashboard panel creation is a visual action; by default it
+        should produce visible feedback. Callers that are building a dashboard in
+        batches, such as publish_dashboard, can pass open_after_add=False and open
+        once after all panels are installed.
+        """
+        for key in ("open_after_add", "open", "auto_open"):
+            if key in data:
+                return self._truthy(data.get(key))
+        actor = str(data.get("created_by") or panel.created_by or "").lower()
+        source = str(data.get("source") or panel.source or dashboard.source or "").lower()
+        return actor in {"agent", "actionbox"} or source in {"agent", "actionbox"}
+
     def add_dashboard_panel(self, data: Dict[str, Any]) -> Dict[str, Any]:
         dashboard = self._find_dashboard(data.get("dashboard_id"))
         if dashboard is None:
@@ -416,7 +440,10 @@ class GuiRuntime:
         dashboard.panels = [p for p in dashboard.panels if p.id != panel.id]
         dashboard.panels.append(panel)
         dashboard.updated_at = now_ts()
-        self.emit("dashboard_panel_added", {"dashboard": asdict(dashboard), "panel": asdict(panel)})
+        payload = {"dashboard": asdict(dashboard), "panel": asdict(panel)}
+        self.emit("dashboard_panel_added", payload)
+        if self._should_open_after_panel_add(data, panel, dashboard):
+            payload["opened"] = self.open_dashboard(dashboard_id=dashboard.id)
         return asdict(panel)
 
     def update_dashboard_panel(self, panel_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -625,7 +652,8 @@ class GuiControllerClient:
                 session_id=panel.get("session_id", session_id),
                 workflow=panel.get("workflow", workflow),
                 host_status=panel.get("host_status", host_status),
-                **{k: v for k, v in panel.items() if k not in {"source", "universe", "created_by", "session_id", "workflow", "host_status"}},
+                open_after_add=False,
+                **{k: v for k, v in panel.items() if k not in {"source", "universe", "created_by", "session_id", "workflow", "host_status", "open_after_add", "open", "auto_open"}},
             ))
         opened = self.controller.open_dashboard(dashboard_id=dashboard.get("id")) if open_after_create else None
         note = self.controller.notify(message=f"Agent opened dashboard: {dashboard.get('name')}", level="info", source=source) if open_after_create else None

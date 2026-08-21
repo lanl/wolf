@@ -20,6 +20,8 @@ from framework.workflows.workflow_models import (
 from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
 from framework.workflows.enhanced_input import interactive_input_line_wrapped
+from framework.workflows.action_registry import get_default_action_registry
+from framework.workflows.action_validation import ActionValidationError, validate_action_response
 
 
 def normalize_payload(payload: Dict, actor: str) -> Dict:
@@ -368,6 +370,7 @@ class BaseWorkflow:
         self.schema_to_use = self.full_schema_string
         self.agent_role_prompt = self.session.agent_role_prompt
         self.action_names_to_use = None
+        self.action_registry = get_default_action_registry()
         # Let infrastructure-level CLI commands inspect/mutate workflow state.
         try:
             self.infra.cli_workflow = self
@@ -457,17 +460,39 @@ class BaseWorkflow:
         self.save_session_state()
 
     def normalize_and_validate_agent_response(self, response, actor:str):
-        try:
-            normalized = normalize_payload(response, actor)
-        except Exception as exc:
-            console.print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to normalize agent_response:\n type(response) = {type(response)} \n response = {response}")
-            return True, f"[payload normalization error] {exc}", None, None
-        try:
-            action_obj = self.action_adapter.validate_python(normalized)
-        except Exception as exc:
-            console.print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to validate agent_response:\n type(response) = {type(response)} \n response = {response}")
-            return True, f"[Normalized payload validation error] {exc}", None, normalized
-        return False, None, action_obj, normalized
+        """Normalize and validate an agent action response using staged validation.
+
+        Compatibility return shape is preserved:
+            (bad_format, err_msg, action_obj, normalized)
+
+        The old implementation validated against ``self.action_adapter`` which is
+        usually a Pydantic discriminated union. That made runtime validation fail
+        with giant tagged-union errors. The new path validates only the selected
+        action class after envelope validation, registry lookup, and allowed-action
+        checks.
+        """
+        registry = getattr(self, "action_registry", None) or get_default_action_registry()
+        allowed_actions = getattr(self, "action_names_to_use", None)
+        validated = validate_action_response(
+            response,
+            registry=registry,
+            allowed_actions=allowed_actions,
+            actor=actor,
+        )
+        if isinstance(validated, ActionValidationError):
+            console.print(
+                "[!][ERROR][normalize_and_validate_agent_response()] "
+                f"stage={validated.stage} action={validated.action} message={validated.message}"
+            )
+            normalized = response if isinstance(response, dict) else None
+            err_msg = f"[Action validation {validated.stage}] {validated.message}"
+            try:
+                details = validated.model_dump(mode="json")
+                err_msg = f"{err_msg}: {details}"
+            except Exception:
+                pass
+            return True, err_msg, None, normalized
+        return False, None, validated.action_obj, validated.normalized
 
     def format_agent_response(self, prompt, schema, agent, max_trial=5):
         ntrial = 0

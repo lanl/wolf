@@ -4,7 +4,7 @@ Wolf GUI is a **visual-workspace-first** interface for WOLF.
 
 Instead of putting chat at the center, Wolf GUI treats the screen as a shared work surface:
 - browser pages,
-- Glance/CAD/mesh views,
+- CAD/mesh views,
 - generated dashboards/reports,
 - actionbox-hosted mini-apps.
 
@@ -78,7 +78,6 @@ Wolf GUI is the **human-facing visual collaboration surface** on top of those la
 - Full-screen workspace iframe
 - Workspace modes:
   - Browser
-  - Glance (URL-based)
   - Dashboard mode (multi-panel)
 
 ### 4.2 Floating + dockable + resizable agent panel
@@ -255,7 +254,7 @@ Expected default:
 - browser opens automatically (depending on launch config)
 
 ### Typical usage flow
-1. Open/prepare workspace (URL/Glance/dashboard)
+1. Open/prepare workspace (URL/dashboard)
 2. Optionally annotate
 3. Open Gateway modal and connect (auth → session → connect)
 4. Fetch/adjust agent & policy params if needed

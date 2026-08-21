@@ -144,7 +144,7 @@ wf_workspace/                              # Runtime session directories, snapsh
 ### 1. Clone the repository
 
 ```bash
-git clone ssh://git@re-git.lanl.gov:10022/mada/wolf.git
+git clone git@github.com:lanl/wolf.git
 cd wolf
 ```
 

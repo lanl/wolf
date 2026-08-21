@@ -77,6 +77,19 @@ def _dedupe_actions(actions: List[str]) -> List[str]:
     return list(dict.fromkeys(a for a in actions if a))
 
 
+def _default_run_control() -> Dict[str, Any]:
+    return {
+        "run_id": None,
+        "status": "idle",
+        "pause_requested": False,
+        "stop_requested": False,
+        "reassess_requested": False,
+        "pending_user_messages": [],
+        "step": 0,
+        "updated_at": datetime.now().isoformat(),
+    }
+
+
 class AgentConfig(BaseModel):
     """Configuration for a WOLF gateway runtime's main agent."""
 
@@ -322,6 +335,8 @@ class ConnectionManager:
                     "reachable": None,
                     "checked_at": None,
                 },
+                "run_control": _default_run_control(),
+                "active_task": None,
                 "session_dir": session["session_dir"],
                 "db_client": session.get("db_client"),
                 "lock": asyncio.Lock(),
@@ -402,6 +417,11 @@ class WolfGateway:
 
     def _redact_value(self, key: str, value: Any) -> Any:
         key_l = str(key).lower()
+        # api_key_var is the *name* of an environment variable, not the secret
+        # value itself.  Redacting it makes the GUI lose the configured key
+        # source on later saves/reconnects.
+        if key_l == "api_key_var":
+            return value
         if any(secret in key_l for secret in self.SECRET_KEYS):
             if value in (None, ""):
                 return value
@@ -419,14 +439,29 @@ class WolfGateway:
         return value
 
     def _resolve_action_names(self, config: Dict[str, Any]) -> List[str]:
+        policy = str(config.get("action_policy") or "limited").strip().lower()
+        known = list(ACTION_NAMES)
         explicit = config.get("action_names")
         if explicit:
             if isinstance(explicit, str):
-                return [a.strip() for a in explicit.split(",") if a.strip()]
-            return list(explicit)
+                actions = [a.strip() for a in explicit.split(",") if a.strip()]
+            else:
+                actions = list(explicit)
 
-        policy = str(config.get("action_policy") or "limited").strip().lower()
-        known = list(ACTION_NAMES)
+            # Explicit action_names is a base allowlist, but gateway-required
+            # capability toggles must still be able to append their companion
+            # actions. Otherwise stale saved policy lists can silently suppress
+            # newly added GUI actions such as screenshot capture.
+            if config.get("enable_gui_capture") or policy in {"advanced", "master"}:
+                actions.extend(["gui_capture_url", "gui_capture_workspace"])
+            if policy != "safe":
+                actions.extend(a for a in GATEWAY_GUI_ACTIONS if a not in actions)
+            if config.get("enable_write") and "write_file" not in actions:
+                actions.append("write_file")
+            if config.get("enable_syscall") and "run_syscall" not in actions:
+                actions.append("run_syscall")
+            return _dedupe_actions(actions)
+
 
         if policy == "safe":
             actions = list(GATEWAY_SAFE_ACTIONS)
@@ -607,7 +642,14 @@ class WolfGateway:
             self.manager.get_or_create_session(account_id=current_account, session_id=session_id)
             if not self.manager.session_belongs_to_account(session_id, current_account):
                 raise HTTPException(status_code=403, detail="Forbidden")
-            current_config = self.manager.sessions[session_id].agent_config or self.manager.default_config()
+            current_config = copy.deepcopy(self.manager.sessions[session_id].agent_config or self.manager.default_config())
+            updates = copy.deepcopy(updates or {})
+            for secret_key in ("api_key", "api_key_var"):
+                if secret_key in updates:
+                    raw = updates.get(secret_key)
+                    text = str(raw or "")
+                    if raw in (None, "") or "redacted" in text.lower() or "***" in text:
+                        updates.pop(secret_key, None)
             current_config.update(updates)
 
             # Policy/privilege updates must not reset chat history or context.
@@ -834,12 +876,31 @@ class WolfGateway:
                             visual_context = data.get("visual_context")
                             if visual_context is None and isinstance(data.get("metadata"), dict):
                                 visual_context = data.get("metadata", {}).get("visual_context")
-                            await self._handle_chat_message(
-                                data.get("content", ""),
-                                session_id,
-                                sender=data.get("sender") or participant_id,
-                                visual_context=visual_context,
-                            )
+                            runtime = self.manager.get_runtime(session_id)
+                            control = self._run_control_for(runtime) if runtime else {}
+                            active_statuses = {"running", "pause_requested", "paused", "resume_requested", "stop_requested"}
+                            if runtime and control.get("status") in active_statuses and not data.get("force_new_run"):
+                                await self._handle_agent_control(
+                                    {
+                                        "command": "reassess_after_step",
+                                        "content": data.get("content", ""),
+                                        "sender": data.get("sender") or participant_id,
+                                        "visual_context": visual_context,
+                                    },
+                                    session_id,
+                                    participant_id,
+                                )
+                            else:
+                                task = asyncio.create_task(self._handle_chat_message(
+                                    data.get("content", ""),
+                                    session_id,
+                                    sender=data.get("sender") or participant_id,
+                                    visual_context=visual_context,
+                                ))
+                                if runtime is not None:
+                                    runtime["active_task"] = task
+                        elif msg_type == "agent_control":
+                            await self._handle_agent_control(data, session_id, participant_id)
                         elif msg_type == "gui_client_hello":
                             requested = str(data.get("requested_route") or data.get("gui_action_route") or "auto").strip().lower()
                             gui_url = data.get("gui_url")
@@ -860,19 +921,147 @@ class WolfGateway:
                                 session_id,
                             )
                         elif msg_type == "gui_command_result":
-                            await self.manager.send_message_to_session(
-                                {
-                                    "type": "gui_command_result",
-                                    "command_id": data.get("command_id"),
-                                    "ok": data.get("ok"),
-                                    "content": data.get("content") or ("GUI command completed." if data.get("ok") else "GUI command failed."),
-                                    "result": data.get("result"),
-                                    "error": data.get("error"),
-                                    "timestamp": datetime.now().isoformat(),
-                                    "session_id": session_id,
-                                },
-                                session_id,
-                            )
+                            gui_result_event = {
+                                "type": "gui_command_result",
+                                "command_id": data.get("command_id"),
+                                "action": data.get("action"),
+                                "ok": data.get("ok"),
+                                "content": data.get("content") or ("GUI command completed." if data.get("ok") else "GUI command failed."),
+                                "result": data.get("result"),
+                                "error": data.get("error"),
+                                "timestamp": datetime.now().isoformat(),
+                                "session_id": session_id,
+                            }
+
+                            # Important bridge: deferred GUI commands execute in the
+                            # browser client after the workflow step has already
+                            # returned. Broadcasting the websocket event is not
+                            # enough; append the result into the WOLF workflow
+                            # history so the next agent turn can use capture IDs,
+                            # image paths, errors, and GUI command metadata.
+                            try:
+                                runtime = self.manager.get_runtime(session_id)
+                                if runtime:
+                                    wf = runtime.get("wf")
+                                    infra = runtime.get("infra")
+                                    result_text = json.dumps(gui_result_event, indent=2, sort_keys=True, default=str)[:40000]
+                                    action_label = data.get("action") or "gui_command_result"
+                                    history_payload = {
+                                        "action": "gui_command_result",
+                                        "gui_action": action_label,
+                                        "command_id": data.get("command_id"),
+                                        "ok": data.get("ok"),
+                                    }
+                                    if infra is not None and hasattr(infra, "append_chat_history"):
+                                        infra.append_chat_history(
+                                            actor="system",
+                                            content=f"[GUI COMMAND RESULT] {action_label}:\n{result_text}",
+                                            action=history_payload,
+                                            log_console=True,
+                                        )
+                                    elif wf is not None and hasattr(wf, "update_history"):
+                                        wf.update_history(
+                                            actor="system",
+                                            content=f"[GUI COMMAND RESULT] {action_label}:\n{result_text}",
+                                            action=history_payload,
+                                            log_console=True,
+                                        )
+
+                                    def _collect_capture_artifacts(value):
+                                        found = []
+                                        if isinstance(value, dict):
+                                            image_path = value.get("image_path")
+                                            capture_id = value.get("capture_id")
+                                            if image_path or capture_id:
+                                                found.append({
+                                                    "ok": value.get("ok"),
+                                                    "status": value.get("status"),
+                                                    "capture_id": capture_id,
+                                                    "source_url": value.get("source_url"),
+                                                    "image_path": image_path,
+                                                    "metadata_path": value.get("metadata_path"),
+                                                    "width": value.get("width"),
+                                                    "height": value.get("height"),
+                                                    "format": value.get("format"),
+                                                    "error": value.get("error"),
+                                                })
+                                            for key in ("results", "captures", "items"):
+                                                nested = value.get(key)
+                                                if isinstance(nested, list):
+                                                    for item in nested:
+                                                        found.extend(_collect_capture_artifacts(item))
+                                        elif isinstance(value, list):
+                                            for item in value:
+                                                found.extend(_collect_capture_artifacts(item))
+                                        return found
+
+                                    capture_artifacts = _collect_capture_artifacts(data.get("result"))
+                                    capture_artifacts = [a for a in capture_artifacts if a.get("image_path") or a.get("capture_id")]
+                                    if capture_artifacts:
+                                        runtime.setdefault("pending_gui_capture_artifacts", []).extend(capture_artifacts)
+                                        gui_result_event["capture_artifacts"] = capture_artifacts
+                                        gui_result_event["image_references"] = [
+                                            {"name": Path(str(a.get("image_path") or "")).name, "path": a.get("image_path")}
+                                            for a in capture_artifacts
+                                            if a.get("image_path")
+                                        ]
+                                    if wf is not None and hasattr(wf, "save_session_state"):
+                                        wf.save_session_state()
+                            except Exception as bridge_exc:
+                                gui_result_event["history_bridge_error"] = f"{type(bridge_exc).__name__}: {bridge_exc}"
+
+                            await self.manager.send_message_to_session(gui_result_event, session_id)
+
+                            try:
+                                runtime = self.manager.get_runtime(session_id)
+                                pending_command = None
+                                if runtime:
+                                    pending = runtime.setdefault("pending_gui_commands", {})
+                                    command_id = data.get("command_id")
+                                    if command_id:
+                                        pending_command = pending.pop(command_id, None)
+                                action_label = data.get("action") or (pending_command or {}).get("action")
+                                should_continue = bool((pending_command or {}).get("auto_continue")) or self._should_auto_continue_gui_command(action_label)
+                                if runtime and should_continue:
+                                    existing_continue = runtime.get("gui_auto_continue_task")
+                                    if existing_continue is not None and not existing_continue.done():
+                                        await self.manager.send_message_to_session(
+                                            {
+                                                "type": "workflow_status",
+                                                "status": "queued",
+                                                "content": "GUI command result received while an agent continuation is already running; result has been appended to history.",
+                                                "action": action_label,
+                                                "command_id": data.get("command_id"),
+                                                "timestamp": datetime.now().isoformat(),
+                                                "session_id": session_id,
+                                            },
+                                            session_id,
+                                        )
+                                    else:
+                                        previous_task = runtime.get("active_task")
+                                        task = asyncio.create_task(
+                                            self._auto_continue_after_gui_command_result(
+                                                session_id,
+                                                action=action_label,
+                                                command_id=data.get("command_id"),
+                                                ok=data.get("ok"),
+                                                previous_task=previous_task,
+                                            )
+                                        )
+                                        runtime["gui_auto_continue_task"] = task
+                                        runtime["active_task"] = task
+                            except Exception as auto_exc:
+                                await self.manager.send_message_to_session(
+                                    {
+                                        "type": "workflow_error",
+                                        "status": "error",
+                                        "content": f"GUI command result stored, but auto-continuation could not be scheduled: {type(auto_exc).__name__}: {auto_exc}",
+                                        "error": str(auto_exc),
+                                        "timestamp": datetime.now().isoformat(),
+                                        "session_id": session_id,
+                                    },
+                                    session_id,
+                                )
                         elif msg_type == "participant_message":
                             await self._handle_participant_message(data, session_id, participant_id)
                         elif msg_type == "ping":
@@ -899,6 +1088,201 @@ class WolfGateway:
                 console.print(f"[!] CRITICAL WebSocket handler error: {e}")
                 console.print(traceback.format_exc())
                 self.manager.disconnect(account_id, session_id, participant_id)
+
+    def _run_control_for(self, runtime: Dict[str, Any]) -> Dict[str, Any]:
+        control = runtime.setdefault("run_control", _default_run_control())
+        for key, value in _default_run_control().items():
+            control.setdefault(key, copy.deepcopy(value))
+        return control
+
+    def _run_control_snapshot(self, session_id: str, control: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "run_control_state",
+            "session_id": session_id,
+            "run_id": control.get("run_id"),
+            "status": control.get("status") or "idle",
+            "pause_requested": bool(control.get("pause_requested")),
+            "stop_requested": bool(control.get("stop_requested")),
+            "reassess_requested": bool(control.get("reassess_requested")),
+            "pending_user_message_count": len(control.get("pending_user_messages") or []),
+            "step": int(control.get("step") or 0),
+            "timestamp": datetime.now().isoformat(),
+            "content": f"Agent run status: {control.get('status') or 'idle'}",
+        }
+
+    async def _broadcast_run_control(self, session_id: str, control: Dict[str, Any], content: Optional[str] = None):
+        event = self._run_control_snapshot(session_id, control)
+        if content:
+            event["content"] = content
+        await self.manager.send_message_to_session(event, session_id)
+
+    def _should_auto_continue_gui_command(self, action: Any) -> bool:
+        """Return true for deferred GUI commands whose result should feed a follow-up agent turn."""
+        return str(action or "").strip() in {"gui_get_visual_context", "gui_capture_url", "gui_capture_workspace"}
+
+    def _gui_command_continuation_prompt(self, action: Any, command_id: Any, ok: Any) -> str:
+        status = "succeeded" if ok else "failed"
+        return (
+            "[SYSTEM CONTINUATION: A deferred GUI browser command result is now available in the "
+            "conversation history.\n"
+            f"Command: {action or 'gui_command'}\n"
+            f"Command id: {command_id or 'unknown'}\n"
+            f"Status: {status}\n\n"
+            "Use the most recent [GUI COMMAND RESULT] entry to answer the user's original request. "
+            "Do not repeat the same GUI command unless the result is missing or unusable. "
+            "If the result reports cross-origin iframe, DOM, pixel, or permission limitations, briefly "
+            "explain the limitation and answer using the available dashboard/workspace metadata. "
+            "Respond to the user with a normal send_message action.]"
+        )
+
+    async def _auto_continue_after_gui_command_result(
+        self,
+        session_id: str,
+        *,
+        action: Any,
+        command_id: Any,
+        ok: Any,
+        previous_task: Any = None,
+    ) -> None:
+        """Start a follow-up agent turn after browser-deferred GUI context/capture results.
+
+        Deferred GUI commands complete after the workflow step that requested them.
+        Without this continuation, the command result is stored in history but the
+        agent never gets another turn to consume it, leaving the user with a silent
+        "GUI command completed" notice and no assistant response.
+        """
+        runtime = self.manager.get_runtime(session_id)
+        if not runtime:
+            await self.manager.send_message_to_session(
+                {
+                    "type": "workflow_error",
+                    "status": "error",
+                    "content": "GUI command result arrived, but no runtime exists to continue the agent turn.",
+                    "error": "No runtime configured for GUI command auto-continuation.",
+                    "timestamp": datetime.now().isoformat(),
+                    "session_id": session_id,
+                },
+                session_id,
+            )
+            return
+
+        try:
+            current = asyncio.current_task()
+            if previous_task is not None and previous_task is not current and not previous_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(previous_task), timeout=15)
+                except asyncio.TimeoutError:
+                    await self.manager.send_message_to_session(
+                        {
+                            "type": "workflow_status",
+                            "status": "waiting",
+                            "content": "GUI command result is ready; waiting for the current agent step lock before continuing.",
+                            "timestamp": datetime.now().isoformat(),
+                            "session_id": session_id,
+                        },
+                        session_id,
+                    )
+                except Exception:
+                    # The previous task may have failed; still attempt to continue so
+                    # the agent can explain the GUI command result or failure.
+                    pass
+
+            control = self._run_control_for(runtime)
+            control["status"] = "running"
+            control["run_id"] = f"run_{uuid.uuid4().hex[:12]}"
+            control["pause_requested"] = False
+            control["stop_requested"] = False
+            control["reassess_requested"] = False
+            control["updated_at"] = datetime.now().isoformat()
+            await self._broadcast_run_control(session_id, control, content=f"GUI command result received; continuing agent response for {action}.")
+            await self.manager.send_message_to_session(
+                {
+                    "type": "workflow_status",
+                    "status": "continuing",
+                    "content": f"GUI command result received; asking agent to answer using {action} result.",
+                    "action": action,
+                    "command_id": command_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "session_id": session_id,
+                },
+                session_id,
+            )
+
+            prompt = self._gui_command_continuation_prompt(action, command_id, ok)
+            await self._handle_chat_message(prompt, session_id, sender="system_gui_continuation", visual_context=None)
+        except Exception as exc:
+            try:
+                await self.manager.send_message_to_session(
+                    {
+                        "type": "workflow_error",
+                        "status": "error",
+                        "content": f"GUI command auto-continuation failed: {type(exc).__name__}: {exc}",
+                        "error": str(exc),
+                        "timestamp": datetime.now().isoformat(),
+                        "session_id": session_id,
+                    },
+                    session_id,
+                )
+            except Exception:
+                pass
+        finally:
+            runtime = self.manager.get_runtime(session_id)
+            if runtime and runtime.get("gui_auto_continue_task") is asyncio.current_task():
+                runtime.pop("gui_auto_continue_task", None)
+
+    async def _handle_agent_control(self, data: Dict[str, Any], session_id: str, participant_id: str = "gui"):
+        runtime = self.manager.get_runtime(session_id)
+        if not runtime:
+            await self.manager.send_message_to_session({"type": "error", "content": "No runtime configured for agent control.", "timestamp": datetime.now().isoformat(), "session_id": session_id}, session_id)
+            return
+        control = self._run_control_for(runtime)
+        command = str(data.get("command") or data.get("action") or "state_request").strip().lower()
+        now = datetime.now().isoformat()
+        control["updated_at"] = now
+        content = "Agent control state requested."
+
+        if command in {"pause", "pause_after_step"}:
+            control["pause_requested"] = True
+            if control.get("status") in {"idle", "completed", "failed", "stopped"}:
+                content = "No active run to pause."
+            else:
+                control["status"] = "pause_requested"
+                content = "Pause requested; agent will pause at the next safe step boundary."
+        elif command in {"resume", "resume_run"}:
+            control["pause_requested"] = False
+            control["status"] = "running" if control.get("run_id") else "idle"
+            content = "Resume requested."
+        elif command in {"stop", "stop_after_step", "cancel", "cancel_after_step"}:
+            control["stop_requested"] = True
+            if control.get("status") in {"idle", "completed", "failed", "stopped"}:
+                control["status"] = "stopped"
+                content = "No active run; marked stopped."
+            else:
+                control["status"] = "stop_requested"
+                content = "Stop requested; agent will stop at the next safe step boundary."
+        elif command in {"reassess", "reassess_after_step", "append_user_message"}:
+            msg = str(data.get("content") or data.get("message") or "").strip()
+            if msg:
+                control.setdefault("pending_user_messages", []).append({
+                    "content": msg,
+                    "sender": data.get("sender") or participant_id,
+                    "visual_context": data.get("visual_context") if isinstance(data.get("visual_context"), dict) else {},
+                    "created_at": now,
+                })
+                control["reassess_requested"] = True
+                if control.get("status") == "idle":
+                    content = "Reassessment message queued, but no run is active."
+                else:
+                    content = "Reassessment queued; agent will incorporate the message at the next safe checkpoint."
+            else:
+                content = "No reassessment message content supplied."
+        elif command in {"state", "state_request", "status"}:
+            content = "Agent control state."
+        else:
+            await self.manager.send_message_to_session({"type": "error", "content": f"Unsupported agent control command: {command}", "timestamp": now, "session_id": session_id}, session_id)
+            return
+
+        await self._broadcast_run_control(session_id, control, content=content)
 
     async def _handle_chat_message(self, content: str, session_id: str, sender: str = "user", visual_context: Optional[Dict[str, Any]] = None):
         runtime = self.manager.get_runtime(session_id)
@@ -929,6 +1313,35 @@ class WolfGateway:
                 f"{vc_text}"
             )
 
+        # Deferred GUI capture commands complete after the workflow step that
+        # requested them.  Store their image artifacts in the runtime, then
+        # attach them to the next agent turn as normal multimodal <input>
+        # references so a vision-capable model can inspect actual pixels.
+        pending_capture_artifacts = runtime.pop("pending_gui_capture_artifacts", []) or []
+        if pending_capture_artifacts:
+            artifact_lines = [
+                "",
+                "[Deferred GUI capture artifact(s) from the previous GUI command result are attached below. "
+                "Use these image pixels to answer the user's question about what is visible. "
+                "If your model lacks vision capability, report the artifact metadata and image path instead.]",
+            ]
+            for idx, artifact in enumerate(pending_capture_artifacts, start=1):
+                if not isinstance(artifact, dict):
+                    continue
+                compact = {
+                    k: artifact.get(k)
+                    for k in ("capture_id", "source_url", "image_path", "metadata_path", "width", "height", "status", "ok", "error")
+                    if artifact.get(k) is not None
+                }
+                try:
+                    artifact_lines.append(f"capture_artifact_{idx}: {json.dumps(compact, sort_keys=True)}")
+                except Exception:
+                    artifact_lines.append(f"capture_artifact_{idx}: {compact}")
+                image_path = str(artifact.get("image_path") or "").strip()
+                if image_path:
+                    artifact_lines.append(f"<input> {image_path} </input>")
+            workflow_content = f"{workflow_content}\n" + "\n".join(artifact_lines)
+
         config = runtime.get("config", {}) or {}
         action_names = self._resolve_action_names(config)
         execution_policy = self._resolve_execution_policy(config)
@@ -954,6 +1367,20 @@ class WolfGateway:
             session_id,
         )
 
+        control = self._run_control_for(runtime)
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        control.update({
+            "run_id": run_id,
+            "status": "running",
+            "pause_requested": False,
+            "stop_requested": False,
+            "reassess_requested": False,
+            "pending_user_messages": [],
+            "step": 0,
+            "updated_at": datetime.now().isoformat(),
+        })
+        await self._broadcast_run_control(session_id, control, content="Agent run started.")
+
         try:
             async with runtime["lock"]:
                 wf: GatewayActionWorkflow = runtime["wf"]
@@ -965,15 +1392,61 @@ class WolfGateway:
                     max_steps=max_steps,
                     log_console=False,
                     execution_policy=execution_policy,
+                    control_state=control,
                 )
             for event in events:
+                if event.get("step") is not None:
+                    try:
+                        control["step"] = max(int(control.get("step") or 0), int(event.get("step") or 0))
+                    except Exception:
+                        pass
                 event.setdefault("session_id", session_id)
                 await self.manager.send_message_to_session(event, session_id)
                 gui_command = self._gui_command_from_workflow_event(event)
                 if gui_command:
                     gui_command.setdefault("session_id", session_id)
+                    try:
+                        pending = runtime.setdefault("pending_gui_commands", {})
+                        command_id = gui_command.get("command_id")
+                        if command_id:
+                            pending[command_id] = {
+                                "command_id": command_id,
+                                "action": gui_command.get("action"),
+                                "payload": gui_command.get("payload") if isinstance(gui_command.get("payload"), dict) else {},
+                                "workflow_event": event,
+                                "auto_continue": self._should_auto_continue_gui_command(gui_command.get("action")),
+                                "created_at": datetime.now().isoformat(),
+                            }
+                    except Exception:
+                        pass
                     await self.manager.send_message_to_session(gui_command, session_id)
+            stop_reason = None
+            for event in reversed(events):
+                if isinstance(event, dict) and event.get("type") == "workflow_status" and event.get("status") == "done":
+                    stop_reason = str(event.get("stop_reason") or "").strip().lower()
+                    break
+            saw_workflow_error = any(isinstance(event, dict) and event.get("type") == "workflow_error" for event in events)
+
+            if control.get("status") not in {"stopped", "failed"}:
+                if stop_reason == "error" or saw_workflow_error:
+                    control["status"] = "failed"
+                else:
+                    control["status"] = "completed"
+            control["pause_requested"] = False
+            control["stop_requested"] = False
+            control["reassess_requested"] = False
+            control["run_id"] = None
+            control["updated_at"] = datetime.now().isoformat()
+            final_content = "Agent run failed." if control.get("status") == "failed" else "Agent run complete."
+            await self._broadcast_run_control(session_id, control, content=final_content)
         except Exception as e:
+            control["status"] = "failed"
+            control["run_id"] = None
+            control["updated_at"] = datetime.now().isoformat()
+            try:
+                await self._broadcast_run_control(session_id, control, content=f"Agent run failed: {str(e)}")
+            except Exception:
+                pass
             await self.manager.send_message_to_session(
                 {"type": "error", "content": f"Workflow error: {str(e)}", "timestamp": datetime.now().isoformat(), "session_id": session_id},
                 session_id,

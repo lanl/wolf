@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from rich.errors import MarkupError
+
 from framework.utils.io_tools import console, jsonfy, expand_dict
 from framework.utils.tokenomics import (
     num_tokens_from_string,
@@ -315,8 +317,23 @@ class BaseInfrastructure:
         if log_console:
             self.console_log(ctx)
 
+    def _safe_console_print(self, text: Any) -> None:
+        """Print via Rich, falling back to literal text if markup parsing fails.
+
+        Conversation/history text may contain arbitrary bracket sequences that
+        Rich interprets as markup. A malformed or literal closing tag can raise
+        MarkupError and should not be allowed to crash the CLI.
+
+        This helper only prints the already-computed text it receives; it does
+        not build context or update display-head counters.
+        """
+        try:
+            console.print(text)
+        except MarkupError:
+            console.print(str(text), markup=False)
+
     def show_ctx(self):
-        console.print(self.CTX)
+        self._safe_console_print(self.CTX)
 
     def get_partial_ctx(self, idx0: int | None = None, idx1: int | None = None) -> str:
         i0 = 0 if idx0 is None else idx0
@@ -351,7 +368,10 @@ class BaseInfrastructure:
         return CTX
 
     def show_partial_ctx(self, idx0: int | None = None, idx1: int | None = None):
-        console.print(self.get_partial_ctx(idx0, idx1))
+        # Compute the partial context exactly once. show_updated_history() owns
+        # CONSOLE_HEAD advancement after this method returns.
+        partial_ctx = self.get_partial_ctx(idx0, idx1)
+        self._safe_console_print(partial_ctx)
 
     def show_updated_history(self, console_head: int | None = None):
         head = self.CONSOLE_HEAD if console_head is None else console_head

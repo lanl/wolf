@@ -60,6 +60,10 @@
     includeVisualContext: $("include-visual-context"),
     allowAgentInspect: $("allow-agent-inspect"),
     allowAgentCapture: $("allow-agent-capture"),
+    agentRunStatus: $("agent-run-status"),
+    agentPauseRun: $("agent-pause-run"),
+    agentResumeRun: $("agent-resume-run"),
+    agentStopRun: $("agent-stop-run"),
   };
 
   if (!els.overlay || !els.form) {
@@ -79,6 +83,13 @@
     username: "",
     participantId: "gui",
     lastError: "",
+    runStatus: "idle",
+    runId: "",
+    pauseRequested: false,
+    stopRequested: false,
+    reassessRequested: false,
+    pendingUserMessageCount: 0,
+    runStep: 0,
   };
   let state = loadState();
   let currentParams = {};
@@ -164,6 +175,7 @@
   function isRedactedSecret(key, value) {
     const k = String(key || "").toLowerCase();
     const v = String(value ?? "");
+    if (k === "api_key_var") return false;
     return /(api_key|token|password|secret|authorization)/.test(k) && /redacted|\*\*\*/i.test(v);
   }
 
@@ -338,6 +350,13 @@
     els.paramsEditor.value = JSON.stringify(merged, null, 2);
   }
 
+  function shortId(value) {
+    const raw = String(value || "");
+    if (!raw) return "";
+    if (raw.length <= 18) return raw;
+    return `${raw.slice(0, 8)}…${raw.slice(-6)}`;
+  }
+
   function setStatus(kind, text) {
     if (els.statusDot) els.statusDot.className = `wolf-gateway-dot ${kind || ""}`.trim();
     if (els.statusText) els.statusText.textContent = text;
@@ -379,6 +398,7 @@
         : "Not authenticated. Enter Gateway URL plus username/password, then click Authenticate.";
     }
     renderSessions();
+    renderRunControl();
 
     setDisabled(els.refreshSessions, !authed);
     setDisabled(els.createSession, !authed);
@@ -396,10 +416,10 @@
     if (els.submit) els.submit.textContent = authed ? "Re-authenticate" : "Authenticate";
     if (els.authenticate) els.authenticate.textContent = authed ? "Re-authenticate" : "Authenticate";
 
-    if (state.phase === "connected") setStatus("connected", `Gateway connected · ${state.accountId}/${state.sessionId}`);
+    if (state.phase === "connected") setStatus("connected", `Gateway connected · acct ${shortId(state.accountId)} · session ${shortId(state.sessionId)}`);
     else if (state.phase === "connecting") setStatus("testing", "Gateway connecting…");
     else if (state.phase === "error") setStatus("error", `Gateway error · ${state.lastError || "local workspace active"}`);
-    else if (authed) setStatus("", `Authenticated · ${state.accountId}${state.sessionId ? ` · selected ${state.sessionId}` : ""}`);
+    else if (authed) setStatus("", `Authenticated · acct ${shortId(state.accountId)}${state.sessionId ? ` · selected ${shortId(state.sessionId)}` : ""}`);
     else setStatus("", "Gateway disconnected · local workspace active");
   }
 
@@ -655,10 +675,10 @@
       } else {
         throw new Error(`Unsupported GUI command action: ${action}`);
       }
-      ws?.send(JSON.stringify({ type: "gui_command_result", command_id: commandId, ok: true, result, content: `GUI command completed: ${action}` }));
+      ws?.send(JSON.stringify({ type: "gui_command_result", command_id: commandId, action, ok: true, result, content: `GUI command completed: ${action}` }));
       addMessage("system", `GUI command completed: ${action}`, { gateway_event: event, compact: true });
     } catch (err) {
-      ws?.send(JSON.stringify({ type: "gui_command_result", command_id: commandId, ok: false, error: String(err?.message || err), content: `GUI command failed: ${action}` }));
+      ws?.send(JSON.stringify({ type: "gui_command_result", command_id: commandId, action, ok: false, error: String(err?.message || err), content: `GUI command failed: ${action}` }));
       addMessage("system", `GUI command failed: ${action}: ${String(err?.message || err)}`, { gateway_event: event, tone: "error" });
     }
   }
@@ -671,19 +691,81 @@
     if (type === "system") return addMessage("system", content || "Connected to gateway.", { gateway_event: event });
     if (type === "error" || type === "workflow_error") return addMessage("system", content || event.error || "Gateway error.", { gateway_event: event, tone: "error" });
     if (type === "agent_response") return addMessage("assistant", content, { gateway_event: event });
-    if (type === "workflow_status") return addMessage("system", `Workflow: ${content || event.status || "status"}`, { gateway_event: event, compact: true });
+    if (type === "run_control_state") {
+      applyRunControlState(event);
+      renderRunControl();
+      return addMessage("system", content || `Run status: ${state.runStatus}`, { gateway_event: event, compact: true });
+    }
+    if (type === "workflow_control") {
+      if (event?.status) state.runStatus = String(event.status);
+      renderRunControl();
+      return addMessage("system", content || `Workflow control: ${event.status || "update"}`, { gateway_event: event, compact: true });
+    }
+    if (type === "workflow_status") {
+      if (String(event?.status || "") === "done" && String(event?.stop_reason || "").toLowerCase() === "error") {
+        state.runStatus = "failed";
+        renderRunControl();
+      }
+      return addMessage("system", `Workflow: ${content || event.status || "status"}`, { gateway_event: event, compact: true });
+    }
     if (type === "policy_resolved") return addMessage("system", `Policy resolved: ${event.action_policy || "limited"}`, { gateway_event: event, compact: true });
     if (type === "gui_route_resolved") return addMessage("system", content || `GUI route: ${event.route || "auto"}`, { gateway_event: event, compact: true });
     if (type === "gui_command") { executeGatewayGuiCommand(event); return; }
     if (type === "gui_command_result") return addMessage("system", content || `GUI command result: ${event.ok ? "ok" : "failed"}`, { gateway_event: event, compact: true });
     if (type === "workflow_action") return addMessage("system", content || `Action: ${event.action || event.payload?.action || "action"}`, { gateway_event: event, card: true });
     if (type === "workflow_result") {
-      if (event.action === "send_message") return addMessage("assistant", content, { gateway_event: event });
-      return addMessage("system", `Result: ${event.action || "action"} — ${content || "completed"}`, { gateway_event: event, card: true });
+      const resultAction = event.action || event.payload?.action || event.normalized?.action || event.result?.action || "action";
+      if (resultAction === "send_message") return addMessage("assistant", content || event.payload?.message || event.payload?.content || event.message || "", { gateway_event: event, force_visible: true });
+      return addMessage("system", `Result: ${resultAction} — ${content || "completed"}`, { gateway_event: event, card: true });
     }
     if (type === "presence") return addMessage("system", content || "Presence updated.", { gateway_event: event, compact: true });
     if (type === "participant_message") return addMessage("assistant", content, { gateway_event: event });
     return addMessage("system", content || `Gateway event: ${type}`, { gateway_event: event });
+  }
+
+  function applyRunControlState(payload = {}) {
+    const status = String(payload.status || state.runStatus || "idle").trim() || "idle";
+    state.runStatus = status;
+    state.runId = String(payload.run_id || state.runId || "");
+    state.pauseRequested = Boolean(payload.pause_requested);
+    state.stopRequested = Boolean(payload.stop_requested);
+    state.reassessRequested = Boolean(payload.reassess_requested);
+    const pending = payload.pending_user_messages;
+    state.pendingUserMessageCount = Array.isArray(pending) ? pending.length : Number(payload.pending_user_message_count || state.pendingUserMessageCount || 0);
+    state.runStep = Number(payload.step ?? state.runStep ?? 0) || 0;
+  }
+
+  function renderRunControl() {
+    const status = String(state.runStatus || "idle");
+    const connected = isConnected();
+    const active = new Set(["running", "pause_requested", "paused", "resume_requested", "stop_requested"]);
+    const canPause = connected && (status === "running" || status === "resume_requested") && !state.pauseRequested;
+    const canResume = connected && status === "paused";
+    const canStop = connected && active.has(status) && status !== "stop_requested";
+
+    if (els.agentRunStatus) {
+      const pretty = status.replace(/_/g, " ").replace(/(^|\s)(\w)/g, (m) => m.toUpperCase());
+      els.agentRunStatus.textContent = pretty || "Idle";
+      els.agentRunStatus.className = `agent-run-status status-${status || "idle"}`;
+    }
+    setDisabled(els.agentPauseRun, !canPause);
+    setDisabled(els.agentResumeRun, !canResume);
+    setDisabled(els.agentStopRun, !canStop);
+  }
+
+  function sendGatewayControl(command, extra = {}) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({
+      type: "agent_control",
+      command,
+      run_id: state.runId || "current",
+      timestamp: new Date().toISOString(),
+      session_id: state.sessionId,
+      source: "gui",
+      authority: "user",
+      ...extra,
+    }));
+    return true;
   }
 
   function connectSession() {
@@ -729,6 +811,7 @@
         }));
       } catch (_) {}
       Promise.allSettled([showParams(), showPolicy()]).then(() => {
+        try { sendGatewayControl("state_request"); } catch (_) {}
         if (els.feedback) els.feedback.textContent = "Gateway session connected. Agent and policy forms are ready.";
         render();
       });
@@ -908,6 +991,9 @@
 
   function sendGatewayChat(content, visualContext = {}) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (new Set(["running","pause_requested","paused","resume_requested","stop_requested"]).has(String(state.runStatus || ""))) {
+      addMessage("system", "Agent is working. Your message will be applied at the next safe step.", { compact: true });
+    }
     ws.send(JSON.stringify({ type: "chat", content, timestamp: new Date().toISOString(), session_id: state.sessionId, visual_context: visualContext, metadata: { visual_context: visualContext, client_type: "gui" } }));
     addMessage("user", content, { gateway_sent: true, visual_context: visualContext });
     return true;
@@ -938,6 +1024,9 @@
   els.showPolicy?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await showPolicy(); } catch (error) { if (els.feedback) els.feedback.textContent = `Fetch policy params failed: ${error.message}`; } }, true);
   els.savePolicy?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await savePolicy(); } catch (error) { if (els.feedback) els.feedback.textContent = `Commit policy params failed: ${error.message}`; } }, true);
   els.resetSession?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await resetSession(); } catch (error) { if (els.feedback) els.feedback.textContent = `Reset failed: ${error.message}`; } }, true);
+  els.agentPauseRun?.addEventListener("click", (ev) => { ev.preventDefault(); if (!sendGatewayControl("pause_after_step")) addMessage("system", "Gateway websocket is not open. Reconnect the selected session.", { tone: "error" }); }, true);
+  els.agentResumeRun?.addEventListener("click", (ev) => { ev.preventDefault(); if (!sendGatewayControl("resume")) addMessage("system", "Gateway websocket is not open. Reconnect the selected session.", { tone: "error" }); }, true);
+  els.agentStopRun?.addEventListener("click", (ev) => { ev.preventDefault(); if (!sendGatewayControl("stop_after_step")) addMessage("system", "Gateway websocket is not open. Reconnect the selected session.", { tone: "error" }); }, true);
   formControls().forEach((el) => el.addEventListener("change", syncRawFromForm));
   formControls().forEach((el) => el.addEventListener("input", () => { if (el !== els.cfgApiKey) syncRawFromForm(); }));
 
@@ -975,4 +1064,60 @@
   window.WolfGatewayUI = { open, close, render, authenticate, refreshSessions, connectSession, showParams, saveParams, showPolicy, savePolicy, resetSession, applyParamsToForm, formToParams, syncRawFromForm, state: () => ({ ...state, token: state.token ? "***redacted***" : "" }), sendChat: sendGatewayChat };
   render();
   console.info("[wolf-gateway-ui] standalone TUI-parity gateway client installed");
+})();
+
+
+// gateway tabbed console controller
+(function () {
+  function ready(fn) {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true });
+    else fn();
+  }
+  ready(function () {
+    const tabs = Array.from(document.querySelectorAll('[data-gateway-tab]'));
+    const pages = Array.from(document.querySelectorAll('[data-gateway-panel]'));
+    const sessionStep = document.getElementById('wolfGatewaySessionStep');
+    const feedback = document.getElementById('wolfGatewayFeedback');
+    if (!tabs.length || !pages.length) return;
+    let active = 'connect';
+    function authed() {
+      return !!sessionStep && !sessionStep.classList.contains('wolf-gateway-hidden');
+    }
+    function setTab(name, opts) {
+      opts = opts || {};
+      if (name !== 'connect' && !authed()) {
+        if (!opts.silent && feedback) feedback.textContent = 'Authenticate with the gateway before editing agent or policy parameters.';
+        name = 'connect';
+      }
+      active = name;
+      tabs.forEach(function (tab) {
+        const on = tab.dataset.gatewayTab === name;
+        tab.classList.toggle('is-active', on);
+        tab.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      pages.forEach(function (page) {
+        const on = page.dataset.gatewayPanel === name;
+        page.hidden = !on;
+        page.classList.toggle('is-active', on);
+      });
+    }
+    function refreshLocks() {
+      const ok = authed();
+      tabs.forEach(function (tab) {
+        if (tab.dataset.gatewayTab !== 'connect') tab.disabled = !ok;
+      });
+      if (!ok && active !== 'connect') setTab('connect', { silent: true });
+    }
+    tabs.forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        setTab(tab.dataset.gatewayTab || 'connect');
+        refreshLocks();
+      });
+    });
+    if (sessionStep && window.MutationObserver) {
+      new MutationObserver(refreshLocks).observe(sessionStep, { attributes: true, attributeFilter: ['class'] });
+    }
+    refreshLocks();
+    setTab(active, { silent: true });
+  });
 })();

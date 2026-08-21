@@ -3,10 +3,14 @@ const state = {
   dockMode: 'float',
   annotations: [],
   messages: [],
+  showSystemMessages: true,
+  hiddenSystemAlertSignature: '',
+  hiddenSystemAlertInitialized: false,
   workflows: {},
   sessions: [],
   apps: [],
   dashboards: [],
+  dashboardActivity: {},
   annotateMode: null,
   dashboardFloat: false,
   latestSeq: 0,
@@ -36,6 +40,7 @@ const els = {
   clearAnnotations: $('clear-annotations'),
   dashboardFloatToggle: $('dashboard-float-toggle'),
   dashboardSnapGrid: $('dashboard-snap-grid'),
+  dashboardSwitcher: $('dashboard-switcher'),
   healthDot: $('gui-health-dot'),
   panel: $('agent-panel'),
   panelHeader: $('agent-panel-header'),
@@ -49,6 +54,7 @@ const els = {
   collapsePanel: $('collapse-panel'),
   refreshState: $('refresh-state'),
   messages: $('messages'),
+  toggleSystemMessages: $('toggle-system-messages'),
   messageForm: $('message-form'),
   messageInput: $('message-input'),
   includeVisualContext: $('include-visual-context'),
@@ -89,6 +95,8 @@ state.toolbarSize = state.uiPrefs.toolbarSize || 'toolbar-mid';
 state.dockMode = state.uiPrefs.dockMode || state.dockMode || 'float';
 state.dashboardLayouts = state.uiPrefs.dashboardLayouts || {};
 state.dashboardFloatById = state.uiPrefs.dashboardFloatById || {};
+state.dashboardActivity = state.uiPrefs.dashboardActivity || {};
+state.showSystemMessages = state.uiPrefs.showSystemMessages !== false;
 
 state.attachWorkspaceView = state.uiPrefs.attachWorkspaceView !== undefined ? Boolean(state.uiPrefs.attachWorkspaceView) : true;
 state.allowAgentInspect = Boolean(state.uiPrefs.allowAgentInspect);
@@ -258,6 +266,26 @@ function showToast(message, ms = 2200) {
   }, ms);
 }
 
+function pulseHiddenSystemNotice(severity = 'warning') {
+  const level = severity === 'error' ? 'error' : 'warning';
+  const className = `system-notice-pulse-${level}`;
+  const targets = [
+    document.querySelector('.agent-panel'),
+    document.querySelector('.agent-panel-header'),
+    document.querySelector('.agent-panel-orb'),
+  ].filter(Boolean);
+  targets.forEach((target) => {
+    target.classList.remove('system-notice-pulse-warning', 'system-notice-pulse-error');
+    // Force animation restart when repeated alerts arrive close together.
+    void target.offsetWidth;
+    target.classList.add(className);
+  });
+  clearTimeout(pulseHiddenSystemNotice.timer);
+  pulseHiddenSystemNotice.timer = setTimeout(() => {
+    targets.forEach((target) => target.classList.remove(className));
+  }, 1500);
+}
+
 function normalizedPointFromEvent(event) {
   return {
     x: event.clientX / Math.max(1, window.innerWidth),
@@ -327,6 +355,90 @@ function activeDashboard() {
   return Array.isArray(state.dashboards) && state.dashboards.length ? state.dashboards[0] : null;
 }
 
+function dashboardLabel(dashboard) {
+  if (!dashboard) return 'Dashboard';
+  const panels = Array.isArray(dashboard.panels) ? dashboard.panels.length : 0;
+  return `${dashboard.name || dashboard.id || 'Dashboard'}${panels ? ` (${panels})` : ''}`;
+}
+
+function markDashboardActivity(dashboardId) {
+  if (!dashboardId) return;
+  const activeId = activeDashboard()?.id;
+  const inDashboard = state.workspace?.mode === 'dashboard';
+  if (inDashboard && activeId === dashboardId) return;
+  state.dashboardActivity = { ...(state.dashboardActivity || {}), [dashboardId]: Date.now() };
+  updateUiPrefs({ dashboardActivity: state.dashboardActivity });
+  renderDashboardSwitcher();
+}
+
+function clearDashboardActivity(dashboardId) {
+  if (!dashboardId || !state.dashboardActivity?.[dashboardId]) return;
+  const next = { ...(state.dashboardActivity || {}) };
+  delete next[dashboardId];
+  state.dashboardActivity = next;
+  updateUiPrefs({ dashboardActivity: state.dashboardActivity });
+}
+
+function renderDashboardSwitcher() {
+  const select = els.dashboardSwitcher;
+  if (!select) return;
+  const dashboards = Array.isArray(state.dashboards) ? state.dashboards : [];
+  const active = activeDashboard();
+  const activeId = active?.id || '';
+  select.innerHTML = '';
+  select.disabled = dashboards.length === 0;
+  select.classList.toggle('has-hidden-activity', dashboards.some((d) => d.id && state.dashboardActivity?.[d.id] && d.id !== activeId));
+
+  if (!dashboards.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No dashboards';
+    select.appendChild(option);
+    select.title = 'No dashboards are available yet';
+    return;
+  }
+
+  dashboards.forEach((dashboard) => {
+    const option = document.createElement('option');
+    option.value = dashboard.id || '';
+    const hasActivity = Boolean(dashboard.id && state.dashboardActivity?.[dashboard.id] && dashboard.id !== activeId);
+    option.textContent = `${hasActivity ? '• ' : ''}${dashboardLabel(dashboard)}`;
+    if (hasActivity) option.dataset.activity = 'true';
+    select.appendChild(option);
+  });
+  select.value = activeId || dashboards[0]?.id || '';
+  select.title = select.classList.contains('has-hidden-activity') ? 'Switch dashboard — bullet indicates hidden dashboard activity' : 'Switch dashboard';
+}
+
+async function openDashboard(dashboardId) {
+  const id = (dashboardId || '').trim();
+  if (!id) return;
+  clearDashboardActivity(id);
+  const local = state.dashboards.find((d) => d.id === id);
+  state.workspace = {
+    ...(state.workspace || {}),
+    mode: 'dashboard',
+    url: `about:dashboard/${encodeURIComponent(id)}`,
+    title: local?.name || 'Dashboard',
+    metadata: { ...((state.workspace || {}).metadata || {}), active_dashboard_id: id },
+  };
+  renderWorkspace();
+
+  try {
+    const data = await api('/api/gui/dashboards/open', {
+      method: 'POST',
+      body: JSON.stringify({ dashboard_id: id }),
+    });
+    if (data?.dashboard) upsertDashboard(data.dashboard);
+    if (data?.workspace) state.workspace = data.workspace;
+    clearDashboardActivity(id);
+    renderWorkspace();
+    renderDiscovery();
+  } catch (error) {
+    showToast(error.message || 'Dashboard switched locally', 2600);
+  }
+}
+
 function panelSource(panel) {
   if (panel.content_html) {
     return `data:text/html;charset=utf-8,${encodeURIComponent(panel.content_html)}`;
@@ -339,6 +451,7 @@ function updateDashboardToolbar() {
   const dashboard = activeDashboard();
   const inDashboard = Boolean((state.workspace || {}).mode === 'dashboard' && dashboard);
   root?.classList.toggle('dashboard-active', inDashboard);
+  renderDashboardSwitcher();
   if (!els.dashboardFloatToggle || !els.dashboardSnapGrid) return;
 
   els.dashboardFloatToggle.disabled = !inDashboard;
@@ -361,6 +474,7 @@ function renderDashboard() {
   const dashboard = activeDashboard();
   els.dashboard.innerHTML = '';
   if (!dashboard) {
+    renderDashboardSwitcher();
     const empty = document.createElement('div');
     empty.className = 'dashboard-empty glass';
     empty.textContent = 'Dashboard mode is active, but no dashboard panels are available yet.';
@@ -370,15 +484,10 @@ function renderDashboard() {
   }
 
   state.dashboardFloat = getDashboardFloat(dashboard);
+  clearDashboardActivity(dashboard.id);
+  renderDashboardSwitcher();
   updateDashboardToolbar();
   const panels = dashboard.panels || [];
-  const header = document.createElement('div');
-  header.className = 'dashboard-header glass dashboard-header-compact';
-  const title = document.createElement('div');
-  title.innerHTML = `<strong>${dashboard.name || 'Agent Dashboard'}</strong><span>${dashboard.description || `${panels.length} panel(s)`}</span>`;
-  header.appendChild(title);
-  els.dashboard.appendChild(header);
-
   const grid = document.createElement('div');
   grid.className = `dashboard-grid layout-${dashboard.layout || 'grid'}${state.dashboardFloat ? ' is-floating' : ''}`;
   panels.forEach((panel, index) => {
@@ -445,12 +554,10 @@ function renderDashboard() {
     bar.appendChild(controls);
     card.appendChild(bar);
     card.appendChild(frame);
-    if (state.dashboardFloat) {
-      const resize = document.createElement('div');
-      resize.className = 'dashboard-panel-resize';
-      resize.title = 'Resize dashboard panel';
-      card.appendChild(resize);
-    }
+    const resize = document.createElement('div');
+    resize.className = 'dashboard-panel-resize';
+    resize.title = state.dashboardFloat ? 'Resize floating dashboard panel' : 'Resize dashboard panel';
+    card.appendChild(resize);
     grid.appendChild(card);
   });
   els.dashboard.appendChild(grid);
@@ -461,6 +568,7 @@ function upsertDashboard(dashboard) {
   const idx = state.dashboards.findIndex((d) => d.id === dashboard.id);
   if (idx >= 0) state.dashboards[idx] = dashboard;
   else state.dashboards.unshift(dashboard);
+  renderDashboardSwitcher();
 }
 
 function renderWorkspace() {
@@ -468,6 +576,7 @@ function renderWorkspace() {
   els.toolbarMode.value = workspace.mode || 'browser';
   els.urlInput.value = workspace.url && workspace.url !== 'about:blank' && workspace.mode !== 'dashboard' ? workspace.url : '';
   els.workspaceSummary.textContent = `${workspace.mode || 'browser'} · ${workspace.title || workspace.url || 'blank'}`;
+  renderDashboardSwitcher();
 
   $('app')?.classList.toggle('dashboard-active', workspace.mode === 'dashboard');
   updateDashboardToolbar();
@@ -540,9 +649,86 @@ function renderAnnotations() {
 
 function renderMessages() {
   els.messages.innerHTML = '';
-  state.messages.forEach((message) => {
+  const showSystemMessages = state.showSystemMessages !== false;
+  let hiddenSystemCount = 0;
+  const hiddenSystemSeverityCounts = { neutral: 0, warning: 0, error: 0 };
+  const hiddenSystemAlertItems = [];
+  let pendingSystem = [];
+
+  const messageTime = (message) => {
+    if (!message?.created_at) return null;
+    const date = new Date(message.created_at * 1000);
+    return Number.isFinite(date.getTime()) ? date : null;
+  };
+
+  const roleLabelFor = (role) => ({ user: 'You', assistant: 'Agent', system: 'System' }[role] || String(role || 'Message').replace(/(^|[-_\s])([a-z])/g, (_, sep, ch) => `${sep}${ch.toUpperCase()}`));
+
+  const isSystemNotice = (message) => {
+    // Only actual system-role messages should be grouped/hidden.
+    // Assistant/user messages from the gateway often carry gateway_event metadata;
+    // those must remain visible as normal chat bubbles.  Also honor a
+    // force_visible escape hatch for gateway messages that should never be
+    // folded into a notice bundle.
+    if (message?.metadata?.force_visible) return false;
+    return (message?.role || 'assistant') === 'system';
+  };
+
+  const systemNoticeSeverity = (message) => {
+    const metadata = message?.metadata || {};
+    const tokens = [
+      metadata.severity, metadata.level, metadata.tone, metadata.status, metadata.type,
+      metadata.gateway_event?.severity, metadata.gateway_event?.level, metadata.gateway_event?.status, metadata.gateway_event?.type,
+      metadata.system_event?.severity, metadata.system_event?.level, metadata.system_event?.status, metadata.system_event?.type,
+      message?.content,
+    ].filter(Boolean).map((value) => String(value).toLowerCase()).join(' ');
+
+    if (/\b(error|failed|failure|fatal|exception|denied|blocked|unauthorized|forbidden|offline|unhealthy)\b/.test(tokens)) return 'error';
+    if (/\b(warn|warning|caution|degraded|retry|timeout|paused|pending|rate.?limit)\b/.test(tokens)) return 'warning';
+    return 'neutral';
+  };
+
+  const systemNoticeSeverityRank = { neutral: 0, warning: 1, error: 2 };
+  const strongestSystemNoticeSeverity = (counts) => (counts.error ? 'error' : counts.warning ? 'warning' : 'neutral');
+  const systemNoticeCountSummary = (counts) => {
+    const parts = [];
+    if (counts.error) parts.push(`${counts.error} error${counts.error === 1 ? '' : 's'}`);
+    if (counts.warning) parts.push(`${counts.warning} warning${counts.warning === 1 ? '' : 's'}`);
+    if (!parts.length && counts.neutral) parts.push(`${counts.neutral} neutral`);
+    return parts.join(', ');
+  };
+
+  const systemNoticeIdentity = (message, index = 0) => {
+    const metadata = message?.metadata || {};
+    return String(metadata.id || metadata.event_id || metadata.gateway_event?.id || metadata.system_event?.id || `${message?.created_at || ''}:${index}:${message?.content || ''}`);
+  };
+
+  const detailPayloadFor = (message) => {
+    const metadata = message?.metadata || {};
+    return metadata.gateway_event || metadata.system_event || metadata.gateway_result || metadata.gateway_policy || null;
+  };
+
+  const appendDetailsButton = (meta, details, title = 'Show details') => {
+    const info = document.createElement('button');
+    info.type = 'button';
+    info.className = 'message-info';
+    info.title = title;
+    info.setAttribute('aria-label', title);
+    info.setAttribute('aria-expanded', 'false');
+    info.textContent = 'i';
+    info.addEventListener('click', () => {
+      const open = details.hidden;
+      details.hidden = !open;
+      info.classList.toggle('is-open', open);
+      info.setAttribute('aria-expanded', open ? 'true' : 'false');
+      info.title = open ? 'Hide details' : title;
+    });
+    meta.appendChild(info);
+  };
+
+  const appendMessage = (message) => {
     const metadata = message.metadata || {};
-    const classes = ['message', message.role || 'assistant'];
+    const roleName = message.role || 'assistant';
+    const classes = ['message', roleName];
     if (metadata.compact) classes.push('compact');
     if (metadata.card) classes.push('card');
     if (metadata.tone) classes.push(`tone-${String(metadata.tone).replace(/[^a-z0-9_-]/gi, '')}`);
@@ -553,25 +739,19 @@ function renderMessages() {
     const meta = document.createElement('div');
     meta.className = 'message-meta';
     const label = document.createElement('span');
-    const date = message.created_at ? new Date(message.created_at * 1000).toLocaleTimeString() : '';
-    label.textContent = `${message.role || 'message'} ${date}`;
+    const date = messageTime(message);
+    const roleLabel = roleLabelFor(roleName);
+    label.textContent = date ? `${roleLabel} · ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : roleLabel;
+    if (date) label.title = date.toLocaleString();
     meta.appendChild(label);
 
     const body = document.createElement('div');
     body.className = 'message-content';
     body.textContent = message.content || '';
 
-    const detailPayload = metadata.gateway_event || metadata.system_event || null;
+    const detailPayload = detailPayloadFor(message);
     let details = null;
     if (detailPayload) {
-      const info = document.createElement('button');
-      info.type = 'button';
-      info.className = 'message-info';
-      info.title = 'Show system details';
-      info.setAttribute('aria-label', 'Show system details');
-      info.setAttribute('aria-expanded', 'false');
-      info.textContent = 'i';
-
       details = document.createElement('pre');
       details.className = 'message-details';
       details.hidden = true;
@@ -580,22 +760,116 @@ function renderMessages() {
       } catch (_) {
         details.textContent = String(detailPayload);
       }
-
-      info.addEventListener('click', () => {
-        const open = details.hidden;
-        details.hidden = !open;
-        info.classList.toggle('is-open', open);
-        info.setAttribute('aria-expanded', open ? 'true' : 'false');
-        info.title = open ? 'Hide system details' : 'Show system details';
-      });
-      meta.appendChild(info);
+      appendDetailsButton(meta, details, 'Show system details');
     }
 
     node.appendChild(meta);
     node.appendChild(body);
     if (details) node.appendChild(details);
     els.messages.appendChild(node);
+  };
+
+  const flushSystemGroup = () => {
+    if (!pendingSystem.length) return;
+    if (!showSystemMessages) {
+      pendingSystem.forEach((msg, index) => {
+        const severity = systemNoticeSeverity(msg);
+        hiddenSystemSeverityCounts[severity] += 1;
+        if (severity !== 'neutral') hiddenSystemAlertItems.push(`${severity}:${systemNoticeIdentity(msg, index)}`);
+      });
+      hiddenSystemCount += pendingSystem.length;
+      pendingSystem = [];
+      return;
+    }
+
+    const groupCounts = { neutral: 0, warning: 0, error: 0 };
+    pendingSystem.forEach((msg) => { groupCounts[systemNoticeSeverity(msg)] += 1; });
+    const groupSeverity = strongestSystemNoticeSeverity(groupCounts);
+
+    const group = document.createElement('article');
+    group.className = `message system system-group compact severity-${groupSeverity}`;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'system-group-toggle';
+    button.setAttribute('aria-expanded', 'false');
+    const firstTime = messageTime(pendingSystem[0]);
+    const groupSummary = systemNoticeCountSummary(groupCounts);
+    button.classList.add(`severity-${groupSeverity}`);
+    button.textContent = `${pendingSystem.length} system notice${pendingSystem.length === 1 ? '' : 's'}${groupSummary ? ` · ${groupSummary}` : ''}${firstTime ? ` · ${firstTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}`;
+
+    const details = document.createElement('div');
+    details.className = 'system-group-details';
+    details.hidden = true;
+    pendingSystem.forEach((msg) => {
+      const item = document.createElement('div');
+      const itemSeverity = systemNoticeSeverity(msg);
+      item.className = `system-group-item severity-${itemSeverity}`;
+      const t = messageTime(msg);
+      item.textContent = `${t ? `${t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ` : ''}${msg.content || 'System event'}`;
+      const payload = detailPayloadFor(msg);
+      if (payload) {
+        const pre = document.createElement('pre');
+        pre.className = 'message-details system-group-payload';
+        try { pre.textContent = JSON.stringify(payload, null, 2); }
+        catch (_) { pre.textContent = String(payload); }
+        item.appendChild(pre);
+      }
+      details.appendChild(item);
+    });
+
+    button.addEventListener('click', () => {
+      const open = details.hidden;
+      details.hidden = !open;
+      button.classList.toggle('is-open', open);
+      button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+
+    group.appendChild(button);
+    group.appendChild(details);
+    els.messages.appendChild(group);
+    pendingSystem = [];
+  };
+
+  state.messages.forEach((message) => {
+    if (isSystemNotice(message)) {
+      pendingSystem.push(message);
+      return;
+    }
+    flushSystemGroup();
+    appendMessage(message);
   });
+  flushSystemGroup();
+
+  const hiddenSeverity = strongestSystemNoticeSeverity(hiddenSystemSeverityCounts);
+  const hiddenSeveritySummary = systemNoticeCountSummary(hiddenSystemSeverityCounts);
+  if (!showSystemMessages && hiddenSystemCount) {
+    const summary = document.createElement('article');
+    summary.className = `message system compact system-summary severity-${hiddenSeverity}`;
+    summary.textContent = `${hiddenSystemCount} system notice${hiddenSystemCount === 1 ? '' : 's'} hidden${hiddenSeveritySummary ? ` · ${hiddenSeveritySummary}` : ''}`;
+    els.messages.prepend(summary);
+  }
+  const hiddenAlertSignature = hiddenSystemAlertItems.join('|');
+  if (!showSystemMessages) {
+    // Treat the first hidden render as the baseline, then pulse only when a
+    // new hidden warning/error appears. This avoids alarming on page load or
+    // immediately when the user intentionally hides existing notices.
+    if (hiddenAlertSignature && state.hiddenSystemAlertInitialized && state.hiddenSystemAlertSignature !== hiddenAlertSignature) {
+      pulseHiddenSystemNotice(hiddenSeverity);
+    }
+    state.hiddenSystemAlertSignature = hiddenAlertSignature;
+    state.hiddenSystemAlertInitialized = true;
+  } else {
+    state.hiddenSystemAlertSignature = '';
+    state.hiddenSystemAlertInitialized = false;
+  }
+  if (els.toggleSystemMessages) {
+    els.toggleSystemMessages.classList.toggle('is-active', showSystemMessages);
+    els.toggleSystemMessages.classList.remove('severity-neutral', 'severity-warning', 'severity-error');
+    if (!showSystemMessages) els.toggleSystemMessages.classList.add(`severity-${hiddenSeverity}`);
+    els.toggleSystemMessages.setAttribute('aria-pressed', showSystemMessages ? 'true' : 'false');
+    els.toggleSystemMessages.textContent = showSystemMessages ? 'System notices on' : `System notices hidden${hiddenSeveritySummary && hiddenSeverity !== 'neutral' ? ` · ${hiddenSeveritySummary}` : ''}`;
+  }
   els.messages.scrollTop = els.messages.scrollHeight;
 }
 
@@ -629,6 +903,9 @@ function applyDockMode(mode, options = {}) {
 
   if (els.dockModeToolbar) els.dockModeToolbar.value = next;
   if (els.dockModePanel) els.dockModePanel.value = next;
+  document.querySelectorAll('[data-dock-mode]').forEach((button) => {
+    button.classList.toggle('is-active', button.getAttribute('data-dock-mode') === next);
+  });
   if (options.persist !== false) persistAgentPanelPrefs();
 }
 
@@ -827,6 +1104,85 @@ function currentVisualContext() {
 
 window.wolfGuiCurrentVisualContext = currentVisualContext;
 
+function installToolbarGroupHandlers() {
+  const groups = Array.from(document.querySelectorAll('.toolbar-group'));
+  if (!groups.length) return;
+  let openGroup = null;
+
+  const setExpanded = (group, expanded) => {
+    const trigger = group?.querySelector?.('.toolbar-group-trigger');
+    if (trigger) trigger.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  };
+
+  const closeGroup = (group) => {
+    if (!group) return;
+    clearTimeout(group._wolfCloseTimer);
+    group.classList.remove('is-open', 'is-hovering');
+    setExpanded(group, false);
+    if (openGroup === group) openGroup = null;
+  };
+
+  const closeOtherGroups = (keep = null) => {
+    groups.forEach((group) => {
+      if (group !== keep) closeGroup(group);
+    });
+  };
+
+  groups.forEach((group) => {
+    const trigger = group.querySelector('.toolbar-group-trigger');
+    if (trigger) {
+      trigger.setAttribute('aria-haspopup', 'true');
+      trigger.setAttribute('aria-expanded', 'false');
+    }
+
+    group.addEventListener('pointerenter', () => {
+      clearTimeout(group._wolfCloseTimer);
+      closeOtherGroups(group);
+      group.classList.add('is-hovering');
+      setExpanded(group, true);
+    });
+
+    group.addEventListener('pointerleave', () => {
+      clearTimeout(group._wolfCloseTimer);
+      group._wolfCloseTimer = setTimeout(() => {
+        if (!group.classList.contains('is-open')) {
+          group.classList.remove('is-hovering');
+          setExpanded(group, false);
+        }
+      }, 260);
+    });
+
+    trigger?.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const willOpen = !group.classList.contains('is-open');
+      closeOtherGroups(group);
+      group.classList.toggle('is-open', willOpen);
+      group.classList.toggle('is-hovering', willOpen);
+      setExpanded(group, willOpen);
+      openGroup = willOpen ? group : null;
+    });
+
+    group.addEventListener('click', (event) => {
+      // Let toolbar item buttons run normally, then close only click-pinned groups.
+      if (!event.target.closest('.toolbar-group-items button')) return;
+      if (group.classList.contains('is-open')) {
+        setTimeout(() => closeGroup(group), 0);
+      }
+    });
+  });
+
+  document.addEventListener('click', (event) => {
+    if (event.target.closest('.toolbar-group')) return;
+    closeOtherGroups(null);
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    closeOtherGroups(null);
+  });
+}
+
 function installWorkspaceHandlers() {
   els.openUrlForm?.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -877,6 +1233,11 @@ function installWorkspaceHandlers() {
     snapDashboardPanelsToGrid();
     updateDashboardToolbar();
   });
+  els.dashboardSwitcher?.addEventListener('change', (event) => {
+    const dashboardId = event.target.value;
+    if (!dashboardId) return;
+    openDashboard(dashboardId);
+  });
 
   els.workspaceBack?.addEventListener('click', () => {
     navigateFrame(els.frame, 'back', workspaceFrameUrl());
@@ -894,6 +1255,18 @@ function installWorkspaceHandlers() {
   els.toggleAnnotate.addEventListener('click', () => setAnnotationMode('point'));
   els.dockModeToolbar?.addEventListener('change', (e) => applyDockMode(e.target.value));
   els.dockModePanel?.addEventListener('change', (e) => applyDockMode(e.target.value));
+  document.querySelectorAll('[data-dock-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const mode = button.getAttribute('data-dock-mode') || 'float';
+      if (els.dockModePanel) els.dockModePanel.value = mode;
+      applyDockMode(mode);
+    });
+  });
+  els.toggleSystemMessages?.addEventListener('click', () => {
+    state.showSystemMessages = state.showSystemMessages === false;
+    updateUiPrefs({ showSystemMessages: state.showSystemMessages });
+    renderMessages();
+  });
   els.toggleRect.addEventListener('click', () => setAnnotationMode('rect'));
 
   els.clearAnnotations.addEventListener('click', async () => {
@@ -1092,6 +1465,13 @@ function installPanelHandlers() {
     syncComposerContextControls({ toast: true });
   });
 
+  els.messageInput?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || !event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
+    event.preventDefault();
+    if (typeof els.messageForm.requestSubmit === 'function') els.messageForm.requestSubmit();
+    else els.messageForm.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+  });
+
   els.messageForm.addEventListener('submit', async (event) => {
     event.preventDefault();
     const content = els.messageInput.value.trim();
@@ -1120,17 +1500,17 @@ function installDashboardPanelHandlers() {
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
   els.dashboard.addEventListener('pointerdown', (event) => {
-    if (!state.dashboardFloat) return;
     const card = event.target.closest('.dashboard-panel');
     if (!card) return;
-    const grid = event.target.closest('.dashboard-grid.is-floating');
+    const grid = event.target.closest('.dashboard-grid');
+    const floating = Boolean(grid?.classList.contains('is-floating'));
     const gridRect = grid?.getBoundingClientRect();
     const rect = card.getBoundingClientRect();
     card.style.zIndex = String(Date.now() % 100000);
 
     const resizeHandle = event.target.closest('.dashboard-panel-resize');
     if (resizeHandle) {
-      sizing = { card, gridRect, left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+      sizing = { card, gridRect, floating, left: rect.left, top: rect.top, width: rect.width, height: rect.height };
       changedCard = card;
       resizeHandle.setPointerCapture?.(event.pointerId);
       event.preventDefault();
@@ -1138,6 +1518,7 @@ function installDashboardPanelHandlers() {
       return;
     }
 
+    if (!floating) return;
     const bar = event.target.closest('.dashboard-panel-bar');
     if (!bar || event.target.closest('button')) return;
     moving = { card, gridRect, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
@@ -1149,10 +1530,15 @@ function installDashboardPanelHandlers() {
   window.addEventListener('pointermove', (event) => {
     if (sizing) {
       const gridRight = sizing.gridRect ? sizing.gridRect.right : window.innerWidth;
-      const width = clamp(event.clientX - sizing.left, 280, gridRight - sizing.left - 12);
-      const height = clamp(event.clientY - sizing.top, 220, window.innerHeight - sizing.top - 12);
-      sizing.card.style.width = `${width}px`;
+      const width = clamp(event.clientX - sizing.left, 280, Math.max(280, gridRight - sizing.left - 12));
+      const height = clamp(event.clientY - sizing.top, 220, Math.max(220, window.innerHeight - sizing.top - 12));
       sizing.card.style.height = `${height}px`;
+      sizing.card.style.minHeight = `${height}px`;
+      if (sizing.floating) {
+        sizing.card.style.width = `${width}px`;
+      } else {
+        sizing.card.style.setProperty('--dashboard-panel-custom-width', `${width}px`);
+      }
       return;
     }
     if (!moving) return;
@@ -1201,13 +1587,17 @@ function applyEvent(event) {
 
   if (t === 'dashboard_created') {
     upsertDashboard(payload);
+    markDashboardActivity(payload?.id);
     renderDiscovery();
     if (state.workspace?.mode === 'dashboard') renderWorkspace();
     return;
   }
 
   if (t === 'dashboard_panel_added' || t === 'dashboard_panel_updated') {
-    if (payload?.dashboard) upsertDashboard(payload.dashboard);
+    if (payload?.dashboard) {
+      upsertDashboard(payload.dashboard);
+      markDashboardActivity(payload.dashboard.id);
+    }
     renderDiscovery();
     if (state.workspace?.mode === 'dashboard') renderWorkspace();
     return;
@@ -1216,6 +1606,7 @@ function applyEvent(event) {
   if (t === 'dashboard_opened') {
     if (payload?.dashboard) upsertDashboard(payload.dashboard);
     if (payload?.workspace) state.workspace = payload.workspace;
+    clearDashboardActivity(payload?.dashboard?.id || payload?.workspace?.metadata?.active_dashboard_id);
     renderWorkspace();
     renderDiscovery();
     showToast(`Agent opened dashboard: ${payload?.dashboard?.name || 'dashboard'}`, 2200);
@@ -1289,10 +1680,12 @@ async function pollEvents() {
 }
 
 installWorkspaceHandlers();
+installToolbarGroupHandlers();
 installPanelHandlers();
 installDashboardPanelHandlers();
 restoreAgentPanelPrefs();
 syncComposerContextControls();
+renderDashboardSwitcher();
 bootstrap().catch((error) => showToast(error.message, 5000));
 setInterval(refreshHealth, 5000);
 pollEvents();

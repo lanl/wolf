@@ -160,6 +160,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                         "session_id": panel.get("session_id") or body.get("session_id"),
                         "workflow": panel.get("workflow") or body.get("workflow"),
                         "host_status": panel.get("host_status") or body.get("host_status") or "unknown",
+                        "open_after_add": False,
                     }
                     panels.append(self.runtime.add_dashboard_panel(panel_data))
                 opened = self.runtime.open_dashboard(dashboard_id=dashboard.get("id")) if body.get("open", True) else None

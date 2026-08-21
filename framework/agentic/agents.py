@@ -2,7 +2,9 @@
 from __future__ import annotations
 import asyncio
 import base64
-from typing import Any, Dict, List, Union, Optional
+import random
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Union, Optional
 from pydantic import BaseModel
 from urllib.parse import urlparse
 # OpenAI
@@ -44,7 +46,11 @@ class OpenAIAgent:
         cache_history: bool = True,
         verbose: int = 0,
         capabilities=[],
-        ctx_window_length=None, ) -> None:
+        ctx_window_length=None,
+        request_timeout: Optional[float] = None,
+        max_retries: int = 3,
+        retry_initial_delay: float = 1.0,
+        retry_max_delay: float = 30.0, ) -> None:
 
         # Name assignment
         if agent_name is None:
@@ -63,6 +69,10 @@ class OpenAIAgent:
         self.console = console if console is not None else print
         self.capabilities=capabilities
         self.ctx_window_length = ctx_window_length
+        self.request_timeout = request_timeout
+        self.max_retries = max(0, int(max_retries))
+        self.retry_initial_delay = max(0.0, float(retry_initial_delay))
+        self.retry_max_delay = max(self.retry_initial_delay, float(retry_max_delay))
         
         parsed = urlparse(host_address)
         scheme = parsed.scheme if parsed.scheme else "http"
@@ -171,7 +181,8 @@ class OpenAIAgent:
         allowed = {
             "model", "host_address", "host_port", "api_version",
             "api_key", "verbose", "sys_prompt", "cache_history",
-            "capabilities", "ctx_window_length",
+            "capabilities", "ctx_window_length", "request_timeout",
+            "max_retries", "retry_initial_delay", "retry_max_delay",
         }
         changed: Dict[str, Any] = {}
         provider_fields = {"host_address", "host_port", "api_version", "api_key"}
@@ -181,8 +192,10 @@ class OpenAIAgent:
             attr = aliases.get(key, key)
             if attr not in allowed:
                 raise ValueError(f"Unsupported OpenAIAgent config field: {key}")
-            if attr in {"host_port", "verbose", "ctx_window_length"} and value not in (None, ""):
+            if attr in {"host_port", "verbose", "ctx_window_length", "max_retries"} and value not in (None, ""):
                 value = int(value)
+            if attr in {"request_timeout", "retry_initial_delay", "retry_max_delay"} and value not in (None, ""):
+                value = float(value)
             if attr == "cache_history" and isinstance(value, str):
                 value = value.strip().lower() in {"1", "true", "yes", "on"}
             if attr == "capabilities" and isinstance(value, str):
@@ -207,7 +220,14 @@ class OpenAIAgent:
 
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
-        raw_response = self.llm.chat.completions.create(model=model, messages=CTX)
+        raw_response = self._call_with_retries(
+            lambda: self.llm.chat.completions.create(
+                model=model,
+                messages=CTX,
+                **self._request_options(),
+            ),
+            operation="chat completion",
+        )
         return self._extract_response(raw_response, resp_choice_idx)
 
     async def get_chat_response_async(
@@ -218,8 +238,13 @@ class OpenAIAgent:
 
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
-        raw_response = await self.async_llm.chat.completions.create(
-            model=model, messages=CTX
+        raw_response = await self._call_with_retries_async(
+            lambda: self.async_llm.chat.completions.create(
+                model=model,
+                messages=CTX,
+                **self._request_options(),
+            ),
+            operation="async chat completion",
         )
         return self._extract_response(raw_response, resp_choice_idx)
 
@@ -228,7 +253,15 @@ class OpenAIAgent:
 
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
-        stream = self.llm.chat.completions.create(model=model, messages=CTX, stream=True)
+        stream = self._call_with_retries(
+            lambda: self.llm.chat.completions.create(
+                model=model,
+                messages=CTX,
+                stream=True,
+                **self._request_options(),
+            ),
+            operation="stream chat completion",
+        )
         response = ""
         for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
@@ -241,8 +274,14 @@ class OpenAIAgent:
 
         model = model or self.model
         response = ""
-        async with await self.async_llm.chat.completions.create(
-            model=model, messages=self._make_ctx(user_prompt), stream=True
+        async with await self._call_with_retries_async(
+            lambda: self.async_llm.chat.completions.create(
+                model=model,
+                messages=self._make_ctx(user_prompt),
+                stream=True,
+                **self._request_options(),
+            ),
+            operation="async stream chat completion",
         ) as stream:
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
@@ -412,6 +451,78 @@ class OpenAIAgent:
     # ---------------------------
     # Private Helpers
     # ---------------------------
+
+    def _request_options(self) -> Dict[str, Any]:
+        """Return per-request OpenAI options without sending unset values."""
+        if self.request_timeout is None:
+            return {}
+        return {"timeout": self.request_timeout}
+
+    @staticmethod
+    def _exception_status_code(exc: BaseException) -> Optional[int]:
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return status_code if isinstance(status_code, int) else None
+
+    def _is_transient_openai_error(self, exc: BaseException) -> bool:
+        """Return True for provider/network errors that are safe to retry."""
+        transient_types = tuple(
+            t for t in (
+                getattr(openai, "InternalServerError", None),
+                getattr(openai, "APITimeoutError", None),
+                getattr(openai, "APIConnectionError", None),
+                getattr(openai, "RateLimitError", None),
+            ) if t is not None
+        )
+        if transient_types and isinstance(exc, transient_types):
+            return True
+        api_status_error = getattr(openai, "APIStatusError", None)
+        if api_status_error is not None and isinstance(exc, api_status_error):
+            status_code = self._exception_status_code(exc)
+            return status_code == 429 or (status_code is not None and 500 <= status_code < 600)
+        return False
+
+    def _retry_delay(self, attempt: int) -> float:
+        base = min(self.retry_max_delay, self.retry_initial_delay * (2 ** max(0, attempt - 1)))
+        jitter = random.uniform(0, min(1.0, base * 0.25)) if base > 0 else 0.0
+        return min(self.retry_max_delay, base + jitter)
+
+    def _call_with_retries(self, fn: Callable[[], Any], operation: str = "OpenAI request") -> Any:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_transient_openai_error(exc) or attempt > self.max_retries:
+                    raise
+                delay = self._retry_delay(attempt)
+                self.console_log(
+                    f"[OpenAI retry] {operation} failed on attempt {attempt}/{self.max_retries + 1}: "
+                    f"{type(exc).__name__}: {exc}. Retrying in {delay:.1f}s."
+                )
+                time.sleep(delay)
+        raise last_exc  # pragma: no cover - loop always returns or raises
+
+    async def _call_with_retries_async(self, fn: Callable[[], Awaitable[Any]], operation: str = "OpenAI request") -> Any:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                return await fn()
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_transient_openai_error(exc) or attempt > self.max_retries:
+                    raise
+                delay = self._retry_delay(attempt)
+                self.console_log(
+                    f"[OpenAI retry] {operation} failed on attempt {attempt}/{self.max_retries + 1}: "
+                    f"{type(exc).__name__}: {exc}. Retrying in {delay:.1f}s."
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # pragma: no cover - loop always returns or raises
 
     def _make_ctx(self, user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]]) -> List[Message]:
 

@@ -16,6 +16,8 @@ from framework.utils.multimodal_input import combine_prompt_with_user_content
 from framework.workflows.base_workflow import BaseWorkflow
 from framework.workflows.sessions_data_models import BaseSession
 from framework.workflows.workflow_models import Actions as FullActions
+from framework.workflows.action_registry import get_default_action_registry
+from framework.workflows.action_validation import ActionValidationError, validate_action_response
 
 
 DEFAULT_GATEWAY_SAFE_ACTIONS = [
@@ -58,6 +60,7 @@ class GatewayActionWorkflow(BaseWorkflow):
             WF_TAG="GatewayActionWorkflow",
         )
         self.WF_TAG = "GatewayActionWorkflow"
+        self.action_registry = get_default_action_registry()
         self.gateway_action_policy: Dict[str, Any] = {
             "allow_write_file": False,
             "allow_run_syscall": False,
@@ -83,6 +86,7 @@ class GatewayActionWorkflow(BaseWorkflow):
         max_steps: int = 1,
         log_console: bool = False,
         execution_policy: Optional[Dict[str, Any]] = None,
+        control_state: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Process one websocket user message and return transport-safe events.
 
@@ -123,6 +127,12 @@ class GatewayActionWorkflow(BaseWorkflow):
         step = 0
         stop_reason = "max_steps"
         while step < max_steps:
+            control_events, control_stop = await self._checkpoint_control(control_state, step=step, phase="before_step", log_console=log_console)
+            events.extend(control_events)
+            if control_stop:
+                stop_reason = control_stop
+                break
+
             actor, actor_name = self._actor_for_current_turn()
             if actor is None:
                 stop_reason = "yield_to_user" if self._turn_is_user() else "unknown_turn"
@@ -133,6 +143,12 @@ class GatewayActionWorkflow(BaseWorkflow):
             step_events, outcome = await self._process_actor_step(actor, actor_name, step, log_console=log_console)
             events.extend(step_events)
 
+            control_events, control_stop = await self._checkpoint_control(control_state, step=step, phase="after_step", log_console=log_console)
+            events.extend(control_events)
+            if control_stop:
+                stop_reason = control_stop
+                break
+
             if outcome.get("error"):
                 stop_reason = "error"
                 break
@@ -140,6 +156,16 @@ class GatewayActionWorkflow(BaseWorkflow):
                 stop_reason = "send_message"
                 break
             if self._turn_is_user():
+                if mode == "wolf_loop" and step < max_steps:
+                    events.append(self._event(
+                        "workflow_status",
+                        "continuing",
+                        step=step,
+                        content="Tool/action result returned control to user; continuing agent loop so the agent can summarize/respond.",
+                        previous_next_turn=outcome.get("next_turn"),
+                    ))
+                    self.WORKFLOW_TURN = self.agent.name
+                    continue
                 stop_reason = "yield_to_user"
                 break
             if mode == "single_step":
@@ -158,6 +184,62 @@ class GatewayActionWorkflow(BaseWorkflow):
             )
         )
         return events
+
+    async def _checkpoint_control(self, control_state: Optional[Dict[str, Any]], step: int, phase: str, log_console: bool = False):
+        """Cooperative run-control checkpoint.
+
+        The gateway updates ``control_state`` from websocket/REST control
+        messages while this workflow is between model/tool steps.  This method
+        never hard-kills an in-flight tool call; it only pauses, stops, or
+        injects reassessment messages at safe boundaries.
+        """
+        events: List[Dict[str, Any]] = []
+        if not isinstance(control_state, dict):
+            return events, None
+
+        async def _consume_pending() -> None:
+            pending = list(control_state.get("pending_user_messages") or [])
+            if not pending:
+                return
+            control_state["pending_user_messages"] = []
+            control_state["reassess_requested"] = False
+            for item in pending:
+                if not isinstance(item, dict):
+                    item = {"content": str(item)}
+                content = str(item.get("content") or item.get("message") or "").strip()
+                if not content:
+                    continue
+                note = (
+                    "[USER INTERRUPT / REASSESSMENT REQUEST]\n"
+                    "The user sent this while the agent was working. Reassess the current plan "
+                    "and incorporate this instruction before continuing.\n"
+                    f"{content}"
+                )
+                self.update_history(actor=self.WF_USER, content=note, action={"action": "user_interrupt", "phase": phase}, log_console=log_console)
+                self.WORKFLOW_TURN = self.agent.name
+                events.append(self._event("workflow_control", "reassessing", step=step, phase=phase, content="Queued user message applied; agent will reassess."))
+
+        await _consume_pending()
+
+        if control_state.get("stop_requested"):
+            control_state["status"] = "stopped"
+            events.append(self._event("workflow_control", "stopped", step=step, phase=phase, content="Agent stopped at a safe checkpoint."))
+            return events, "stopped_by_user"
+
+        if control_state.get("pause_requested"):
+            control_state["status"] = "paused"
+            events.append(self._event("workflow_control", "paused", step=step, phase=phase, content="Agent paused at a safe checkpoint."))
+            while control_state.get("pause_requested") and not control_state.get("stop_requested"):
+                await asyncio.sleep(0.2)
+                await _consume_pending()
+            if control_state.get("stop_requested"):
+                control_state["status"] = "stopped"
+                events.append(self._event("workflow_control", "stopped", step=step, phase=phase, content="Agent stopped while paused."))
+                return events, "stopped_by_user"
+            control_state["status"] = "running"
+            events.append(self._event("workflow_control", "resumed", step=step, phase=phase, content="Agent resumed."))
+
+        return events, None
 
     # ------------------------------------------------------------------
     # Actor-step implementation adapted from TurnBasedWorkflow._handle_actor_turn
@@ -221,13 +303,36 @@ class GatewayActionWorkflow(BaseWorkflow):
                 events.append(self._event("workflow_error", "error", step=step, content=err, error=err))
                 return events, {"error": True}
 
-            bad_format, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(response_dict, actor)
-            if bad_format:
+            allowed_for_validation = getattr(self, "action_names_to_use", None)
+            validated = validate_action_response(
+                response_dict,
+                registry=self.action_registry,
+                allowed_actions=allowed_for_validation,
+                actor=actor,
+            )
+            if isinstance(validated, ActionValidationError):
                 self.WORKFLOW_TURN = "user"
-                self.update_history(actor="system", content=err_msg, action={"action": "system_info"}, log_console=log_console)
-                events.append(self._event("workflow_error", "error", step=step, content=err_msg, error=err_msg, normalized=normalized))
+                err_msg = f"[Action validation {validated.stage}] {validated.message}"
+                normalized = response_dict if isinstance(response_dict, dict) else None
+                err_details = validated.model_dump(mode="json")
+                self.update_history(actor="system", content=err_details, action={"action": "action_validation_error"}, log_console=log_console)
+                events.append(
+                    self._event(
+                        "workflow_error",
+                        "error",
+                        step=step,
+                        content=err_msg,
+                        error=err_msg,
+                        validation_stage=validated.stage,
+                        action=validated.action,
+                        details=err_details,
+                        normalized=normalized,
+                    )
+                )
                 return events, {"error": True}
 
+            action_obj = validated.action_obj
+            normalized = validated.normalized
             action_name = normalized.get("action")
             guard_ok, guard_msg = self._guard_action_execution(action_obj, normalized)
             if not guard_ok:
@@ -263,12 +368,34 @@ class GatewayActionWorkflow(BaseWorkflow):
                 if str(action_name or "").startswith("gui_"):
                     prepared = self._prepare_gui_direct_action(normalized)
                     if prepared is not normalized:
-                        bad_format, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(prepared, actor)
-                        if bad_format:
+                        allowed_for_validation = getattr(self, "action_names_to_use", None)
+                        prepared_validated = validate_action_response(
+                            prepared,
+                            registry=self.action_registry,
+                            allowed_actions=allowed_for_validation,
+                            actor=actor,
+                        )
+                        if isinstance(prepared_validated, ActionValidationError):
                             self.WORKFLOW_TURN = "user"
-                            self.update_history(actor="system", content=err_msg, action={"action": "system_info"}, log_console=log_console)
-                            events.append(self._event("workflow_error", "error", step=step, content=err_msg, error=err_msg, normalized=normalized))
+                            err_msg = f"[Action validation {prepared_validated.stage}] {prepared_validated.message}"
+                            err_details = prepared_validated.model_dump(mode="json")
+                            self.update_history(actor="system", content=err_details, action={"action": "action_validation_error"}, log_console=log_console)
+                            events.append(
+                                self._event(
+                                    "workflow_error",
+                                    "error",
+                                    step=step,
+                                    content=err_msg,
+                                    error=err_msg,
+                                    validation_stage=prepared_validated.stage,
+                                    action=prepared_validated.action,
+                                    details=err_details,
+                                    normalized=prepared,
+                                )
+                            )
                             return events, {"error": True, "action": action_name}
+                        action_obj = prepared_validated.action_obj
+                        normalized = prepared_validated.normalized
                 result = await asyncio.to_thread(action_obj.execute, infra=self.infra)
 
             # Existing action execute() methods often append directly to infra;
@@ -442,22 +569,35 @@ class GatewayActionWorkflow(BaseWorkflow):
         if not action_name.startswith("gui_"):
             return normalized
 
-        policy = getattr(self, "gateway_action_policy", {}) or {}
-        gui_url = str(policy.get("gui_url") or "").strip().rstrip("/")
-        if not gui_url:
-            return normalized
-
         payload = normalized.get("payload")
         if not isinstance(payload, dict):
             payload = {}
 
-        # Preserve an explicit model-provided gui_url, but inject the route
-        # resolved by the gateway when the model did not provide one.
-        if str(payload.get("gui_url") or "").strip():
+        raw_payload_gui_url = str(payload.get("gui_url") or "").strip()
+        sentinel_gui_urls = {"default", "auto", "browser", "gui", "local", "none", "null"}
+        payload_gui_url_is_sentinel = raw_payload_gui_url.lower().rstrip("/") in sentinel_gui_urls
+
+        # Preserve an explicit model-provided real URL, but do not preserve
+        # sentinel/default words. Models sometimes emit gui_url="default" to mean
+        # "use the connected GUI"; using that string literally creates invalid
+        # URLs such as "default/api/gui/dashboards/publish".
+        if raw_payload_gui_url and not payload_gui_url_is_sentinel:
             return normalized
 
+        policy = getattr(self, "gateway_action_policy", {}) or {}
+        gui_url = str(policy.get("gui_url") or "").strip().rstrip("/")
+
         prepared = dict(normalized)
-        prepared["payload"] = {**payload, "gui_url": gui_url}
+        prepared_payload = dict(payload)
+        if gui_url:
+            prepared_payload["gui_url"] = gui_url
+        elif payload_gui_url_is_sentinel:
+            # No resolved GUI URL is available. Remove the sentinel so
+            # gui_actions.py can use WOLF_GUI_URL / DEFAULT_GUI_URL fallback.
+            prepared_payload.pop("gui_url", None)
+        else:
+            return normalized
+        prepared["payload"] = prepared_payload
         return prepared
 
     def _guard_action_execution(self, action_obj: Any, normalized: Dict[str, Any]) -> tuple[bool, str]:
