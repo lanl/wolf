@@ -316,7 +316,7 @@ textarea { width: 100%; resize: vertical; min-height: 74px; padding: 10px; }
 }
 
 
-/* Wolf/Cerberus gateway overlay: additive, scoped, non-breaking. */
+/* WOLF gateway overlay: additive, scoped, non-breaking. */
 .wolf-gateway-open,
 .wolf-gateway-mini {
   position: static;

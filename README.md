@@ -1,12 +1,12 @@
-# Cerberus / WOLF
+# WOLF
 
-**Cerberus** is the development cousin of the production **WOLF** application. Historically, WOLF has meant the **Workflow Orchestration Language Framework**. As the project evolves, WOLF also names the **Workflow Orchestration Learning Framework**: a philosophy and runtime direction for agents that learn from workflows, tools, users, environments, and their own operational traces.
+Historically, WOLF has meant the **Workflow Orchestration Language Framework**. As the project evolves, WOLF also names the **Workflow Orchestration Learning Framework**: a philosophy and runtime direction for agents that learn from workflows, tools, users, environments, and their own operational traces.
 
 Most agent systems give models tools.
 
 **WOLF gives agents worlds.**
 
-Cerberus / WOLF is not merely an agent harness. It is a **learning framework**: an infrastructure substrate that agents, harnesses, workflows, and users can inhabit while solving tasks. It provides agents with curated action spaces, memory, context management, knowledgebases, toolboxes, universes/actionboxes, gateway runtimes, and shared visual workspaces so they can interact with environments rather than only call tools.
+WOLF is not merely an agent harness. It is a **learning framework**: an infrastructure substrate that agents, harnesses, workflows, and users can inhabit while solving tasks. It provides agents with curated action spaces, memory, context management, knowledgebases, toolboxes, universes/actionboxes, gateway runtimes, and shared visual workspaces so they can interact with environments rather than only call tools.
 
 The core design bet is inspired by Richard Sutton's **Bitter Lesson**: durable progress comes less from hand-encoding every decision and more from building general systems that can learn from computation, search, feedback, and interaction with environments. WOLF therefore emphasizes agents that can explore, discover, exploit, evaluate, remember, and improve their own strategies over time.
 
@@ -20,7 +20,7 @@ Much of the repository still uses **WOLF** terminology in code, prompts, configu
 
 ## Table of Contents
 
-1. [What is Cerberus / WOLF?](#what-is-cerberus--wolf)
+1. [What is WOLF?](#what-is-wolf)
 2. [Why WOLF is Different](#why-wolf-is-different)
 3. [Levels of Agency](#levels-of-agency)
 4. [WOLF Philosophy](#wolf-philosophy)
@@ -45,9 +45,9 @@ Much of the repository still uses **WOLF** terminology in code, prompts, configu
 
 ---
 
-## What is Cerberus / WOLF?
+## What is WOLF?
 
-Cerberus / WOLF provides a composable learning runtime for agentic workflows. Instead of treating an LLM as a text generator attached to tools, WOLF treats an agent as an actor inside an infrastructure-rich environment. The active workflow expects agents to emit validated JSON **actions**. Those actions are discovered dynamically from the framework, validated with Pydantic models, executed through the local infrastructure layer, and routed back to the user, system, another agent, the GUI/VUI, or an external sandboxed universe.
+WOLF provides a composable learning runtime for agentic workflows. Instead of treating an LLM as a text generator attached to tools, WOLF treats an agent as an actor inside an infrastructure-rich environment. The active workflow expects agents to emit validated JSON **actions**. Those actions are discovered dynamically from the framework, validated with Pydantic models, executed through the local infrastructure layer, and routed back to the user, system, another agent, the GUI/VUI, or an external sandboxed universe.
 
 WOLF can be used as a harness, but it is broader than a harness. A harness usually wraps an agent so it can perform a task. WOLF provides the environment, memory, action space, workflow substrate, evaluation traces, and shared work surfaces that let agents and harnesses improve how tasks are performed.
 
@@ -311,13 +311,11 @@ git clone git@github.com:lanl/wolf.git
 cd wolf
 ```
 
-> Note: Although this development repository is referred to as Cerberus in some contexts, many commands, paths, prompts, and code objects still use the WOLF name.
-
 ---
 
 ### 2. Install the environment
 
-Cerberus / WOLF can be installed using several Python environment workflows. The older Conda-only setup is still supported, but the repository now includes `pyproject.toml`, so `uv`, `pip`, and other PEP 517/518-compatible tools can be used as well.
+WOLF can be installed using several Python environment workflows. The older Conda-only setup is still supported, but the repository now includes `pyproject.toml`, so `uv`, `pip`, and other PEP 517/518-compatible tools can be used as well.
 
 Python 3.13 or newer is recommended unless your branch or deployment environment specifies otherwise.
 
