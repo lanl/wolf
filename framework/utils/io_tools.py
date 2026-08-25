@@ -33,8 +33,8 @@ def load_env_vars(env_path=".env"):
     env_file = Path(env_path)
     if not env_file.exists():
         print(f".env file not found at {env_path}")
-        return {}
-    load_dotenv(dotenv_path=env_file)
+    else:
+        load_dotenv(dotenv_path=env_file)
     return {key: os.getenv(key) for key in os.environ}
 
 def _resolve_path(file_path: Union[str, Path]) -> Path:
