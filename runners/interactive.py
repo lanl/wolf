@@ -12,12 +12,13 @@ import tiktoken
 from config.defaults.inference_engine import LLM
 from config.session.default.params.inputs import session_params
 from framework.utils.config_tools import CliSession #setup_cli_session
+from framework.utils.io_tools import WOLF_PATH
 from framework.agentic.default.params.llm_params import LocalInferenceEngineParams
 
 """ HINT: Seesion inputus can be found in  config/session/default/params/inputs.py: make sure params:
 session_params = {"tiktoken_cache_dir": (Path.cwd() / ".tiktoken_cache").resolve(),
                   "curl_ca_bundle_file": None.
-                  "banner_image_file": f"{(Path.cwd() / 'config/preferences/banner').resolve()}/WOLF.png".strip(),
+                  "banner_image_file": f"{(WOLF_PATH / 'config/preferences/banner').resolve()}/WOLF.png".strip(),
                   "banner_image_color": "purple",
                   "banner_image_width": 100,
                   "universes":[],

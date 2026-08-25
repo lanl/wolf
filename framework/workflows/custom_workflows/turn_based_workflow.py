@@ -1,6 +1,7 @@
 from typing import Any, List, Optional
 
-from framework.utils.io_tools import console, jsonfy, save_pickle_file, load_pickle_file
+from framework.utils.io_tools import (
+    WOLF_PATH, console, jsonfy, save_pickle_file, load_pickle_file)
 from framework.utils.json_parsing import robust_jsonfy
 # Import the updated workflow models that provide action‑subset capability
 from framework.workflows.workflow_models import (
@@ -29,9 +30,9 @@ class TurnBasedWorkflow(BaseWorkflow):
                  session: BaseSession|str|None      = None,
                  infra: BaseInfrastructure|None      = None, 
                  actions_union: Any                  = FullActions,
-                 wf_rules_file: str|None             ="config/preferences/rules/workflow/basewf.md",
-                 wf_agent_behaviour_file: str|None   ="config/preferences/behaviour/workflow/basewf.md",
-                 wf_agent_sys_prompt_file: str|None  ="config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md",
+                 wf_rules_file: str|None             = str(WOLF_PATH / "config/preferences/rules/workflow/basewf.md"),
+                 wf_agent_behaviour_file: str|None   = str(WOLF_PATH / "config/preferences/behaviour/workflow/basewf.md"),
+                 wf_agent_sys_prompt_file: str|None  = str(WOLF_PATH / "config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md"),
                  wf_user:str                         = "user",
                  wf_turn                             = None
                  ):

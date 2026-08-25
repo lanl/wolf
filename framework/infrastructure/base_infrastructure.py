@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from framework.utils.io_tools import console, jsonfy, expand_dict
+from framework.utils.io_tools import WOLF_PATH, console, jsonfy, expand_dict
 from framework.utils.tokenomics import (
     num_tokens_from_string,
     num_tokens_chat_entry,
@@ -43,7 +43,7 @@ class BaseInfrastructure:
         traces_vector_store: Any = None,
         summaries_vector_store: Any = None,
         db_client: Any = None,
-        infra_description_file = "framework/infrastructure/config/base_infra_description.md",
+        infra_description_file = str(WOLF_PATH / "framework/infrastructure/config/base_infra_description.md"),
         input_processor: Any = None,
         input_processor_config: Any = None
     ):
