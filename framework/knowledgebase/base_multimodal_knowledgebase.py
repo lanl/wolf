@@ -412,13 +412,24 @@ class MultimodalKnowledgeBase:
                 for r in cur.fetchall()
             ]
 
-    def _get_extracted_pdf_images_dir(self, document_id: str) -> pathlib.Path:
+    def _resolve_effective_persist_extracted_images(self, persist_extracted_images: Optional[bool] = None) -> bool:
+        if persist_extracted_images is None:
+            return bool(getattr(self.params, "persist_extracted_pdf_images", False))
+        return bool(persist_extracted_images)
+
+    def _resolve_effective_extracted_images_base_dir(self, extracted_image_dir: Optional[str] = None) -> pathlib.Path:
+        if extracted_image_dir:
+            return pathlib.Path(os.path.expanduser(extracted_image_dir))
+
         configured_dir = getattr(self.params, "extracted_pdf_images_dir", None)
         if configured_dir:
-            base_dir = pathlib.Path(os.path.expanduser(configured_dir))
-        else:
-            persist_dir = self.params.persist_dir or "./chroma_db"
-            base_dir = pathlib.Path(persist_dir) / f"{self.name}_assets" / "images"
+            return pathlib.Path(os.path.expanduser(configured_dir))
+
+        persist_dir = self.params.persist_dir or "./chroma_db"
+        return pathlib.Path(persist_dir) / f"{self.name}_assets" / "images"
+
+    def _get_extracted_pdf_images_dir(self, document_id: str, extracted_image_dir: Optional[str] = None) -> pathlib.Path:
+        base_dir = self._resolve_effective_extracted_images_base_dir(extracted_image_dir=extracted_image_dir)
         doc_dir = base_dir / document_id
         doc_dir.mkdir(parents=True, exist_ok=True)
         return doc_dir
@@ -430,20 +441,27 @@ class MultimodalKnowledgeBase:
         page_number: int,
         image_index: int,
         image_ext: str,
+        persist_extracted_images: Optional[bool] = None,
+        extracted_image_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         image_sha256 = hashlib.sha256(image_bytes).hexdigest()
-        persist_images = bool(getattr(self.params, "persist_extracted_pdf_images", False))
+        effective_persist = self._resolve_effective_persist_extracted_images(
+            persist_extracted_images=persist_extracted_images
+        )
 
         result: Dict[str, Any] = {
             "image_sha256": image_sha256,
             "persisted_image": False,
         }
 
-        if not persist_images:
+        if not effective_persist:
             return result
 
         ext = (image_ext or "png").lstrip(".").lower() or "png"
-        images_dir = self._get_extracted_pdf_images_dir(document_id)
+        images_dir = self._get_extracted_pdf_images_dir(
+            document_id,
+            extracted_image_dir=extracted_image_dir,
+        )
         file_name = f"page_{page_number:03d}_img_{image_index:03d}.{ext}"
         file_path = images_dir / file_name
         file_path.write_bytes(image_bytes)
@@ -463,6 +481,8 @@ class MultimodalKnowledgeBase:
         metadata: Optional[Dict[str, Any]] = None,
         extract_images: bool = True,
         extract_tables: bool = True,
+        persist_extracted_images: Optional[bool] = None,
+        extracted_image_dir: Optional[str] = None,
         collection: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not PYMUPDF_AVAILABLE:
@@ -472,6 +492,12 @@ class MultimodalKnowledgeBase:
 
         document_id = str(uuid.uuid4())
         source_name = "bytes"
+        effective_persist_extracted_images = self._resolve_effective_persist_extracted_images(
+            persist_extracted_images=persist_extracted_images
+        )
+        effective_extracted_images_base_dir = self._resolve_effective_extracted_images_base_dir(
+            extracted_image_dir=extracted_image_dir
+        )
 
         try:
             if isinstance(pdf_content, (str, pathlib.Path)):
@@ -503,11 +529,13 @@ class MultimodalKnowledgeBase:
 
         self._logger.info(f"Parsing PDF with {n_pages} pages: {source_name}")
         self._logger.info(
-            "PDF ingestion start kb=%s source=%s extract_images=%s extract_tables=%s collection=%s",
+            "PDF ingestion start kb=%s source=%s extract_images=%s extract_tables=%s persist_extracted_images=%s extracted_image_base_dir=%s collection=%s",
             self.name,
             source_name,
             extract_images,
             extract_tables,
+            effective_persist_extracted_images,
+            str(effective_extracted_images_base_dir),
             collection or self.default_collection,
         )
 
@@ -579,6 +607,8 @@ class MultimodalKnowledgeBase:
                                 page_number=page_num + 1,
                                 image_index=img_index,
                                 image_ext=image_ext,
+                                persist_extracted_images=persist_extracted_images,
+                                extracted_image_dir=extracted_image_dir,
                             )
 
                             img_metadata = dict(page_metadata)
@@ -724,6 +754,8 @@ class MultimodalKnowledgeBase:
             "n_text_chunks": len(all_text_results),
             "n_images": len(all_image_results),
             "n_tables": len(all_table_results),
+            "persisted_images": effective_persist_extracted_images,
+            "extracted_image_base_dir": str(effective_extracted_images_base_dir.resolve()) if effective_persist_extracted_images else None,
             "status": "success" if not extraction_errors else "partial_success",
         }
 

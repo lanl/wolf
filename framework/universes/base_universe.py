@@ -216,7 +216,7 @@ class BaseUniverse:
         metadata: Optional[Dict[str, Any]] = None,
         extract_images: bool = True,
         extract_tables: bool = True,
-        persist_extracted_images: Optional[bool] = None,
+        persist_extracted_images: Optional[bool] = True,
         extracted_image_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add a PDF document to a multimodal knowledge base, extracting text, images, and tables."""
@@ -224,17 +224,13 @@ class BaseUniverse:
         if not isinstance(kb, MultimodalKnowledgeBase):
             raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
 
-        effective_metadata = dict(metadata or {})
-        if persist_extracted_images is not None:
-            effective_metadata["persist_extracted_images"] = persist_extracted_images
-        if extracted_image_dir is not None:
-            effective_metadata["extracted_image_dir"] = extracted_image_dir
-
         return kb.add_pdf_document(
             pdf_content,
-            metadata=effective_metadata,
+            metadata=metadata,
             extract_images=extract_images,
             extract_tables=extract_tables,
+            persist_extracted_images=persist_extracted_images,
+            extracted_image_dir=extracted_image_dir,
         )
 
     async def akb_add_pdf(
@@ -244,7 +240,7 @@ class BaseUniverse:
         metadata: Optional[Dict[str, Any]] = None,
         extract_images: bool = True,
         extract_tables: bool = True,
-        persist_extracted_images: Optional[bool] = None,
+        persist_extracted_images: Optional[bool] = True,
         extracted_image_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add a PDF document to a multimodal knowledge base, extracting text, images, and tables (async)."""
@@ -252,18 +248,14 @@ class BaseUniverse:
         if not isinstance(kb, MultimodalKnowledgeBase):
             raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
 
-        effective_metadata = dict(metadata or {})
-        if persist_extracted_images is not None:
-            effective_metadata["persist_extracted_images"] = persist_extracted_images
-        if extracted_image_dir is not None:
-            effective_metadata["extracted_image_dir"] = extracted_image_dir
-
         # add_pdf_document is sync but uses _run_async_in_thread internally
         return kb.add_pdf_document(
             pdf_content,
-            metadata=effective_metadata,
+            metadata=metadata,
             extract_images=extract_images,
             extract_tables=extract_tables,
+            persist_extracted_images=persist_extracted_images,
+            extracted_image_dir=extracted_image_dir,
         )
 
     def kb_stats(self, name: str) -> Dict[str, int]:
@@ -416,7 +408,7 @@ class AddPDFRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata for the PDF")
     extract_images: bool = Field(True, description="Whether to extract images from PDF")
     extract_tables: bool = Field(True, description="Whether to extract tables from PDF")
-    persist_extracted_images: Optional[bool] = Field(None, description="Override KB default for whether extracted PDF images are physically saved to disk")
+    persist_extracted_images: bool = Field(True, description="Whether extracted PDF images should be physically saved to disk")
     extracted_image_dir: Optional[str] = Field(None, description="Optional directory where extracted PDF images should be persisted")
 
 
@@ -742,6 +734,8 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
                         detail=f"Invalid base64-encoded PDF content: {str(e)}"
                     )
 
+            effective_extracted_image_dir = os.path.expanduser(req.extracted_image_dir) if req.extracted_image_dir else None
+
             summary = await universe.akb_add_pdf(
                 name,
                 pdf_content,
@@ -749,7 +743,7 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
                 extract_images=req.extract_images,
                 extract_tables=req.extract_tables,
                 persist_extracted_images=req.persist_extracted_images,
-                extracted_image_dir=req.extracted_image_dir,
+                extracted_image_dir=effective_extracted_image_dir,
             )
 
             return {

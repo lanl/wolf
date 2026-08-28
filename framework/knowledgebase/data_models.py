@@ -42,7 +42,7 @@ class MultimodalKnowledgeBaseParams(BaseModel):
     )
     
     inventory_path: str|None = Field(None, description='(Optional) Path to directory containing documentation files to upload')
-    persist_dir: str|None = Field(None, description='(Optional) Path to directory where the KB SQLite inventory database will be stored. Defaults to <inventory_path>/inventory_db if inventory_path is provided, otherwise defaults to <session_dir>/VStore')
+    persist_dir: str|None = Field(None, description='(Optional) Path to directory where the KB SQLite inventory database will be stored. Defaults to <inventory_path>/inventory_db if inventory_path is provided, otherwise defaults to ./chroma_db')
     rebuild_vstore: bool = Field(False, description='Flag for rebuilding the vector store by recreating the collection and reuploading the files')
     
     # BM25 and RRF parameters
@@ -60,7 +60,7 @@ class MultimodalKnowledgeBaseParams(BaseModel):
 
     # PDF image persistence
     persist_extracted_pdf_images: bool = Field(
-        False,
+        True,
         description='Whether images extracted during PDF ingestion should be physically persisted to disk'
     )
     extracted_pdf_images_dir: Optional[str] = Field(
@@ -72,10 +72,17 @@ class MultimodalKnowledgeBaseParams(BaseModel):
 
     @model_validator(mode='after')
     def set_persist_dir_default(self):
-        """Set persist_dir based on inventory_path if not explicitly provided."""
+        """Set deterministic defaults and normalize configured paths."""
         if self.persist_dir is None and self.inventory_path is not None:
-            # Set persist_dir to <inventory_path>/inventory_db
             self.persist_dir = os.path.join(os.path.expanduser(self.inventory_path), "inventory_db")
+        elif self.persist_dir is None:
+            self.persist_dir = "./chroma_db"
+        else:
+            self.persist_dir = os.path.expanduser(self.persist_dir)
+
+        if self.extracted_pdf_images_dir is not None:
+            self.extracted_pdf_images_dir = os.path.expanduser(self.extracted_pdf_images_dir)
+
         return self
 
 multimodal_kb_params_type = NewType('multimodal_kb_params_type', Type[MultimodalKnowledgeBaseParams])

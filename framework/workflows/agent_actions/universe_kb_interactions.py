@@ -12,6 +12,11 @@ from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnow
 from framework.universes.base_universe import CreateKBRequest
 
 from framework.workflows.base_agent_action import AgentAction
+from framework.workflows.relevance_filtering import (
+    search_direct,
+    search_with_rolling_window,
+    search_with_agentic_internal_questions,
+)
 
 
 # Default timeout for all HTTP requests
@@ -147,6 +152,19 @@ class KBSearchArgs(BaseModel):
     query: str = Field(description="Search query")
     k: int = Field(default=5, description="Number of results to return")
     context_window: int = Field(default=1, description="Context window size for results")
+    search_mode: Literal["direct_search", "rolling_window", "agentic_internal_questions"] = Field(
+        default="direct_search",
+        description="KB search strategy to use"
+    )
+    batch_size: int = Field(default=10, description="Batch size for rolling-window search")
+    max_batches: int = Field(default=5, description="Maximum number of batches to process for rolling-window search")
+    max_relevant_results: Optional[int] = Field(default=None, description="Optional cap on relevant results returned by advanced search modes")
+    dedupe_by: str = Field(default="id", description="Candidate deduplication key: id, source, or document")
+    require_strict_yes_no: bool = Field(default=True, description="Require strict yes/no answers for relevance checks")
+    include_nonrelevant: bool = Field(default=False, description="Include nonrelevant results metadata for advanced modes")
+    show_steps: bool = Field(default=False, description="Print intermediate advanced-search steps for debugging")
+    max_internal_questions: int = Field(default=3, description="Maximum number of generated internal questions")
+    k_per_internal_question: Optional[int] = Field(default=None, description="Results to retrieve per internal question; defaults to k")
 
 
 class UniverseKBSearchAction(AgentAction):
@@ -160,42 +178,92 @@ class UniverseKBSearchAction(AgentAction):
                               "kb_name": <string>,
                               "query": <string>,
                               "k": <int> (optional, default=5),
-                              "context_window": <int> (optional, default=1)
+                              "context_window": <int> (optional, default=1),
+                              "search_mode": <string> (optional, default="direct_search"),
+                              "batch_size": <int> (optional, default=10),
+                              "max_batches": <int> (optional, default=5),
+                              "max_relevant_results": <int|null> (optional),
+                              "dedupe_by": <string> (optional, default="id"),
+                              "require_strict_yes_no": <bool> (optional, default=true),
+                              "include_nonrelevant": <bool> (optional, default=false),
+                              "show_steps": <bool> (optional, default=false),
+                              "max_internal_questions": <int> (optional, default=3),
+                              "k_per_internal_question": <int|null> (optional)
                               }
                               """
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
+
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        result: Dict[str, Any]
+        univ_base_url = f"universe={univ_name}"
+
         try:
             univ = infra.UNIVs[univ_name]
+            if hasattr(univ, "get_base_url"):
+                univ_base_url = univ.get_base_url()
         except Exception as info_err:
             ctx_msg = (f"[ERROR] finding universe {univ_name}'s info:\n"
                        f"  {info_err}")
-            infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
+            infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True)
             return
+
         try:
-            univ_base_url = univ.get_base_url()
-            response = requests.post(
-                f"{univ_base_url}/kbs/{self.payload.kb_name}/search",
-                json={"query": self.payload.query, "k": self.payload.k, "context_window": self.payload.context_window},
-                timeout=DEFAULT_TIMEOUT
-            )
-            response.raise_for_status()
-            result = response.json()
-            if not isinstance(result, list):
-                result = {"error": "Invalid response format, expected list", "action": self.action}
-            result = {"results": result, "count": len(result)}
+            search_mode = self.payload.search_mode
+            if search_mode == "direct_search":
+                result = search_direct(
+                    infra=infra,
+                    universe_name=univ_name,
+                    kb_name=self.payload.kb_name,
+                    query=self.payload.query,
+                    k=self.payload.k,
+                    context_window=self.payload.context_window,
+                )
+            elif search_mode == "rolling_window":
+                result = search_with_rolling_window(
+                    user_input=self.payload.query,
+                    agent=infra.agent,
+                    infra=infra,
+                    universe_name=univ_name,
+                    kb_name=self.payload.kb_name,
+                    batch_size=self.payload.batch_size,
+                    max_batches=self.payload.max_batches,
+                    context_window=self.payload.context_window,
+                    dedupe_by=self.payload.dedupe_by,
+                    require_strict_yes_no=self.payload.require_strict_yes_no,
+                    include_nonrelevant=self.payload.include_nonrelevant,
+                    max_relevant_results=self.payload.max_relevant_results,
+                    show_steps=self.payload.show_steps,
+                )
+            elif search_mode == "agentic_internal_questions":
+                result = search_with_agentic_internal_questions(
+                    user_input=self.payload.query,
+                    agent=infra.agent,
+                    infra=infra,
+                    universe_name=univ_name,
+                    kb_name=self.payload.kb_name,
+                    k_per_internal_question=self.payload.k_per_internal_question or self.payload.k,
+                    context_window=self.payload.context_window,
+                    max_internal_questions=self.payload.max_internal_questions,
+                    dedupe_by=self.payload.dedupe_by,
+                    require_strict_yes_no=self.payload.require_strict_yes_no,
+                    include_nonrelevant=self.payload.include_nonrelevant,
+                    max_relevant_results=self.payload.max_relevant_results,
+                    show_steps=self.payload.show_steps,
+                )
+            else:
+                result = {"error": f"Unsupported search_mode: {search_mode}", "action": self.action}
         except requests.exceptions.Timeout:
             result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
             result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
             result = {"error": str(e), "action": self.action}
-        ## Show results
+
         ctx_msg = (f"[Universe: {univ_base_url}] Knowledgebase query results:\n"
                    f"{result}")
-        infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
-        return
+        infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True)
+        return result
 
 
 class KBAppendTextsArgs(BaseModel):
@@ -417,7 +485,7 @@ class KBAddPDFArgs(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata for the PDF")
     extract_images: bool = Field(default=True, description="Whether to extract images from PDF")
     extract_tables: bool = Field(default=True, description="Whether to extract tables from PDF")
-    persist_extracted_images: Optional[bool] = Field(default=None, description="Override KB default for whether extracted PDF images are physically saved to disk")
+    persist_extracted_images: bool = Field(default=True, description="Whether extracted PDF images are physically saved to disk")
     extracted_image_dir: Optional[str] = Field(default=None, description="Optional directory where extracted PDF images should be persisted")
 
 
@@ -435,7 +503,7 @@ class UniverseKBAddPDFAction(AgentAction):
                             "metadata": <dict> (optional),
                             "extract_images": <bool> (optional, default=True),
                             "extract_tables": <bool> (optional, default=True),
-                            "persist_extracted_images": <bool> (optional),
+                            "persist_extracted_images": <bool> (optional, default=True),
                             "extracted_image_dir": <string> (optional)}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
