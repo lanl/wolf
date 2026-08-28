@@ -7,31 +7,38 @@ import concurrent.futures
 import json
 import os
 import sqlite3
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Union
+import uuid
+import traceback
+import hashlib
+from typing import Any, Dict, Iterable, List, Optional, Union, Tuple
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Core imports
 # ---------------------------------------------------------------------------
 import chromadb
-from chromadb.config import Settings
-from framework.data_store.data_models import MultimodalEmbeddingParams, MultimodalVectorStoreParams
+from framework.data_store.data_models import MultimodalVectorStoreParams
 from framework.data_store.multimodal_vstore import MultimodalVectorStore
 from framework.knowledgebase.data_models import MultimodalKnowledgeBaseParams
+
+# PDF parsing imports
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Inventory (SQLite) schema for multimodal KB
 # ---------------------------------------------------------------------------
 
 MULTIMODAL_INVENTORY_SCHEMA = """
-PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_path TEXT,
     doc_type   TEXT,
-    modality   TEXT,    -- 'text', 'image', 'audio', 'video', 'table', 'binary'
-    v_ids_json TEXT,    -- JSON array of vector IDs associated with this source
+    modality   TEXT,
+    v_ids_json TEXT,
     n_chunks   INTEGER,
     n_tokens   INTEGER,
     added_at   TEXT
@@ -41,12 +48,12 @@ CREATE INDEX IF NOT EXISTS idx_documents_modality ON documents(modality);
 
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    v_id       TEXT,      -- vector id returned by the vstore
+    v_id       TEXT,
     source_path TEXT,
-    modality   TEXT,      -- modality of this chunk
-    line_start INTEGER,   -- line number where chunk starts (for text)
-    line_end   INTEGER,   -- line number where chunk ends (for text)
-    position   INTEGER,   -- position/order within the source
+    modality   TEXT,
+    line_start INTEGER,
+    line_end   INTEGER,
+    position   INTEGER,
     n_tokens   INTEGER,
     metadata_json TEXT,
     added_at   TEXT
@@ -56,53 +63,238 @@ CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_path);
 CREATE INDEX IF NOT EXISTS idx_chunks_modality ON chunks(modality);
 """
 
+
 def _now_iso() -> str:
-    """Return current UTC timestamp in ISO format."""
     dt = datetime.now(timezone.utc).replace(microsecond=0)
     return dt.isoformat().replace("+00:00", "Z")
 
+
 def _count_tokens(text: str) -> int:
-    """Conservative token proxy (whitespace split)."""
     return len(str(text).split())
 
-# ---------------------------------------------------------------------------
-# Types accepted by the public API
-# ---------------------------------------------------------------------------
+
 SupportedModalities = Union[
-    str,               # raw text string
-    pathlib.Path,      # local file path (any modality)
-    bytes,             # raw bytes for non‑text modalities
+    str,
+    pathlib.Path,
+    bytes,
 ]
 
+
 # ---------------------------------------------------------------------------
-# MultimodalKnowledgeBase – independent wrapper (no inheritance)
+# Enhanced PDF extraction helpers with FLAT metadata
 # ---------------------------------------------------------------------------
+
+def _flatten_spatial_metadata(nested: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    flat = {}
+    for key, value in nested.items():
+        new_key = f"{prefix}_{key}" if prefix else key
+
+        if isinstance(value, dict):
+            flat.update(_flatten_spatial_metadata(value, new_key))
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            flat[new_key] = value
+        elif isinstance(value, list):
+            try:
+                if all(isinstance(item, (str, int, float, bool)) or item is None for item in value):
+                    flat[new_key] = value
+                else:
+                    flat[new_key] = json.dumps(value)
+            except Exception:
+                flat[new_key] = str(value)
+        else:
+            flat[new_key] = str(value)
+
+    return flat
+
+
+def _rows_to_csv(rows: list[list[str]]) -> str:
+    return "\n".join(
+        [",".join("" if cell is None else str(cell) for cell in r) for r in rows]
+    )
+
+
+def _extract_section_context(page: "fitz.Page", page_text: str) -> Dict[str, Any]:
+    try:
+        blocks = page.get_text("dict")["blocks"]
+        sections = []
+        font_sizes = []
+        for block in blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        font_sizes.append(span.get("size", 0))
+
+        if not font_sizes:
+            return {"sections": [], "hierarchy": []}
+
+        avg_size = sum(font_sizes) / len(font_sizes)
+        heading_threshold = avg_size * 1.2
+
+        for block in blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    line_text = " ".join(span["text"] for span in line["spans"])
+                    if not line_text.strip():
+                        continue
+                    max_font_size = max((span.get("size", 0) for span in line["spans"]), default=0)
+                    if max_font_size >= heading_threshold:
+                        if re.match(r'^\d+\.', line_text) or re.match(r'^[A-Z][A-Za-z\s]+$', line_text):
+                            sections.append({
+                                "text": line_text.strip(),
+                                "font_size": max_font_size,
+                                "bbox": block.get("bbox", [0, 0, 0, 0])
+                            })
+
+        return {"sections": sections, "hierarchy": sections}
+    except Exception as e:
+        return {"sections": [], "hierarchy": [], "error": str(e)}
+
+
+def _get_page_region(bbox: Tuple[float, float, float, float], page_height: float, page_width: float) -> str:
+    x0, y0, x1, y1 = bbox
+    header_threshold = page_height * 0.1
+    footer_threshold = page_height * 0.9
+    left_margin_threshold = page_width * 0.1
+    right_margin_threshold = page_width * 0.9
+
+    if y0 < header_threshold:
+        return "header"
+    elif y1 > footer_threshold:
+        return "footer"
+    elif x0 < left_margin_threshold:
+        return "left_margin"
+    elif x1 > right_margin_threshold:
+        return "right_margin"
+    else:
+        return "body"
+
+
+def _extract_surrounding_text(page: "fitz.Page", element_bbox: Tuple[float, float, float, float],
+                             context_chars: int = 200) -> Dict[str, str]:
+    try:
+        blocks = page.get_text("dict")["blocks"]
+        all_text_blocks = []
+
+        for block in blocks:
+            if "lines" in block:
+                block_bbox = block.get("bbox", [0, 0, 0, 0])
+                block_text = " ".join(
+                    " ".join(span["text"] for span in line["spans"])
+                    for line in block["lines"]
+                )
+                if block_text.strip():
+                    all_text_blocks.append({
+                        "text": block_text,
+                        "bbox": block_bbox,
+                        "y_center": (block_bbox[1] + block_bbox[3]) / 2
+                    })
+
+        all_text_blocks.sort(key=lambda b: b["y_center"])
+        element_y_center = (element_bbox[1] + element_bbox[3]) / 2
+        preceding_blocks = [b for b in all_text_blocks if b["y_center"] < element_y_center]
+        following_blocks = [b for b in all_text_blocks if b["y_center"] > element_y_center]
+
+        preceding_text = ""
+        if preceding_blocks:
+            preceding_text = " ".join(b["text"] for b in preceding_blocks[-3:])
+            if len(preceding_text) > context_chars:
+                preceding_text = "..." + preceding_text[-context_chars:]
+
+        following_text = ""
+        if following_blocks:
+            following_text = " ".join(b["text"] for b in following_blocks[:3])
+            if len(following_text) > context_chars:
+                following_text = following_text[:context_chars] + "..."
+
+        return {
+            "preceding_text": preceding_text.strip(),
+            "following_text": following_text.strip()
+        }
+    except Exception as e:
+        return {
+            "preceding_text": "",
+            "following_text": "",
+            "error": str(e)
+        }
+
+
+def _find_text_anchors(page_text: str, element_type: str = "image") -> List[str]:
+    anchors = []
+    if element_type == "image":
+        fig_pattern = r'(?:Figure|Fig\.?|Image)\s*\d+'
+        anchors.extend(re.findall(fig_pattern, page_text, re.IGNORECASE))
+    elif element_type == "table":
+        table_pattern = r'Table\s*\d+'
+        anchors.extend(re.findall(table_pattern, page_text, re.IGNORECASE))
+
+    generic_patterns = [
+        r'shown\s+(?:below|above|in\s+(?:Figure|Table)\s*\d+)',
+        r'illustrated\s+(?:below|above|in)',
+        r'depicted\s+(?:below|above|in)',
+        r'as\s+shown',
+        r'see\s+(?:Figure|Table)\s*\d+'
+    ]
+
+    for pattern in generic_patterns:
+        anchors.extend(re.findall(pattern, page_text, re.IGNORECASE))
+
+    return list(set(anchors))
+
+
+def _get_element_spatial_metadata(page: "fitz.Page", element_bbox: Tuple[float, float, float, float],
+                                 element_type: str, page_num: int) -> Dict[str, Any]:
+    page_rect = page.rect
+    page_width = page_rect.width
+    page_height = page_rect.height
+    page_text = page.get_text("text")
+    x0, y0, x1, y1 = element_bbox
+
+    spatial_metadata = {
+        "bbox_x0": round(x0, 2),
+        "bbox_y0": round(y0, 2),
+        "bbox_x1": round(x1, 2),
+        "bbox_y1": round(y1, 2),
+        "bbox_width": round(x1 - x0, 2),
+        "bbox_height": round(y1 - y0, 2),
+        "page_region": _get_page_region(element_bbox, page_height, page_width),
+        "normalized_x_center": round((x0 + x1) / (2 * page_width), 3),
+        "normalized_y_center": round((y0 + y1) / (2 * page_height), 3),
+        "page_width": round(page_width, 2),
+        "page_height": round(page_height, 2)
+    }
+
+    surrounding = _extract_surrounding_text(page, element_bbox)
+    spatial_metadata.update(surrounding)
+
+    text_anchors = _find_text_anchors(page_text, element_type)
+    if text_anchors:
+        spatial_metadata["text_anchors"] = text_anchors
+
+    section_info = _extract_section_context(page, page_text)
+    if section_info["sections"]:
+        element_y = (y0 + y1) / 2
+        nearest_section = None
+        min_distance = float('inf')
+
+        for section in section_info["sections"]:
+            section_y = (section["bbox"][1] + section["bbox"][3]) / 2
+            distance = abs(element_y - section_y)
+            if distance < min_distance and section_y < element_y:
+                min_distance = distance
+                nearest_section = section["text"]
+
+        if nearest_section:
+            spatial_metadata["section_context"] = nearest_section
+
+    return spatial_metadata
+
+
 class MultimodalKnowledgeBase:
-    """Knowledge base that supports text, images, audio, video and binary data.
-
-    The async methods required by the tests (``add_text_docs``, ``query``,
-    ``close``) directly delegate to the underlying ``MultiModalVectorStore``.
-    All other helpers (``add_document``, ``add_documents``, ``add_texts``,
-    ``delete_collection``, …) are kept for API compatibility and simply forward
-    to the same store.
-
-    Includes SQLite inventory tracking similar to KnowledgeBase.
-    """
-
-    # ---------------------------------------------------------------------
-    # Construction – normalise params and create the underlying store
-    # ---------------------------------------------------------------------
     def __init__(self, params: MultimodalKnowledgeBaseParams, db_client: chromadb.Client):
-        """Create a new multimodal KB.
-
-        ``params`` is an instance of ``MultimodalKnowledgeBaseParams``.
-        ``db_client`` is the chromadb.Client instance (session-wide client).
-        """
         self.params = params
         self.name = params.name
         self.VRBZ = int(params.vrbz)
 
-        # Initialize MultimodalVectorStoreParams from MultimodalKnowledgeBaseParams
         vs_params = MultimodalVectorStoreParams(
             collection_name=f"kb_{params.name}_collection",
             chunk_size=params.chunk_size,
@@ -120,14 +312,12 @@ class MultimodalKnowledgeBase:
             vs_VRBZ=params.vrbz
         )
 
-        # Instantiate the underlying MultimodalVectorStore with the session-wide client
         self.store = MultimodalVectorStore(
             params=vs_params,
             client=db_client
         )
         self.default_collection: str = vs_params.collection_name
 
-        # Ensure a logger is configured (info level by default)
         import logging
         self._logger = logging.getLogger(__name__)
         if not self._logger.handlers:
@@ -137,28 +327,44 @@ class MultimodalKnowledgeBase:
             self._logger.addHandler(handler)
             self._logger.setLevel(logging.INFO)
 
-        # Backward‑compatibility shim – expose the client for callers that may need direct access
         self.client = db_client
-
-        # Initialize inventory
         inv_dir = params.persist_dir or "./chroma_db"
         pathlib.Path(inv_dir).mkdir(parents=True, exist_ok=True)
         self.inventory_path = os.path.join(inv_dir, f"{self.name}_inventory.sqlite")
         self._init_inventory()
 
-    # --------------------------
-    # Inventory helpers
-    # --------------------------
-
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.inventory_path, isolation_level=None)
 
     def _init_inventory(self) -> None:
+        schema_error = None
         with self._connect() as cx:
+            try:
+                cx.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError as e:
+                schema_error = e
+                self._logger.warning(
+                    "SQLite WAL mode unavailable for inventory %s; falling back to DELETE mode. Error: %s",
+                    self.inventory_path,
+                    e,
+                )
+                try:
+                    cx.execute("PRAGMA journal_mode=DELETE;")
+                except sqlite3.OperationalError as fallback_error:
+                    self._logger.warning(
+                        "SQLite DELETE journal mode also failed for inventory %s; continuing with default mode. Error: %s",
+                        self.inventory_path,
+                        fallback_error,
+                    )
             cx.executescript(MULTIMODAL_INVENTORY_SCHEMA)
 
+        if schema_error is not None:
+            self._logger.info(
+                "Inventory schema initialized without WAL for %s",
+                self.inventory_path,
+            )
+
     def _record_document(self, source_path: str, doc_type: str, modality: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Record a document in the inventory after it's been added to the vector store."""
         n_chunks = len(results)
         n_tokens = sum(_count_tokens(str(r.get("document", ""))) for r in results)
         v_ids = [r.get("id", f"{source_path}_chunk_{i}") for i, r in enumerate(results)]
@@ -169,7 +375,6 @@ class MultimodalKnowledgeBase:
                 "INSERT INTO documents (source_path, doc_type, modality, v_ids_json, n_chunks, n_tokens, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (source_path, doc_type, modality, json.dumps(v_ids), n_chunks, n_tokens, added_at),
             )
-            # Store chunk-level info
             for i, result in enumerate(results):
                 meta = result.get("metadata", {})
                 v_id = result.get("id", f"{source_path}_chunk_{i}")
@@ -186,12 +391,9 @@ class MultimodalKnowledgeBase:
         return {"source_path": source_path, "doc_type": doc_type, "modality": modality, "n_chunks": n_chunks, "n_tokens": n_tokens, "v_ids": v_ids}
 
     def inventory_stats(self) -> Dict[str, Any]:
-        """Get statistics about the knowledge base inventory."""
         with self._connect() as cx:
             cur = cx.execute("SELECT COUNT(*), COALESCE(SUM(n_chunks),0), COALESCE(SUM(n_tokens),0) FROM documents")
             n_docs, n_chunks, n_tokens = cur.fetchone()
-
-            # Get modality breakdown
             cur = cx.execute("SELECT modality, COUNT(*), COALESCE(SUM(n_chunks),0) FROM documents GROUP BY modality")
             modality_stats = {row[0]: {"n_docs": row[1], "n_chunks": row[2]} for row in cur.fetchall()}
 
@@ -203,7 +405,6 @@ class MultimodalKnowledgeBase:
         }
 
     def list_sources(self) -> List[Dict[str, Any]]:
-        """List all sources in the knowledge base."""
         with self._connect() as cx:
             cur = cx.execute("SELECT source_path, doc_type, modality, n_chunks, n_tokens, added_at FROM documents ORDER BY added_at DESC")
             return [
@@ -211,27 +412,346 @@ class MultimodalKnowledgeBase:
                 for r in cur.fetchall()
             ]
 
-    # ---------------------------------------------------------------------
-    # Async API required by the test suite
-    # ---------------------------------------------------------------------
+    def _get_extracted_pdf_images_dir(self, document_id: str) -> pathlib.Path:
+        configured_dir = getattr(self.params, "extracted_pdf_images_dir", None)
+        if configured_dir:
+            base_dir = pathlib.Path(os.path.expanduser(configured_dir))
+        else:
+            persist_dir = self.params.persist_dir or "./chroma_db"
+            base_dir = pathlib.Path(persist_dir) / f"{self.name}_assets" / "images"
+        doc_dir = base_dir / document_id
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        return doc_dir
+
+    def _persist_pdf_image(
+        self,
+        image_bytes: bytes,
+        document_id: str,
+        page_number: int,
+        image_index: int,
+        image_ext: str,
+    ) -> Dict[str, Any]:
+        image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+        persist_images = bool(getattr(self.params, "persist_extracted_pdf_images", False))
+
+        result: Dict[str, Any] = {
+            "image_sha256": image_sha256,
+            "persisted_image": False,
+        }
+
+        if not persist_images:
+            return result
+
+        ext = (image_ext or "png").lstrip(".").lower() or "png"
+        images_dir = self._get_extracted_pdf_images_dir(document_id)
+        file_name = f"page_{page_number:03d}_img_{image_index:03d}.{ext}"
+        file_path = images_dir / file_name
+        file_path.write_bytes(image_bytes)
+
+        result.update({
+            "persisted_image": True,
+            "stored_file_path": str(file_path.resolve()),
+            "stored_file_name": file_name,
+            "asset_rel_path": str(file_path.relative_to(images_dir.parent.parent)) if images_dir.parent.parent in file_path.parents else str(file_path),
+            "stored_file_size": len(image_bytes),
+        })
+        return result
+
+    def add_pdf_document(
+        self,
+        pdf_content: Union[str, pathlib.Path, bytes],
+        metadata: Optional[Dict[str, Any]] = None,
+        extract_images: bool = True,
+        extract_tables: bool = True,
+        collection: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not PYMUPDF_AVAILABLE:
+            raise ImportError(
+                "PyMuPDF (fitz) is required for PDF parsing. Install with: pip install PyMuPDF"
+            )
+
+        document_id = str(uuid.uuid4())
+        source_name = "bytes"
+
+        try:
+            if isinstance(pdf_content, (str, pathlib.Path)):
+                pdf_path = pathlib.Path(pdf_content)
+                if not pdf_path.exists():
+                    raise ValueError(f"PDF file not found: {pdf_content}")
+                source_name = str(pdf_path)
+                doc = fitz.open(pdf_path)
+            elif isinstance(pdf_content, bytes):
+                doc = fitz.open(stream=pdf_content, filetype="pdf")
+            else:
+                raise ValueError(
+                    f"pdf_content must be str, pathlib.Path, or bytes, got {type(pdf_content)}"
+                )
+        except Exception as e:
+            raise ValueError(f"Failed to open PDF: {e}")
+
+        base_metadata = metadata or {}
+        base_metadata["document_id"] = document_id
+        base_metadata["source"] = source_name
+        base_metadata["doc_type"] = "pdf"
+        base_metadata["extracted_at"] = _now_iso()
+
+        extraction_errors = []
+        n_pages = len(doc)
+        all_text_results: List[Dict[str, Any]] = []
+        all_image_results: List[Dict[str, Any]] = []
+        all_table_results: List[Dict[str, Any]] = []
+
+        self._logger.info(f"Parsing PDF with {n_pages} pages: {source_name}")
+        self._logger.info(
+            "PDF ingestion start kb=%s source=%s extract_images=%s extract_tables=%s collection=%s",
+            self.name,
+            source_name,
+            extract_images,
+            extract_tables,
+            collection or self.default_collection,
+        )
+
+        for page_num in range(n_pages):
+            page = doc[page_num]
+            page_metadata = dict(base_metadata)
+            page_metadata["page_number"] = page_num + 1
+            page_metadata["page"] = page_num + 1
+
+            try:
+                text = page.get_text("text")
+                if text.strip():
+                    self._logger.info(
+                        "PDF page %s text extraction produced %s chars; attempting add_document(text)",
+                        page_num + 1,
+                        len(text),
+                    )
+                    text_metadata = dict(page_metadata)
+                    text_metadata["modality"] = "text"
+                    text_metadata["element_type"] = "page_text"
+                    text_results = self.add_document(
+                        content=text,
+                        metadata=text_metadata,
+                        modality="text",
+                        collection=collection
+                    )
+                    all_text_results.extend(text_results)
+                    self._logger.info(
+                        "PDF page %s text add_document succeeded; chunks_added=%s cumulative_text_chunks=%s",
+                        page_num + 1,
+                        len(text_results),
+                        len(all_text_results),
+                    )
+            except Exception as e:
+                error_msg = f"Failed to extract text from page {page_num + 1}: {e}"
+                self._logger.warning(error_msg)
+                self._logger.warning(traceback.format_exc())
+                extraction_errors.append(error_msg)
+
+            if extract_images:
+                try:
+                    image_list = page.get_images(full=True)
+                    self._logger.info(
+                        "PDF page %s image candidates=%s",
+                        page_num + 1,
+                        len(image_list),
+                    )
+                    for img_index, img in enumerate(image_list):
+                        try:
+                            xref = img[0]
+                            base_image = doc.extract_image(xref)
+                            image_bytes = base_image["image"]
+                            image_ext = base_image["ext"]
+                            img_rects = page.get_image_rects(xref)
+                            if img_rects:
+                                img_bbox = img_rects[0]
+                                spatial_meta = _get_element_spatial_metadata(
+                                    page,
+                                    (img_bbox.x0, img_bbox.y0, img_bbox.x1, img_bbox.y1),
+                                    "image",
+                                    page_num + 1
+                                )
+                            else:
+                                spatial_meta = {"bbox_note": "bbox not available"}
+
+                            persistence_meta = self._persist_pdf_image(
+                                image_bytes=image_bytes,
+                                document_id=document_id,
+                                page_number=page_num + 1,
+                                image_index=img_index,
+                                image_ext=image_ext,
+                            )
+
+                            img_metadata = dict(page_metadata)
+                            img_metadata["modality"] = "image"
+                            img_metadata["element_type"] = "extracted_image"
+                            img_metadata["image_index"] = img_index
+                            img_metadata["image_format"] = image_ext
+                            img_metadata.update(spatial_meta)
+                            img_metadata.update(persistence_meta)
+
+                            self._logger.info(
+                                "PDF page %s image %s extracted bytes=%s format=%s; attempting add_document(image)",
+                                page_num + 1,
+                                img_index,
+                                len(image_bytes),
+                                image_ext,
+                            )
+                            image_results = self.add_document(
+                                content=image_bytes,
+                                metadata=img_metadata,
+                                modality="image",
+                                collection=collection
+                            )
+                            all_image_results.extend(image_results)
+                            self._logger.info(
+                                "PDF page %s image %s add_document succeeded; items_added=%s cumulative_images=%s",
+                                page_num + 1,
+                                img_index,
+                                len(image_results),
+                                len(all_image_results),
+                            )
+                        except Exception as e:
+                            error_msg = f"Failed to extract image {img_index} from page {page_num + 1}: {e}"
+                            self._logger.warning(error_msg)
+                            self._logger.warning(traceback.format_exc())
+                            extraction_errors.append(error_msg)
+                except Exception as e:
+                    error_msg = f"Failed to get images from page {page_num + 1}: {e}"
+                    self._logger.warning(error_msg)
+                    self._logger.warning(traceback.format_exc())
+                    extraction_errors.append(error_msg)
+
+            if extract_tables:
+                try:
+                    if hasattr(page, "find_tables"):
+                        found_tables = page.find_tables()
+                        table_iter = found_tables.tables if hasattr(found_tables, "tables") else found_tables
+                        table_iter = list(table_iter)
+                        self._logger.info(
+                            "PDF page %s table candidates=%s",
+                            page_num + 1,
+                            len(table_iter),
+                        )
+
+                        for table_index, tbl in enumerate(table_iter):
+                            try:
+                                rows = tbl.extract()
+                                if not rows:
+                                    continue
+
+                                table_text = _rows_to_csv(rows)
+                                if not table_text.strip():
+                                    continue
+
+                                table_bbox = None
+                                if hasattr(tbl, "bbox") and tbl.bbox:
+                                    table_bbox = tbl.bbox
+                                elif hasattr(tbl, "rect") and tbl.rect:
+                                    r = tbl.rect
+                                    table_bbox = (r.x0, r.y0, r.x1, r.y1)
+
+                                if table_bbox is not None:
+                                    spatial_meta = _get_element_spatial_metadata(
+                                        page,
+                                        tuple(table_bbox),
+                                        "table",
+                                        page_num + 1,
+                                    )
+                                else:
+                                    spatial_meta = {"bbox_note": "table bbox not available"}
+
+                                table_metadata = dict(page_metadata)
+                                table_metadata["modality"] = "table"
+                                table_metadata["element_type"] = "extracted_table"
+                                table_metadata["table_index"] = table_index
+                                table_metadata["table_rows"] = len(rows)
+                                table_metadata["table_cols"] = max((len(r) for r in rows), default=0)
+                                table_metadata.update(spatial_meta)
+
+                                self._logger.info(
+                                    "PDF page %s table %s rows=%s cols=%s csv_chars=%s; attempting add_document(table)",
+                                    page_num + 1,
+                                    table_index,
+                                    len(rows),
+                                    max((len(r) for r in rows), default=0),
+                                    len(table_text),
+                                )
+                                table_results = self.add_document(
+                                    content=table_text,
+                                    metadata=table_metadata,
+                                    modality="table",
+                                    collection=collection,
+                                )
+                                all_table_results.extend(table_results)
+                                self._logger.info(
+                                    "PDF page %s table %s add_document succeeded; items_added=%s cumulative_tables=%s",
+                                    page_num + 1,
+                                    table_index,
+                                    len(table_results),
+                                    len(all_table_results),
+                                )
+                            except Exception as e:
+                                error_msg = (
+                                    f"Failed to ingest table {table_index} "
+                                    f"from page {page_num + 1}: {e}"
+                                )
+                                self._logger.warning(error_msg)
+                                self._logger.warning(traceback.format_exc())
+                                extraction_errors.append(error_msg)
+                    else:
+                        self._logger.warning(
+                            "PyMuPDF page.find_tables() not available in this version; skipping table extraction"
+                        )
+                except Exception as e:
+                    error_msg = f"Failed to extract tables from page {page_num + 1}: {e}"
+                    self._logger.warning(error_msg)
+                    self._logger.warning(traceback.format_exc())
+                    extraction_errors.append(error_msg)
+
+        doc.close()
+
+        if all_text_results:
+            self._record_document(source_name, "pdf", "text", all_text_results)
+        if all_image_results:
+            self._record_document(source_name, "pdf", "image", all_image_results)
+        if all_table_results:
+            self._record_document(source_name, "pdf", "table", all_table_results)
+
+        summary = {
+            "document_id": document_id,
+            "source": source_name,
+            "n_pages": n_pages,
+            "n_text_chunks": len(all_text_results),
+            "n_images": len(all_image_results),
+            "n_tables": len(all_table_results),
+            "status": "success" if not extraction_errors else "partial_success",
+        }
+
+        if extraction_errors:
+            summary["errors"] = extraction_errors
+            summary["n_errors"] = len(extraction_errors)
+
+        self._logger.info(
+            f"PDF ingestion complete: {len(all_text_results)} text chunks, "
+            f"{len(all_image_results)} images, {len(all_table_results)} tables from {n_pages} pages"
+        )
+
+        return summary
+
     async def add_text_docs(
         self,
         texts: List[str],
         doc_source: str = "user",
         pbar: Optional[str] = None,
     ) -> None:
-        """Asynchronously ingest plain‑text documents.
-
-        Mirrors the behaviour of ``KnowledgeBase.add_text_docs`` but forwards
-        straight to the multimodal store.
-        """
-        await self.store.add_text_docs(texts, doc_source=doc_source)
-
-        # Record in inventory
-        results = await self.store.query_hybrid(query=doc_source, k=len(texts) * 10)
-        filtered_results = [r for r in results if r.get("metadata", {}).get("source") == doc_source]
-        if filtered_results:
-            self._record_document(source_path=f"text://{doc_source}", doc_type="text", modality="text", results=filtered_results)
+        results = await self.store.add_text_docs(texts, doc_source=doc_source)
+        if results:
+            self._record_document(
+                source_path=f"text://{doc_source}",
+                doc_type="text",
+                modality="text",
+                results=results,
+            )
 
     async def query(
         self,
@@ -240,29 +760,19 @@ class MultimodalKnowledgeBase:
         filter: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
-        """Run a query against the multimodal knowledge base.
-
-        ``filter`` may contain ``channel_weights``; this logic is retained.  The
-        default number of results is 5 (the test asks for five hits).  No
-        modality‑specific filtering is performed – the store ranks all modalities
-        together.
-        """
-        # ----- detect visual intent ------------------------------------------------
         visual_keywords = ["picture", "image", "photo", "diagram", "figure", "show", "display"]
         is_visual = any(re.search(r"\b" + kw + r"\b", query, re.IGNORECASE) for kw in visual_keywords)
 
-        # Preserve original ``channel_weights`` handling.
         channel_weights: Optional[Dict[str, float]] = None
         if filter is not None:
-            filter = dict(filter)  # shallow copy
+            filter = dict(filter)
             if "channel_weights" in filter:
                 channel_weights = filter.pop("channel_weights")
                 if not filter:
                     filter = None
 
-        # ----- if visual query and user did not specify weights, apply a boost ----
         if is_visual and channel_weights is None:
-            channel_weights = {"image": 2.0, "text": 0.5}  # tune as needed
+            channel_weights = {"image": 2.0, "text": 0.5}
 
         store_kwargs: Dict[str, Any] = {
             "query": query,
@@ -276,12 +786,8 @@ class MultimodalKnowledgeBase:
         return await self.store.query_hybrid(**store_kwargs)
 
     async def close(self) -> None:
-        """Close any resources held by the underlying store."""
         await self.store.close()
 
-    # ---------------------------------------------------------------------
-    # Compatibility async search interface expected by BaseUniverse
-    # ---------------------------------------------------------------------
     async def asearch(
         self,
         query: str,
@@ -290,23 +796,29 @@ class MultimodalKnowledgeBase:
         context_window: int = 1,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
-        """Alias for ``query`` to satisfy ``BaseUniverse`` expectations.
-        ``with_score`` and ``context_window`` are ignored as the multimodal store
-        does not expose them directly; they are kept for signature compatibility.
-        """
         return await self.query(query, n_results=k, **kwargs)
 
-    # ---------------------------------------------------------------------
-    # Synchronous convenience helpers (kept for backward compatibility)
-    # ---------------------------------------------------------------------
     def _run_async_in_thread(self, coro):
-        """Run an async coroutine in a thread to avoid ``asyncio.run`` errors.
-        """
         def runner():
-            return asyncio.run(coro)
+            self._logger.info("_run_async_in_thread runner starting")
+            try:
+                result = asyncio.run(coro)
+                self._logger.info("_run_async_in_thread runner completed")
+                return result
+            except Exception:
+                self._logger.error("_run_async_in_thread runner failed\n%s", traceback.format_exc())
+                raise
+
+        self._logger.info("_run_async_in_thread submit start")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(runner)
-            return future.result()
+            try:
+                result = future.result()
+                self._logger.info("_run_async_in_thread future.result completed")
+                return result
+            except Exception:
+                self._logger.error("_run_async_in_thread future.result failed\n%s", traceback.format_exc())
+                raise
 
     def add_document(
         self,
@@ -314,50 +826,97 @@ class MultimodalKnowledgeBase:
         metadata: Optional[Dict[str, Any]] = None,
         modality: str = "text",
         collection: Optional[str] = None,
-    ) -> List[str]:
-        """Add a single document (or file) to the knowledge base.
+    ) -> List[Dict[str, Any]]:
+        _ = collection or self.default_collection
+        metadata_keys = sorted(list(metadata.keys())) if metadata else []
+        self._logger.info(
+            "add_document start kb=%s modality=%s content_type=%s metadata_keys=%s collection=%s",
+            self.name,
+            modality,
+            type(content).__name__,
+            metadata_keys,
+            collection or self.default_collection,
+        )
 
-        For all modalities (text, table, image, audio, video, binary), we now
-        use the unified store.add_documents method with the binary_payload parameter.
-        """
-        col = collection or self.default_collection
-
-        # ----- Text modality ------------------------------------------------
         if modality == "text":
+            try:
+                if isinstance(content, pathlib.Path):
+                    self._logger.info("add_document text branch using pathlib.Path source=%s", str(content))
+                    coro = self.store.add_documents([str(content)])
+                    result = self._run_async_in_thread(coro)
+                    self._logger.info("add_document text/path branch success results=%s", len(result))
+                    return result
+                else:
+                    doc_source = metadata.get("source", "user") if metadata else "user"
+                    self._logger.info(
+                        "add_document text branch using add_text_docs doc_source=%s text_chars=%s",
+                        doc_source,
+                        len(str(content)),
+                    )
+                    coro = self.store.add_text_docs(
+                        [str(content)],
+                        doc_source=doc_source,
+                        metadatas=[metadata] if metadata is not None else None,
+                    )
+                    result = self._run_async_in_thread(coro)
+                    self._logger.info("add_document text branch success results=%s", len(result))
+                    return result
+            except Exception:
+                self._logger.error(
+                    "add_document text branch failed modality=%s content_type=%s metadata_keys=%s\n%s",
+                    modality,
+                    type(content).__name__,
+                    metadata_keys,
+                    traceback.format_exc(),
+                )
+                raise
+
+        try:
             if isinstance(content, pathlib.Path):
-                coro = self.store.add_documents([str(content)])
-                self._run_async_in_thread(coro)
-                return []
+                data = content.read_bytes()
+                if metadata is None:
+                    metadata = {}
+                if "source_file" not in metadata:
+                    metadata["source_file"] = content.name
+                self._logger.info(
+                    "add_document binary branch loaded pathlib.Path bytes=%s source_file=%s",
+                    len(data),
+                    metadata.get("source_file"),
+                )
+            elif isinstance(content, bytes):
+                data = content
+                self._logger.info("add_document binary branch received raw bytes=%s", len(data))
+            elif isinstance(content, str):
+                data = content.encode("utf-8")
+                self._logger.info("add_document binary branch encoded str to bytes=%s", len(data))
             else:
-                coro = self.store.add_text_docs([str(content)])
-                self._run_async_in_thread(coro)
-                return []
+                raise ValueError(
+                    f"Unsupported content type for modality '{modality}': {type(content)}"
+                )
 
-        # ----- All other modalities (table, image, audio, video, binary) ------
-        if isinstance(content, pathlib.Path):
-            data = content.read_bytes()
-            # Extract the filename for metadata
-            if metadata is None:
-                metadata = {}
-            if "source_file" not in metadata:
-                metadata["source_file"] = content.name
-        elif isinstance(content, bytes):
-            data = content
-        elif isinstance(content, str):
-            # For table modality, accept raw string
-            data = content.encode("utf-8")
-        else:
-            raise ValueError(
-                f"Unsupported content type for modality '{modality}': {type(content)}"
+            payload = {modality: data}
+            if metadata:
+                payload["metadata"] = metadata
+            self._logger.info(
+                "Adding %s document via store.add_documents payload_keys=%s metadata_keys=%s bytes=%s",
+                modality,
+                sorted(payload.keys()),
+                sorted(list(metadata.keys())) if metadata else [],
+                len(data),
             )
-
-        payload = {modality: data}
-        if metadata:
-            payload["metadata"] = metadata
-        self._logger.info("Adding %s document via store.add_documents", modality)
-        coro = self.store.add_documents([], binary_payload=payload)
-        self._run_async_in_thread(coro)
-        return []
+            coro = self.store.add_documents([], binary_payload=payload)
+            result = self._run_async_in_thread(coro)
+            self._logger.info("add_document binary branch success modality=%s results=%s", modality, len(result))
+            return result
+        except Exception:
+            self._logger.error(
+                "add_document binary branch failed modality=%s content_type=%s metadata_keys=%s\n%s",
+                modality,
+                type(content).__name__,
+                sorted(list(metadata.keys())) if metadata else [],
+                traceback.format_exc(),
+            )
+            raise
 
     def add_documents(
         self,
@@ -365,10 +924,10 @@ class MultimodalKnowledgeBase:
         metadata: Optional[Iterable[Dict[str, Any]]] = None,
         modality: str = "text",
         collection: Optional[str] = None,
-    ) -> List[List[str]]:
+    ) -> List[List[Dict[str, Any]]]:
         col = collection or self.default_collection
         meta_iter = metadata or (None for _ in contents)
-        ids: List[List[str]] = []
+        ids: List[List[Dict[str, Any]]] = []
         for content, meta in zip(contents, meta_iter):
             ids.append(self.add_document(content, meta, modality, col))
         return ids
@@ -378,10 +937,10 @@ class MultimodalKnowledgeBase:
         texts: Iterable[str],
         metadatas: Optional[Iterable[Dict[str, Any]]] = None,
         collection: Optional[str] = None,
-    ) -> List[List[str]]:
+    ) -> List[List[Dict[str, Any]]]:
         col = collection or self.default_collection
         meta_iter = metadatas or (None for _ in texts)
-        ids: List[List[str]] = []
+        ids: List[List[Dict[str, Any]]] = []
         for txt, meta in zip(texts, meta_iter):
             ids.append(self.add_document(txt, meta, modality="text", collection=col))
         return ids
@@ -403,17 +962,12 @@ class MultimodalKnowledgeBase:
         except Exception as e:
             return {"error": str(e)}
 
-    # ---------------------------------------------------------------------
-    # Optional synchronous wrapper for legacy callers of ``add_text_docs``
-    # ---------------------------------------------------------------------
     def add_text_docs_sync(
         self,
         texts: List[str],
         doc_source: str = "user",
         pbar: Optional[str] = None,
     ) -> None:
-        """Run ``add_text_docs`` synchronously when no event loop is active.
-        """
         try:
             asyncio.get_running_loop()
             raise RuntimeError(
@@ -422,13 +976,7 @@ class MultimodalKnowledgeBase:
         except RuntimeError:
             asyncio.run(self.add_text_docs(texts, doc_source=doc_source, pbar=pbar))
 
-    # ---------------------------------------------------------------------
-    # Convenience helpers for debugging / tests
-    # ---------------------------------------------------------------------
     def list_modalities(self) -> Dict[str, int]:
-        """Return a dict ``{modality: count}`` summarising what is stored.
-        Useful in tests to verify that each modality was ingested.
-        """
         stats = self.inventory_stats()
         return {k: v.get("n_chunks", 0) for k, v in stats.get("modalities", {}).items()}
 

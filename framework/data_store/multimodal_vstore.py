@@ -272,7 +272,6 @@ class MultimodalEmbedder:
             except Exception:
                 self._whisper = None
 
-        #DistilBERT encoder (lazy loaded)
         self._table_encoder = None
         self._table_tokenizer = None
 
@@ -377,8 +376,6 @@ class MultimodalEmbedder:
         return vecs
 
     def _load_table_encoder(self):
-        """Lazy‑load the DistilBERT  model and tokenizer.
-        It ia a lighter‑weight version of Google's BERT."""
         if self._table_encoder is not None:
             return
         if transformers is None:
@@ -392,23 +389,21 @@ class MultimodalEmbedder:
         self._table_encoder.eval()
 
     def embed_table(self, table_text: str) -> List[float]:
-        """Return a single dense vector for *table_text*.
-        The method tokenises the textual representation of the table (e.g. CSV
-        or markdown) and mean‑pools the last‑hidden‑state to obtain a fixed‑size
-        embedding."""
-        self._load_table_encoder()
-        import torch
+        try:
+            self._load_table_encoder()
+            import torch
 
-        inputs = self._table_tokenizer(
-            table_text, return_tensors="pt", truncation=True, max_length=512
-        )
-        if self.device:
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = self._table_encoder(**inputs)
-        # Mean‑pool over token dimension
-        vec = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
-        return vec
+            inputs = self._table_tokenizer(
+                table_text, return_tensors="pt", truncation=True, max_length=512
+            )
+            if self.device:
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self._table_encoder(**inputs)
+            vec = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
+            return vec
+        except Exception:
+            return self._hash_embed([table_text], dim=384)[0]
 
 
 # ============================================================
@@ -505,9 +500,6 @@ class MultimodalVectorStore:
             except Exception:
                 self._reranker = None
 
-    # ----------------------------
-    # Internal helpers
-    # ----------------------------
     def _get_collection_for_space(self, space: str):
         if space == "text":
             return self.text_collection
@@ -613,56 +605,89 @@ class MultimodalVectorStore:
 
         for space, group in buckets.items():
             coll = self._get_collection_for_space(space)
-            coll.add(
-                ids=[it.id for it in group],
-                documents=[it.document for it in group],
-                metadatas=[it.metadata for it in group],
-                embeddings=[it.embedding for it in group],
-            )
+            try:
+                coll.add(
+                    ids=[it.id for it in group],
+                    documents=[it.document for it in group],
+                    metadatas=[it.metadata for it in group],
+                    embeddings=[it.embedding for it in group],
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to add items to collection '{coll.name}' for embedding space '{space}'. "
+                    f"This may indicate stale collection state or embedding dimension/config mismatch. "
+                    f"Original error: {str(e)}"
+                ) from e
 
         if self.bm25 is not None:
             self.bm25.add_many([(it.id, it.document, it.metadata) for it in items])
 
-
-    # ----------------------------
-    # Public ingestion APIs
-    # ----------------------------
-    async def add_text_docs(self, texts: List[str], doc_source: str = "user") -> None:
+    async def add_text_docs(
+        self,
+        texts: List[str],
+        doc_source: str = "user",
+        metadatas: Optional[List[Optional[Dict[str, Any]]]] = None,
+    ) -> List[Dict[str, Any]]:
         if not texts:
-            return
+            return []
 
         all_items: List[IngestItem] = []
+        created_results: List[Dict[str, Any]] = []
         for idx, text in enumerate(texts):
             chunks = await self._split_text_with_lines(text)
             chunk_texts = [c[0] for c in chunks]
             vecs = await asyncio.to_thread(self.embedder.embed_text, chunk_texts)
+            caller_meta = {}
+            if metadatas and idx < len(metadatas) and metadatas[idx]:
+                caller_meta = dict(metadatas[idx])
+
+            source_value = caller_meta.get("source", doc_source)
+            uri_value = caller_meta.get("uri", source_value)
+            mime_value = caller_meta.get("mime", "text/plain")
+            document_id = caller_meta.get("document_id")
+            page_number = caller_meta.get("page_number", caller_meta.get("page"))
 
             for chunk_idx, ((chunk, ls, le), vec) in enumerate(zip(chunks, vecs)):
-                doc_id = f"{doc_source}::text::{idx}::{chunk_idx}"
-                meta = {
-                    "source": doc_source,
-                    "uri": doc_source,
+                if document_id is not None and page_number is not None:
+                    doc_id = f"{document_id}::page::{page_number}::text::{chunk_idx}"
+                else:
+                    doc_id = f"{source_value}::text::{idx}::{chunk_idx}"
+
+                meta = dict(caller_meta)
+                meta.update({
+                    "source": source_value,
+                    "uri": uri_value,
                     "modality": "text",
                     "embedding_space": "text",
                     "text_id": idx,
                     "chunk_id": chunk_idx,
                     "line_start": ls,
                     "line_end": le,
-                    "mime": "text/plain",
-                }
-                all_items.append(
-                    IngestItem(id=doc_id, document=chunk, embedding=vec, metadata=meta)
-                )
+                    "mime": mime_value,
+                })
+                if page_number is not None:
+                    meta.setdefault("page_number", page_number)
+                    meta.setdefault("page", page_number)
+
+                item = IngestItem(id=doc_id, document=chunk, embedding=vec, metadata=meta)
+                all_items.append(item)
+                created_results.append({
+                    "id": doc_id,
+                    "document": chunk,
+                    "metadata": meta,
+                })
 
         self._add_items(all_items)
+        return created_results
 
-    async def _ingest_text_file(self, p: Path) -> None:
+    async def _ingest_text_file(self, p: Path) -> List[Dict[str, Any]]:
         content = await self._read_text_file(p)
         chunks = await self._split_text_with_lines(content)
         chunk_texts = [c[0] for c in chunks]
         vecs = await asyncio.to_thread(self.embedder.embed_text, chunk_texts)
 
         items = []
+        created_results: List[Dict[str, Any]] = []
         for i, ((chunk, ls, le), vec) in enumerate(zip(chunks, vecs)):
             doc_id = f"{str(p)}::text::{i}"
             meta = {
@@ -676,18 +701,35 @@ class MultimodalVectorStore:
                 "mime": guess_mime(p),
             }
             items.append(IngestItem(id=doc_id, document=chunk, embedding=vec, metadata=meta))
+            created_results.append({
+                "id": doc_id,
+                "document": chunk,
+                "metadata": meta,
+            })
 
         self._add_items(items)
+        return created_results
 
-    async def _ingest_image_file(self, p: Path, extra_metadata: Optional[Dict[str, Any]] = None) -> None:
+    async def _ingest_image_file(self, p: Path, extra_metadata: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         caption = await asyncio.to_thread(self.embedder.caption_image, str(p))
 
-        # Use source_file from extra_metadata if available, otherwise fall back to p.name
         image_name = extra_metadata.get('source_file', p.name) if extra_metadata else p.name
         proxy = caption.strip() if caption.strip() else f"[image] {image_name}"
 
         img_vec = (await asyncio.to_thread(self.embedder.embed_images, [str(p)]))[0]
-        doc_id = f"{str(p)}::image::0"
+
+        document_id = extra_metadata.get("document_id") if extra_metadata else None
+        page_number = None
+        image_index = 0
+        if extra_metadata:
+            page_number = extra_metadata.get("page_number", extra_metadata.get("page"))
+            image_index = extra_metadata.get("image_index", 0)
+
+        if document_id is not None and page_number is not None:
+            doc_id = f"{document_id}::page::{page_number}::image::{image_index}"
+        else:
+            doc_id = f"{str(p)}::image::0"
+
         meta = {
             "source": str(p),
             "uri": str(p),
@@ -700,11 +742,16 @@ class MultimodalVectorStore:
         }
         if extra_metadata:
             meta.update(extra_metadata)
+        if page_number is not None:
+            meta.setdefault("page_number", page_number)
+            meta.setdefault("page", page_number)
+
         self._add_items([
             IngestItem(id=doc_id, document=proxy, embedding=img_vec, metadata=meta)
         ])
+        return [{"id": doc_id, "document": proxy, "metadata": meta}]
 
-    async def _ingest_audio_file(self, p: Path) -> None:
+    async def _ingest_audio_file(self, p: Path) -> List[Dict[str, Any]]:
         transcript = await asyncio.to_thread(self.embedder.transcribe_audio, str(p))
         proxy = transcript.strip() if transcript.strip() else f"[audio] {p.name}"
 
@@ -723,8 +770,10 @@ class MultimodalVectorStore:
         self._add_items([
             IngestItem(id=doc_id, document=proxy, embedding=vec, metadata=meta)
         ])
+        return [{"id": doc_id, "document": proxy, "metadata": meta}]
 
-    async def _ingest_video_file(self, p: Path) -> None:
+    async def _ingest_video_file(self, p: Path) -> List[Dict[str, Any]]:
+        created_results: List[Dict[str, Any]] = []
         with tempfile.TemporaryDirectory() as td:
             wav = os.path.join(td, "audio.wav")
             await asyncio.to_thread(self._ffmpeg_extract_audio_wav, str(p), wav)
@@ -752,6 +801,11 @@ class MultimodalVectorStore:
                     items.append(
                         IngestItem(id=doc_id, document=chunk, embedding=vec, metadata=meta)
                     )
+                    created_results.append({
+                        "id": doc_id,
+                        "document": chunk,
+                        "metadata": meta,
+                    })
                 self._add_items(items)
 
             frame_dir = os.path.join(td, "frames")
@@ -778,9 +832,16 @@ class MultimodalVectorStore:
                     items.append(
                         IngestItem(id=doc_id, document=proxy, embedding=vec, metadata=meta)
                     )
+                    created_results.append({
+                        "id": doc_id,
+                        "document": proxy,
+                        "metadata": meta,
+                    })
                 self._add_items(items)
 
-    async def _ingest_binary_file(self, p: Path) -> None:
+        return created_results
+
+    async def _ingest_binary_file(self, p: Path) -> List[Dict[str, Any]]:
         sha = await asyncio.to_thread(sha256_file, p)
         mime = guess_mime(p)
         proxy = f"[binary] name={p.name} mime={mime} sha256={sha} size={p.stat().st_size}"
@@ -800,31 +861,34 @@ class MultimodalVectorStore:
         self._add_items([
             IngestItem(id=doc_id, document=proxy, embedding=vec, metadata=meta)
         ])
+        return [{"id": doc_id, "document": proxy, "metadata": meta}]
 
-    async def _ingest_table(self, table_text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Ingest a table represented as plain text (CSV/markdown/etc.).
-
-        The table is embedded with the table encoder and stored under the
-        ``table`` modality.  ``metadata`` may contain any additional fields the
-        caller wishes to attach (e.g., source PDF, page number).
-        """
+    async def _ingest_table(self, table_text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        metadata = metadata or {}
         vec = await asyncio.to_thread(self.embedder.embed_table, table_text)
-        doc_id = (
-            f"{metadata.get('source', 'table')}::table::"
-            f"{metadata.get('page', 0)}::{metadata.get('table_index', 0)}"
-        )
+
+        page_value = metadata.get("page", metadata.get("page_number", 0))
+        table_index = metadata.get("table_index", 0)
+        document_id = metadata.get("document_id")
+
+        if document_id is not None:
+            doc_id = f"{document_id}::page::{page_value}::table::{table_index}"
+        else:
+            doc_id = f"{metadata.get('source', 'table')}::table::{page_value}::{table_index}"
+
         base_meta: Dict[str, Any] = {
             "source": metadata.get("source", "table"),
-            "uri": metadata.get("uri", "unknown"),
+            "uri": metadata.get("uri", metadata.get("source", "unknown")),
             "modality": "table",
             "embedding_space": "table",
-            "page": metadata.get("page", 0),
-            "table_index": metadata.get("table_index", 0),
+            "page": page_value,
+            "page_number": metadata.get("page_number", page_value),
+            "table_index": table_index,
             "doc_id": doc_id,
         }
-
-        if metadata:
-            base_meta.update({k: v for k, v in metadata.items() if k not in base_meta})
+        base_meta.update(metadata)
+        base_meta["page"] = page_value
+        base_meta.setdefault("page_number", page_value)
 
         self._add_items([
             IngestItem(
@@ -834,6 +898,7 @@ class MultimodalVectorStore:
                 metadata=base_meta,
             )
         ])
+        return [{"id": doc_id, "document": table_text, "metadata": base_meta}]
 
     async def add_documents(
         self,
@@ -843,16 +908,17 @@ class MultimodalVectorStore:
         pbar_title: str = "[@] Adding documents (multi-modal)",
         pbar_length: int = 20,
         pbar_spinner: str = "wait",
-    ) -> None:
+    ) -> List[Dict[str, Any]]:
         if not documents and not binary_payload:
-            return
+            return []
 
-        # Handle binary payload first if provided
+        created_results: List[Dict[str, Any]] = []
+
         if binary_payload:
-            # Extract metadata if present
-            extra_metadata = binary_payload.pop("metadata", None)
+            payload = dict(binary_payload)
+            extra_metadata = payload.pop("metadata", None)
 
-            for modality, data in binary_payload.items():
+            for modality, data in payload.items():
                 suffix_map = {
                     "image": ".png",
                     "audio": ".wav",
@@ -862,26 +928,26 @@ class MultimodalVectorStore:
                     "pdf": ".pdf",
                 }
                 suffix = suffix_map.get(modality, ".bin")
-                
+
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                     tmp.write(data)
                     p = Path(tmp.name)
 
                 try:
                     if modality == "image":
-                        await self._ingest_image_file(p, extra_metadata=extra_metadata)
+                        created_results.extend(await self._ingest_image_file(p, extra_metadata=extra_metadata))
                     elif modality == "audio":
-                        await self._ingest_audio_file(p)
+                        created_results.extend(await self._ingest_audio_file(p))
                     elif modality == "video":
-                        await self._ingest_video_file(p)
+                        created_results.extend(await self._ingest_video_file(p))
                     elif modality == "table":
                         text = data.decode("utf-8", errors="ignore")
                         table_meta = {"source": str(p), "uri": str(p)}
                         if extra_metadata:
                             table_meta.update(extra_metadata)
-                        await self._ingest_table(text, metadata=table_meta)
+                        created_results.extend(await self._ingest_table(text, metadata=table_meta))
                     else:
-                        await self._ingest_binary_file(p)
+                        created_results.extend(await self._ingest_binary_file(p))
                 finally:
                     try:
                         os.unlink(p)
@@ -889,7 +955,7 @@ class MultimodalVectorStore:
                         pass
 
         if not documents:
-            return
+            return created_results
 
         paths: List[Path] = []
         raw_texts: List[str] = []
@@ -908,10 +974,10 @@ class MultimodalVectorStore:
             raw_texts.append(s)
 
         if raw_texts:
-            await self.add_text_docs(raw_texts, doc_source="raw_text")
+            created_results.extend(await self.add_text_docs(raw_texts, doc_source="raw_text"))
 
         if not paths:
-            return
+            return created_results
 
         async def ingest_one(p: Path):
             ext = p.suffix.lower().lstrip(".")
@@ -925,8 +991,7 @@ class MultimodalVectorStore:
                 return await self._ingest_video_file(p)
             if ext in self.table_extensions:
                 txt = await self._read_text_file(p)
-                await self._ingest_table(txt, metadata={"source": str(p), "uri": str(p)})
-                return
+                return await self._ingest_table(txt, metadata={"source": str(p), "uri": str(p)})
             return await self._ingest_binary_file(p)
 
         tasks = [ingest_one(p) for p in paths]
@@ -940,10 +1005,17 @@ class MultimodalVectorStore:
                 spinner=pbar_spinner,
             ) as bar:
                 for t in asyncio.as_completed(tasks):
-                    await t
+                    res = await t
+                    if res:
+                        created_results.extend(res)
                     bar()
         else:
-            await asyncio.gather(*tasks)
+            gathered = await asyncio.gather(*tasks)
+            for res in gathered:
+                if res:
+                    created_results.extend(res)
+
+        return created_results
 
     async def recursive_upload(
         self,
@@ -1023,9 +1095,6 @@ class MultimodalVectorStore:
                 await self.add_url_doc(u)
                 bar()
 
-    # ----------------------------
-    # Retrieval
-    # ----------------------------
     async def remove_documents(self, file_paths: List[str]) -> None:
         if not file_paths:
             return
@@ -1243,9 +1312,6 @@ class MultimodalVectorStore:
 
         return out
 
-    # ----------------------------
-    # Stats / lifecycle
-    # ----------------------------
     def update_doc_count(self) -> int:
         rt = self.text_collection.get()
         rv = self.vision_collection.get()

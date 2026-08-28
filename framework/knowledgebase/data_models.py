@@ -57,6 +57,16 @@ class MultimodalKnowledgeBaseParams(BaseModel):
     # Online fetching
     allow_online: bool = Field(False, description='Allow fetching documents from URLs')
     http_timeout: int = Field(20, description='Timeout for HTTP requests in seconds')
+
+    # PDF image persistence
+    persist_extracted_pdf_images: bool = Field(
+        False,
+        description='Whether images extracted during PDF ingestion should be physically persisted to disk'
+    )
+    extracted_pdf_images_dir: Optional[str] = Field(
+        None,
+        description='Optional directory where extracted PDF images are stored. Defaults to <persist_dir>/<kb_name>_assets/images'
+    )
     
     vrbz: int = Field(default=0, description="KB Level of verbosity")
 

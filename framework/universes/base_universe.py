@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import os
+import sys
+import platform
 from pathlib import Path
+import base64
+import traceback
+import logging
 
 import chromadb
 
@@ -18,6 +23,9 @@ from framework.universes.data_models import BaseUniverseModel, BaseUniverseParam
 from framework.tooling.toolbox import ToolBox
 from framework.tooling.tools import Tool, ToolCard
 from framework.tooling.tool_models import ToolMeta
+
+
+logger = logging.getLogger(__name__)
 
 
 class BaseUniverse:
@@ -68,6 +76,7 @@ class BaseUniverse:
             "kb_add_url",
             "kb_add_urls",
             "kb_add_document",
+            "kb_add_pdf",
             "kb_stats",
             "kb_sources",
             "kb_purge",
@@ -200,6 +209,63 @@ class BaseUniverse:
         # MultimodalKnowledgeBase.add_document is sync but uses _run_async_in_thread internally
         return kb.add_document(content, metadata=metadata, modality=modality)
 
+    def kb_add_pdf(
+        self,
+        name: str,
+        pdf_content: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        extract_images: bool = True,
+        extract_tables: bool = True,
+        persist_extracted_images: Optional[bool] = None,
+        extracted_image_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add a PDF document to a multimodal knowledge base, extracting text, images, and tables."""
+        kb = self.get_kb(name)
+        if not isinstance(kb, MultimodalKnowledgeBase):
+            raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
+
+        effective_metadata = dict(metadata or {})
+        if persist_extracted_images is not None:
+            effective_metadata["persist_extracted_images"] = persist_extracted_images
+        if extracted_image_dir is not None:
+            effective_metadata["extracted_image_dir"] = extracted_image_dir
+
+        return kb.add_pdf_document(
+            pdf_content,
+            metadata=effective_metadata,
+            extract_images=extract_images,
+            extract_tables=extract_tables,
+        )
+
+    async def akb_add_pdf(
+        self,
+        name: str,
+        pdf_content: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        extract_images: bool = True,
+        extract_tables: bool = True,
+        persist_extracted_images: Optional[bool] = None,
+        extracted_image_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add a PDF document to a multimodal knowledge base, extracting text, images, and tables (async)."""
+        kb = self.get_kb(name)
+        if not isinstance(kb, MultimodalKnowledgeBase):
+            raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
+
+        effective_metadata = dict(metadata or {})
+        if persist_extracted_images is not None:
+            effective_metadata["persist_extracted_images"] = persist_extracted_images
+        if extracted_image_dir is not None:
+            effective_metadata["extracted_image_dir"] = extracted_image_dir
+
+        # add_pdf_document is sync but uses _run_async_in_thread internally
+        return kb.add_pdf_document(
+            pdf_content,
+            metadata=effective_metadata,
+            extract_images=extract_images,
+            extract_tables=extract_tables,
+        )
+
     def kb_stats(self, name: str) -> Dict[str, int]:
         return self.get_kb(name).get_stats()
 
@@ -301,7 +367,7 @@ class BaseUniverse:
 # FastAPI models
 # --------------------
 class CreateKBRequest(BaseModel):
-    kb_params: KnowledgeBaseParams | MultimodalKnowledgeBaseParams = Field(..., description="Parameters of the KB")
+    kb_params: Dict[str, Any] = Field(..., description="Parameters of the KB")
     type: str = Field("text", description="Type of KB: 'text' for text-only or 'multimodal' for multimodal KB")
 
 
@@ -342,6 +408,16 @@ class AddDocumentRequest(BaseModel):
     content: str = Field(..., description="Content of the document (text, base64-encoded data, or file path)")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata for the document")
     modality: str = Field("text", description="Modality type: 'text', 'image', 'audio', 'video', 'table', 'binary'")
+
+
+class AddPDFRequest(BaseModel):
+    pdf_path: Optional[str] = Field(None, description="Path to PDF file on server")
+    pdf_content: Optional[str] = Field(None, description="Base64-encoded PDF content")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata for the PDF")
+    extract_images: bool = Field(True, description="Whether to extract images from PDF")
+    extract_tables: bool = Field(True, description="Whether to extract tables from PDF")
+    persist_extracted_images: Optional[bool] = Field(None, description="Override KB default for whether extracted PDF images are physically saved to disk")
+    extracted_image_dir: Optional[str] = Field(None, description="Optional directory where extracted PDF images should be persisted")
 
 
 class ExecuteRequest(BaseModel):
@@ -403,6 +479,47 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
     def all_tools():
         return universe.get_available_tools()
 
+    @app.get("/debug/runtime")
+    def debug_runtime():
+        fitz_info: Dict[str, Any] = {"import_ok": False}
+        try:
+            import fitz  # type: ignore
+            fitz_info = {
+                "import_ok": True,
+                "module_file": getattr(fitz, "__file__", None),
+                "module_name": getattr(fitz, "__name__", None),
+                "version": getattr(fitz, "__doc__", None),
+            }
+        except Exception as e:
+            fitz_info = {
+                "import_ok": False,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+
+        env_keys = [
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "CONDA_DEFAULT_ENV",
+            "PYTHONPATH",
+            "PATH",
+        ]
+        env_subset = {k: os.environ.get(k) for k in env_keys}
+
+        return {
+            "universe_name": universe.name,
+            "pid": os.getpid(),
+            "cwd": os.getcwd(),
+            "sys_executable": sys.executable,
+            "sys_version": sys.version,
+            "sys_prefix": sys.prefix,
+            "sys_base_prefix": getattr(sys, "base_prefix", None),
+            "platform": platform.platform(),
+            "pythonpath_entries": sys.path,
+            "environment": env_subset,
+            "fitz": fitz_info,
+        }
+
     # --------------- KB endpoints ---------------
     @app.get("/kbs")
     def list_kbs():
@@ -413,22 +530,42 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
         kb_type = req.type.lower()
 
         if kb_type == "text":
-            if not isinstance(req.kb_params, KnowledgeBaseParams):
-                raise HTTPException(status_code=400, detail="For 'text' type, kb_params must be KnowledgeBaseParams")
-            if req.kb_params.name in universe.KBs:
-                raise HTTPException(status_code=409, detail=f"KB {req.kb_params.name} already exists")
-            kb = KnowledgeBase(req.kb_params, universe.db_client)
-            universe.add_kb(req.kb_params.name, kb)
-            return {"ok": True, "name": req.kb_params.name, "type": "text"}
+            try:
+                kb_params = KnowledgeBaseParams(**req.kb_params)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid text kb_params: {str(e)}")
+            if kb_params.name in universe.KBs:
+                raise HTTPException(status_code=409, detail=f"KB {kb_params.name} already exists")
+            try:
+                kb = KnowledgeBase(kb_params, universe.db_client)
+                universe.add_kb(kb_params.name, kb)
+                return {"ok": True, "name": kb_params.name, "type": "text"}
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.exception("Unhandled exception in POST /kbs for text KB %s", kb_params.name)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error creating text KB '{kb_params.name}': {str(e)}\nTRACEBACK:\n{tb}"
+                )
 
         elif kb_type == "multimodal":
-            if not isinstance(req.kb_params, MultimodalKnowledgeBaseParams):
-                raise HTTPException(status_code=400, detail="For 'multimodal' type, kb_params must be MultimodalKnowledgeBaseParams")
-            if req.kb_params.name in universe.KBs:
-                raise HTTPException(status_code=409, detail=f"KB {req.kb_params.name} already exists")
-            kb = MultimodalKnowledgeBase(req.kb_params, universe.db_client)
-            universe.add_kb(req.kb_params.name, kb)
-            return {"ok": True, "name": req.kb_params.name, "type": "multimodal"}
+            try:
+                kb_params = MultimodalKnowledgeBaseParams(**req.kb_params)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid multimodal kb_params: {str(e)}")
+            if kb_params.name in universe.KBs:
+                raise HTTPException(status_code=409, detail=f"KB {kb_params.name} already exists")
+            try:
+                kb = MultimodalKnowledgeBase(kb_params, universe.db_client)
+                universe.add_kb(kb_params.name, kb)
+                return {"ok": True, "name": kb_params.name, "type": "multimodal"}
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.exception("Unhandled exception in POST /kbs for multimodal KB %s", kb_params.name)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error creating multimodal KB '{kb_params.name}': {str(e)}\nTRACEBACK:\n{tb}"
+                )
 
         else:
             raise HTTPException(status_code=400, detail=f"Invalid KB type: {req.type}. Must be 'text' or 'multimodal'")
@@ -471,33 +608,28 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
     async def kb_upload_dir(name: str, req: UploadDirRequest):
         """Upload directory contents to a knowledge base."""
         try:
-            # Get KB to check it exists
             kb = universe.get_kb(name)
         except KeyError:
             raise HTTPException(
                 status_code=404,
                 detail=f"KB '{name}' not found. Universe is running on host: {universe.info.host if universe.info else 'unknown'}"
             )
-        
-        # Expand user path and validate directory exists
+
         dir_path = os.path.expanduser(req.dir_path)
         if not os.path.exists(dir_path):
             raise HTTPException(
                 status_code=400,
                 detail=f"Directory '{req.dir_path}' does not exist on universe host {universe.info.host if universe.info else 'unknown'}:{universe.info.port if universe.info else 'unknown'}. Please verify the path is accessible from the universe's runtime environment."
             )
-        
+
         if not os.path.isdir(dir_path):
             raise HTTPException(
                 status_code=400,
                 detail=f"Path '{req.dir_path}' exists but is not a directory on host {universe.info.host if universe.info else 'unknown'}. Please provide a valid directory path."
             )
-        
+
         try:
-            # Attempt to upload
             result = await universe.akb_upload_dir(name, dir_path, target_ext=req.target_ext)
-            
-            # Provide detailed feedback
             return {
                 "ok": True,
                 "kb_name": name,
@@ -531,17 +663,12 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
     async def kb_add_document(name: str, req: AddDocumentRequest):
         """Add a single document to a multimodal knowledge base."""
         try:
-            # Convert content based on modality
             if req.modality == "text":
                 content = req.content
             else:
-                # For non-text modalities, assume content is a file path or base64 data
-                # Try as file path first
                 if os.path.exists(req.content):
                     content = Path(req.content)
                 else:
-                    # Assume it's base64-encoded bytes
-                    import base64
                     try:
                         content = base64.b64decode(req.content)
                     except Exception:
@@ -568,6 +695,88 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
                 detail=f"Error adding document to KB '{name}': {str(e)}"
             )
 
+    @app.post("/kbs/{name}/add_pdf")
+    async def kb_add_pdf(name: str, req: AddPDFRequest):
+        """Add a PDF document to a multimodal knowledge base, extracting all elements."""
+        try:
+            kb = universe.get_kb(name)
+            if not isinstance(kb, MultimodalKnowledgeBase):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"KB '{name}' is not a multimodal knowledge base. PDF ingestion requires a multimodal KB."
+                )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="KB not found")
+
+        if req.pdf_path and req.pdf_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either 'pdf_path' or 'pdf_content', not both"
+            )
+        if not req.pdf_path and not req.pdf_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Must provide either 'pdf_path' or 'pdf_content'"
+            )
+
+        try:
+            if req.pdf_path:
+                pdf_path = os.path.expanduser(req.pdf_path)
+                if not os.path.exists(pdf_path):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"PDF file '{req.pdf_path}' does not exist on universe host {universe.info.host if universe.info else 'unknown'}:{universe.info.port if universe.info else 'unknown'}"
+                    )
+                if not os.path.isfile(pdf_path):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Path '{req.pdf_path}' is not a file"
+                    )
+                pdf_content = pdf_path
+            else:
+                try:
+                    pdf_content = base64.b64decode(req.pdf_content)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid base64-encoded PDF content: {str(e)}"
+                    )
+
+            summary = await universe.akb_add_pdf(
+                name,
+                pdf_content,
+                metadata=req.metadata,
+                extract_images=req.extract_images,
+                extract_tables=req.extract_tables,
+                persist_extracted_images=req.persist_extracted_images,
+                extracted_image_dir=req.extracted_image_dir,
+            )
+
+            return {
+                "ok": True,
+                "kb_name": name,
+                "summary": summary,
+                "message": f"Successfully ingested PDF into KB '{name}'"
+            }
+
+        except ImportError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"PDF parsing library not available: {str(e)}"
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e)
+            )
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.exception("Unhandled exception in /kbs/%s/add_pdf", name)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error processing PDF for KB '{name}': {str(e)}\nTRACEBACK:\n{tb}"
+            )
+
     @app.post("/kbs/{name}/purge")
     async def kb_purge(name: str):
         try:
@@ -586,7 +795,6 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
         except KeyError:
             raise HTTPException(status_code=404, detail="KB not found")
 
-    # --------------- TB endpoints ---------------
     @app.get("/tbs")
     def list_tbs():
         return universe.list_tbs()
@@ -710,13 +918,14 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
 
 def build_default_universe(params: base_universe_params_type|None = None) -> BaseUniverse:
     """Create an base Universe. Extend this in your app bootstrap."""
-    if params is not None: 
+    if params is not None:
         return BaseUniverse(params=params)
     else:
         name_generator = NameGenerator()
         info = BaseUniverseModel(name=name_generator.get_name())
         _params = BaseUniverseParams(info=info)
         return BaseUniverse(params=_params)
+
 
 def create_app_default() -> FastAPI:
     """Zero-argument ASGI factory for uvicorn --factory."""
@@ -733,8 +942,24 @@ def run_app(
 ) -> None:
     import json
     from pathlib import Path
-    
+
     host = host.strip()
+
+    logger.warning(
+        "Universe runtime startup: pid=%s executable=%s cwd=%s sys_prefix=%s base_prefix=%s VIRTUAL_ENV=%s CONDA_PREFIX=%s",
+        os.getpid(),
+        sys.executable,
+        os.getcwd(),
+        sys.prefix,
+        getattr(sys, "base_prefix", None),
+        os.environ.get("VIRTUAL_ENV"),
+        os.environ.get("CONDA_PREFIX"),
+    )
+    try:
+        import fitz  # type: ignore
+        logger.warning("Universe runtime startup: fitz import OK from %s", getattr(fitz, "__file__", None))
+    except Exception:
+        logger.warning("Universe runtime startup: fitz import FAILED\n%s", traceback.format_exc())
 
     if params is None:
         name_generator = NameGenerator()
@@ -754,19 +979,17 @@ def run_app(
     universe = build_default_universe(_params)
     app = create_app(universe, cors_origins=cors)
 
-    # Pre-bind socket ourselves so we know the real port before Uvicorn starts.
     import socket
     import uvicorn
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))          # port=0 => OS picks a free port
+    sock.bind((host, port))
     sock.listen()
     actual_port = sock.getsockname()[1]
 
     _params.info.port = actual_port
     base_url = _params.info.get_base_url()
 
-    # Write status file with complete information after socket binding
     if status_file:
         try:
             status_data = {
