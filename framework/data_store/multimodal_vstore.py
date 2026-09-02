@@ -117,7 +117,7 @@ def _metadata_term_overlap_score(query: str, metadata: Optional[Dict[str, Any]])
         return 0.0
 
     fields = []
-    for key in ("section_context", "preceding_text", "following_text", "caption", "stored_file_name", "source_file", "element_type"):
+    for key in ("section_context", "preceding_text", "following_text", "caption", "caption_label", "stored_file_name", "source_file", "element_type"):
         value = metadata.get(key)
         if value:
             fields.append(str(value))
@@ -589,8 +589,13 @@ class MultimodalVectorStore:
         elif text_anchors:
             parts.append(f"anchors: {text_anchors}")
 
-        if caption and caption.strip():
-            parts.append(f"caption: {_truncate_text(caption, 240)}")
+        caption_label = metadata.get("caption_label")
+        if caption_label:
+            parts.append(f"caption_label: {caption_label}")
+
+        effective_caption = metadata.get("caption") or caption
+        if effective_caption and str(effective_caption).strip():
+            parts.append(f"caption: {_truncate_text(effective_caption, 1500)}")
 
         preceding_text = metadata.get("preceding_text")
         if preceding_text:

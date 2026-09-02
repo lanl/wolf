@@ -64,6 +64,16 @@ CREATE INDEX IF NOT EXISTS idx_chunks_modality ON chunks(modality);
 """
 
 
+FIGURE_CAPTION_START_RE = re.compile(
+    r"^\s*((?:Fig\.?|Figure|FIGURE|Image)\s*\d+[A-Za-z]?(?:\s*[.:\-]|\s*\([A-Za-z0-9]+\))?)",
+    re.IGNORECASE,
+)
+OTHER_CAPTION_START_RE = re.compile(
+    r"^\s*(?:Fig\.?|Figure|FIGURE|Image|Table)\s*\d+[A-Za-z]?",
+    re.IGNORECASE,
+)
+
+
 def _now_iso() -> str:
     dt = datetime.now(timezone.utc).replace(microsecond=0)
     return dt.isoformat().replace("+00:00", "Z")
@@ -111,6 +121,67 @@ def _rows_to_csv(rows: list[list[str]]) -> str:
     return "\n".join(
         [",".join("" if cell is None else str(cell) for cell in r) for r in rows]
     )
+
+
+def _normalize_caption_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _bbox_vertical_gap(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    if by0 >= ay1:
+        return by0 - ay1
+    if ay0 >= by1:
+        return ay0 - by1
+    return 0.0
+
+
+def _bbox_horizontal_overlap_ratio(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax0, _ay0, ax1, _ay1 = a
+    bx0, _by0, bx1, _by1 = b
+    overlap = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    base = max(1.0, min(ax1 - ax0, bx1 - bx0))
+    return overlap / base
+
+
+def _extract_text_blocks(page: "fitz.Page") -> List[Dict[str, Any]]:
+    blocks = page.get_text("dict").get("blocks", [])
+    out: List[Dict[str, Any]] = []
+
+    for block_index, block in enumerate(blocks):
+        lines = block.get("lines") or []
+        if not lines:
+            continue
+
+        line_texts: List[str] = []
+        font_sizes: List[float] = []
+        for line in lines:
+            spans = line.get("spans") or []
+            line_text = " ".join(span.get("text", "") for span in spans).strip()
+            if line_text:
+                line_texts.append(line_text)
+            for span in spans:
+                size = span.get("size")
+                if isinstance(size, (int, float)):
+                    font_sizes.append(float(size))
+
+        text = _normalize_caption_text(" ".join(line_texts))
+        if not text:
+            continue
+
+        bbox = tuple(block.get("bbox", [0, 0, 0, 0]))
+        out.append({
+            "block_index": block_index,
+            "text": text,
+            "bbox": bbox,
+            "y_center": (bbox[1] + bbox[3]) / 2,
+            "x_center": (bbox[0] + bbox[2]) / 2,
+            "font_size_max": max(font_sizes) if font_sizes else 0.0,
+        })
+
+    out.sort(key=lambda b: (b["bbox"][1], b["bbox"][0], b["block_index"]))
+    return out
 
 
 def _extract_section_context(page: "fitz.Page", page_text: str) -> Dict[str, Any]:
@@ -239,6 +310,111 @@ def _find_text_anchors(page_text: str, element_type: str = "image") -> List[str]
         anchors.extend(re.findall(pattern, page_text, re.IGNORECASE))
 
     return list(set(anchors))
+
+
+def _extract_figure_caption(page: "fitz.Page", element_bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
+    try:
+        text_blocks = _extract_text_blocks(page)
+        if not text_blocks:
+            return {}
+
+        page_height = float(page.rect.height or 0.0)
+        if page_height <= 0:
+            page_height = 1000.0
+
+        x0, y0, x1, y1 = element_bbox
+        search_specs = [
+            ("below", lambda b: b["bbox"][1] >= y1 - 2.0),
+            ("above", lambda b: b["bbox"][3] <= y0 + 2.0),
+        ]
+
+        for position, predicate in search_specs:
+            candidates: List[Tuple[float, Dict[str, Any]]] = []
+            for block in text_blocks:
+                if not predicate(block):
+                    continue
+                text = block["text"]
+                if not FIGURE_CAPTION_START_RE.match(text):
+                    continue
+
+                gap = _bbox_vertical_gap(element_bbox, block["bbox"])
+                overlap = _bbox_horizontal_overlap_ratio(element_bbox, block["bbox"])
+                center_distance = abs(((block["bbox"][0] + block["bbox"][2]) / 2) - ((x0 + x1) / 2))
+                score = gap - (120.0 * overlap) + (0.05 * center_distance)
+                candidates.append((score, block))
+
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: item[0])
+            start_block = candidates[0][1]
+            start_text = start_block["text"]
+            label_match = FIGURE_CAPTION_START_RE.match(start_text)
+            caption_label = _normalize_caption_text(label_match.group(1)) if label_match else ""
+
+            caption_blocks = [start_block]
+            start_index = next((i for i, b in enumerate(text_blocks) if b["block_index"] == start_block["block_index"]), None)
+            if start_index is None:
+                start_index = text_blocks.index(start_block)
+
+            max_gap = max(18.0, page_height * 0.025)
+            caption_left = start_block["bbox"][0]
+            caption_right = start_block["bbox"][2]
+            caption_font = start_block.get("font_size_max", 0.0)
+
+            for next_block in text_blocks[start_index + 1:]:
+                if position == "below" and next_block["bbox"][1] < start_block["bbox"][1]:
+                    continue
+                if position == "above" and next_block["bbox"][1] < start_block["bbox"][1]:
+                    continue
+
+                next_text = next_block["text"]
+                if OTHER_CAPTION_START_RE.match(next_text):
+                    break
+
+                prev_block = caption_blocks[-1]
+                vertical_gap = max(0.0, next_block["bbox"][1] - prev_block["bbox"][3])
+                if vertical_gap > max_gap:
+                    break
+
+                horizontal_overlap = _bbox_horizontal_overlap_ratio(prev_block["bbox"], next_block["bbox"])
+                left_shift = abs(next_block["bbox"][0] - caption_left)
+                right_shift = abs(next_block["bbox"][2] - caption_right)
+                similar_font = abs(float(next_block.get("font_size_max", 0.0)) - float(caption_font)) <= max(1.5, caption_font * 0.2 if caption_font else 2.0)
+
+                if horizontal_overlap < 0.15 and left_shift > 80 and right_shift > 80:
+                    break
+                if not similar_font and vertical_gap > (max_gap * 0.5):
+                    break
+
+                caption_blocks.append(next_block)
+                caption_left = min(caption_left, next_block["bbox"][0])
+                caption_right = max(caption_right, next_block["bbox"][2])
+
+            caption_text = _normalize_caption_text(" ".join(block["text"] for block in caption_blocks))
+            if not caption_text:
+                continue
+
+            confidence = "high"
+            start_gap = _bbox_vertical_gap(element_bbox, start_block["bbox"])
+            start_overlap = _bbox_horizontal_overlap_ratio(element_bbox, start_block["bbox"])
+            if start_gap > max_gap or start_overlap < 0.2:
+                confidence = "medium"
+            if start_gap > max_gap * 2 or start_overlap < 0.05:
+                confidence = "low"
+
+            return {
+                "caption": caption_text,
+                "caption_label": caption_label,
+                "caption_position": position,
+                "caption_blocks": len(caption_blocks),
+                "caption_source": "pdf_geometric_extraction",
+                "caption_confidence": confidence,
+            }
+
+        return {}
+    except Exception as e:
+        return {"caption_extraction_error": str(e)}
 
 
 def _get_element_spatial_metadata(page: "fitz.Page", element_bbox: Tuple[float, float, float, float],
@@ -613,15 +789,17 @@ class MultimodalKnowledgeBase:
                             base_image = doc.extract_image(xref)
                             image_bytes = base_image["image"]
                             image_ext = base_image["ext"]
-                            img_rects = page.get_image_rects(xref)
-                            if img_rects:
+                            caption_meta: Dict[str, Any] = {}
+                            if img_rects := page.get_image_rects(xref):
                                 img_bbox = img_rects[0]
+                                bbox_tuple = (img_bbox.x0, img_bbox.y0, img_bbox.x1, img_bbox.y1)
                                 spatial_meta = _get_element_spatial_metadata(
                                     page,
-                                    (img_bbox.x0, img_bbox.y0, img_bbox.x1, img_bbox.y1),
+                                    bbox_tuple,
                                     "image",
                                     page_num + 1
                                 )
+                                caption_meta = _extract_figure_caption(page, bbox_tuple)
                             else:
                                 spatial_meta = {"bbox_note": "bbox not available"}
 
@@ -642,13 +820,20 @@ class MultimodalKnowledgeBase:
                             img_metadata["image_format"] = image_ext
                             img_metadata.update(spatial_meta)
                             img_metadata.update(persistence_meta)
+                            if caption_meta.get("caption"):
+                                img_metadata.update(caption_meta)
+                            elif caption_meta.get("caption_extraction_error"):
+                                img_metadata["caption_extraction_error"] = caption_meta["caption_extraction_error"]
 
                             self._logger.info(
-                                "PDF page %s image %s extracted bytes=%s format=%s; attempting add_document(image)",
+                                "PDF page %s image %s extracted bytes=%s format=%s caption_found=%s caption_label=%s caption_chars=%s; attempting add_document(image)",
                                 page_num + 1,
                                 img_index,
                                 len(image_bytes),
                                 image_ext,
+                                bool(img_metadata.get("caption")),
+                                img_metadata.get("caption_label", ""),
+                                len(img_metadata.get("caption", "") or ""),
                             )
                             image_results = self.add_document(
                                 content=image_bytes,
