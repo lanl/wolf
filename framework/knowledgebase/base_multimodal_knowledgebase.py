@@ -289,6 +289,30 @@ def _get_element_spatial_metadata(page: "fitz.Page", element_bbox: Tuple[float, 
     return spatial_metadata
 
 
+def _detect_query_intent(query: str) -> Dict[str, bool]:
+    q = str(query or "")
+    visual_patterns = [
+        r"\bimage\b", r"\bimages\b", r"\bpicture\b", r"\bpictures\b", r"\bphoto\b", r"\bphotos\b",
+        r"\bfigure\b", r"\bfigures\b", r"\bdiagram\b", r"\bdiagrams\b", r"\billustration\b", r"\billustrations\b",
+        r"\bscreenshot\b", r"\bshow\b", r"\bdisplay\b", r"\bdepict\b", r"\bdepicts\b", r"\bshown\b",
+        r"which\s+(?:picture|image|figure|diagram)",
+        r"describe\s+the\s+(?:picture|image|figure|diagram)",
+        r"what\s+does\s+the\s+(?:picture|image|figure|diagram)\s+show",
+    ]
+    table_patterns = [
+        r"\btable\b", r"\btables\b", r"\brow\b", r"\brows\b", r"\bcolumn\b", r"\bcolumns\b",
+        r"\bspreadsheet\b", r"\btabular\b",
+    ]
+
+    is_visual = any(re.search(pattern, q, re.IGNORECASE) for pattern in visual_patterns)
+    is_table = any(re.search(pattern, q, re.IGNORECASE) for pattern in table_patterns)
+    return {
+        "is_visual": is_visual,
+        "is_table": is_table,
+        "is_text": not is_visual and not is_table,
+    }
+
+
 class MultimodalKnowledgeBase:
     def __init__(self, params: MultimodalKnowledgeBaseParams, db_client: chromadb.Client):
         self.params = params
@@ -792,8 +816,7 @@ class MultimodalKnowledgeBase:
         filter: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
-        visual_keywords = ["picture", "image", "photo", "diagram", "figure", "show", "display"]
-        is_visual = any(re.search(r"\b" + kw + r"\b", query, re.IGNORECASE) for kw in visual_keywords)
+        intent = _detect_query_intent(query)
 
         channel_weights: Optional[Dict[str, float]] = None
         if filter is not None:
@@ -803,13 +826,16 @@ class MultimodalKnowledgeBase:
                 if not filter:
                     filter = None
 
-        if is_visual and channel_weights is None:
-            channel_weights = {"image": 2.0, "text": 0.5}
+        if intent["is_visual"] and channel_weights is None:
+            channel_weights = {"vision": 2.5, "dense": 0.6, "bm25": 0.4, "table": 0.3}
+        elif intent["is_table"] and channel_weights is None:
+            channel_weights = {"table": 2.0, "dense": 0.8, "bm25": 0.6, "vision": 0.3}
 
         store_kwargs: Dict[str, Any] = {
             "query": query,
             "k": n_results,
             "filter": filter,
+            "query_intent": intent,
             **kwargs,
         }
         if channel_weights is not None:

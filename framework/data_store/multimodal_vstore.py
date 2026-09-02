@@ -82,6 +82,59 @@ def rrf_fuse(
     ]
 
 
+def _truncate_text(text: Any, max_chars: int = 220) -> str:
+    s = str(text or "").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars].rstrip() + "..."
+
+
+def _normalize_query_intent(query_intent: Optional[Dict[str, Any]] = None, query: str = "") -> Dict[str, bool]:
+    if query_intent is not None:
+        return {
+            "is_visual": bool(query_intent.get("is_visual", False)),
+            "is_table": bool(query_intent.get("is_table", False)),
+            "is_text": bool(query_intent.get("is_text", False)),
+        }
+
+    q = str(query or "").lower()
+    visual_terms = ["image", "picture", "photo", "figure", "diagram", "illustration", "screenshot", "show", "display", "depict"]
+    table_terms = ["table", "row", "rows", "column", "columns", "spreadsheet", "tabular"]
+    is_visual = any(term in q for term in visual_terms)
+    is_table = any(term in q for term in table_terms)
+    return {
+        "is_visual": is_visual,
+        "is_table": is_table,
+        "is_text": not is_visual and not is_table,
+    }
+
+
+def _metadata_term_overlap_score(query: str, metadata: Optional[Dict[str, Any]]) -> float:
+    if not metadata:
+        return 0.0
+    query_terms = set(simple_tokenize(query))
+    if not query_terms:
+        return 0.0
+
+    fields = []
+    for key in ("section_context", "preceding_text", "following_text", "caption", "stored_file_name", "source_file", "element_type"):
+        value = metadata.get(key)
+        if value:
+            fields.append(str(value))
+
+    anchors = metadata.get("text_anchors")
+    if isinstance(anchors, list):
+        fields.extend(str(a) for a in anchors if a)
+    elif anchors:
+        fields.append(str(anchors))
+
+    candidate_terms = set(simple_tokenize(" ".join(fields)))
+    overlap = query_terms.intersection(candidate_terms)
+    if not overlap:
+        return 0.0
+    return min(1.0, len(overlap) / max(1, len(query_terms)))
+
+
 # ============================================================
 # BM25 Sidecar (persistent)
 # ============================================================
@@ -518,6 +571,86 @@ class MultimodalVectorStore:
             return "table"
         return "text"
 
+    def _build_image_proxy_text(self, image_name: str, extra_metadata: Optional[Dict[str, Any]] = None, caption: str = "") -> str:
+        metadata = extra_metadata or {}
+        parts: List[str] = [f"[image] {image_name}"]
+
+        page_number = metadata.get("page_number", metadata.get("page"))
+        if page_number is not None:
+            parts.append(f"page {page_number}")
+
+        section_context = metadata.get("section_context")
+        if section_context:
+            parts.append(f"section: {section_context}")
+
+        text_anchors = metadata.get("text_anchors")
+        if isinstance(text_anchors, list) and text_anchors:
+            parts.append("anchors: " + ", ".join(str(a) for a in text_anchors[:5]))
+        elif text_anchors:
+            parts.append(f"anchors: {text_anchors}")
+
+        if caption and caption.strip():
+            parts.append(f"caption: {_truncate_text(caption, 240)}")
+
+        preceding_text = metadata.get("preceding_text")
+        if preceding_text:
+            parts.append(f"preceding: {_truncate_text(preceding_text, 240)}")
+
+        following_text = metadata.get("following_text")
+        if following_text:
+            parts.append(f"following: {_truncate_text(following_text, 240)}")
+
+        element_type = metadata.get("element_type")
+        if element_type:
+            parts.append(f"element_type: {element_type}")
+
+        stored_file_name = metadata.get("stored_file_name") or metadata.get("source_file")
+        if stored_file_name:
+            parts.append(f"file: {stored_file_name}")
+
+        return " | ".join(part for part in parts if part)
+
+    def _apply_intent_aware_rerank(self, query: str, candidates: List[Dict[str, Any]], query_intent: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        intent = _normalize_query_intent(query_intent=query_intent, query=query)
+        if not candidates:
+            return candidates
+
+        visual_query = intent.get("is_visual", False)
+        table_query = intent.get("is_table", False)
+
+        reranked: List[Dict[str, Any]] = []
+        for idx, candidate in enumerate(candidates):
+            modality = str(candidate.get("modality") or "")
+            metadata = candidate.get("metadata") or {}
+            score = float(-idx)
+
+            if visual_query:
+                if modality == "image":
+                    score += 1000.0
+                    score += 50.0 * _metadata_term_overlap_score(query, metadata)
+                    if metadata.get("section_context"):
+                        score += 10.0
+                    if metadata.get("preceding_text") or metadata.get("following_text"):
+                        score += 5.0
+                elif modality == "text":
+                    score += 100.0
+                elif modality == "table":
+                    score += 25.0
+            elif table_query:
+                if modality == "table":
+                    score += 1000.0
+                elif modality == "text":
+                    score += 100.0
+                elif modality == "image":
+                    score += 10.0
+
+            enriched = dict(candidate)
+            enriched["_heuristic_score"] = score
+            reranked.append(enriched)
+
+        reranked.sort(key=lambda x: x.get("_heuristic_score", float("-inf")), reverse=True)
+        return reranked
+
     async def _split_text_with_lines(self, text: str) -> List[Tuple[str, int, int]]:
         lines = text.splitlines()
         chunks = []
@@ -714,7 +847,7 @@ class MultimodalVectorStore:
         caption = await asyncio.to_thread(self.embedder.caption_image, str(p))
 
         image_name = extra_metadata.get('source_file', p.name) if extra_metadata else p.name
-        proxy = caption.strip() if caption.strip() else f"[image] {image_name}"
+        proxy = self._build_image_proxy_text(image_name=image_name, extra_metadata=extra_metadata, caption=caption)
 
         img_vec = (await asyncio.to_thread(self.embedder.embed_images, [str(p)]))[0]
 
@@ -1122,6 +1255,7 @@ class MultimodalVectorStore:
         filter: Optional[Dict[str, Any]] = None,
         rerank_top_n: int = 50,
         channel_weights: Optional[Dict[str, float]] = None,
+        query_intent: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         channel_weights = channel_weights or {
             "dense": 1.0,
@@ -1257,6 +1391,7 @@ class MultimodalVectorStore:
                 })
 
         candidates.sort(key=lambda x: fused_rank.get(x["id"], 10**9))
+        candidates = self._apply_intent_aware_rerank(query=query, candidates=candidates, query_intent=query_intent)
 
         if self._reranker is not None and candidates:
             top = candidates[:rerank_top_n]
@@ -1265,7 +1400,9 @@ class MultimodalVectorStore:
                 scores = await asyncio.to_thread(self._reranker.predict, pairs)
                 for c, s in zip(top, scores):
                     c["_rerank_score"] = float(s)
-                top.sort(key=lambda x: x.get("_rerank_score", -1e9), reverse=True)
+                    if c.get("_heuristic_score") is not None:
+                        c["_combined_rerank_score"] = float(s) + (0.001 * float(c.get("_heuristic_score", 0.0)))
+                top.sort(key=lambda x: x.get("_combined_rerank_score", x.get("_rerank_score", -1e9)), reverse=True)
                 candidates = top + candidates[rerank_top_n:]
             except Exception:
                 pass
