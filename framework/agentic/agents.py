@@ -520,7 +520,15 @@ class OpenAIAgent:
             if "parsed" in result:
                 return False, result["parsed"], raw, result
             raw = self.get_chat_response(
-                user_prompt=f"Please fix the JSON format of the following response: {result}\n{schema}"
+                user_prompt=(
+                    "The following response was not valid JSON. "
+                    "Re-emit the FULL response as a single valid JSON object "
+                    "matching the schema below. Preserve all original content "
+                    "(including any code blocks) verbatim; only fix the JSON "
+                    "structure/escaping - do not summarize, truncate, or "
+                    "replace content with placeholders.\n\n"
+                    f"--- Original response ---\n{raw}\n--- End original response ---\n\n{schema}"
+                )
             )
             result = robust_jsonfy(raw)
             if "parsed" in result:
