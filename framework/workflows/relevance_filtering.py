@@ -295,6 +295,42 @@ def _filter_candidates_for_relevance(
     return result
 
 
+def evaluate_direct_search_relevance(
+    user_input: str,
+    agent: Any,
+    raw_results: List[Dict[str, Any]],
+    universe_name: str,
+    kb_name: str,
+    require_strict_yes_no: bool = True,
+    include_nonrelevant: bool = False,
+    show_steps: bool = False,
+) -> Dict[str, Any]:
+    normalized_results = _normalize_results(
+        raw_results,
+        universe_name=universe_name,
+        kb_name=kb_name,
+    )
+    filtered = _filter_candidates_for_relevance(
+        user_input=user_input,
+        agent=agent,
+        candidates=normalized_results,
+        require_strict_yes_no=require_strict_yes_no,
+        include_nonrelevant=include_nonrelevant,
+        show_steps=show_steps,
+    )
+    result: Dict[str, Any] = {
+        "normalized_results": normalized_results,
+        "n_raw_results": len(raw_results),
+        "n_relevant": filtered.get("n_relevant", 0),
+        "relevant_results": filtered.get("relevant_results", []),
+        "relevance_errors": filtered.get("relevance_errors", []),
+    }
+    if include_nonrelevant:
+        result["nonrelevant_results"] = filtered.get("nonrelevant_results", [])
+        result["n_nonrelevant"] = filtered.get("n_nonrelevant", 0)
+    return result
+
+
 def search_direct(
     infra: Any,
     universe_name: str,
@@ -410,6 +446,99 @@ def search_with_rolling_window(
         result["metadata"]["nonrelevant_results"] = nonrelevant_results
         result["metadata"]["n_nonrelevant"] = len(nonrelevant_results)
     return result
+
+
+def search_direct_with_auto_fallback(
+    user_input: str,
+    agent: Any,
+    infra: Any,
+    universe_name: str,
+    kb_name: str,
+    k: int = 5,
+    context_window: int = 1,
+    batch_size: int = 10,
+    max_batches: int = 5,
+    dedupe_by: str = "id",
+    require_strict_yes_no: bool = True,
+    include_nonrelevant: bool = False,
+    max_relevant_results: int | None = None,
+    show_steps: bool = False,
+) -> Dict[str, Any]:
+    direct_result = search_direct(
+        infra=infra,
+        universe_name=universe_name,
+        kb_name=kb_name,
+        query=user_input,
+        k=k,
+        context_window=context_window,
+    )
+
+    raw_results = direct_result.get("results", [])
+    precheck = evaluate_direct_search_relevance(
+        user_input=user_input,
+        agent=agent,
+        raw_results=raw_results,
+        universe_name=universe_name,
+        kb_name=kb_name,
+        require_strict_yes_no=require_strict_yes_no,
+        include_nonrelevant=include_nonrelevant,
+        show_steps=show_steps,
+    )
+
+    direct_metadata = dict(direct_result.get("metadata") or {})
+    direct_metadata.update({
+        "requested_mode": "direct_search",
+        "executed_mode": "direct_search",
+        "auto_fallback_attempted": False,
+        "fallback_from": None,
+        "fallback_reason": None,
+        "direct_precheck": {
+            "n_raw_results": precheck.get("n_raw_results", 0),
+            "n_relevant": precheck.get("n_relevant", 0),
+            "relevance_errors": precheck.get("relevance_errors", []),
+            "relevant_candidate_ids": [r.get("id") for r in precheck.get("relevant_results", [])],
+        },
+    })
+    if include_nonrelevant:
+        direct_metadata["direct_precheck"]["n_nonrelevant"] = precheck.get("n_nonrelevant", 0)
+
+    if precheck.get("n_relevant", 0) > 0:
+        direct_result["metadata"] = direct_metadata
+        return direct_result
+
+    rolling_result = search_with_rolling_window(
+        user_input=user_input,
+        agent=agent,
+        infra=infra,
+        universe_name=universe_name,
+        kb_name=kb_name,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        context_window=context_window,
+        dedupe_by=dedupe_by,
+        require_strict_yes_no=require_strict_yes_no,
+        include_nonrelevant=include_nonrelevant,
+        max_relevant_results=max_relevant_results,
+        show_steps=show_steps,
+    )
+    rolling_metadata = dict(rolling_result.get("metadata") or {})
+    rolling_metadata.update({
+        "requested_mode": "direct_search",
+        "executed_mode": "rolling_window",
+        "auto_fallback_attempted": True,
+        "fallback_from": "direct_search",
+        "fallback_reason": "direct_search_returned_no_relevant_results",
+        "direct_precheck": {
+            "n_raw_results": precheck.get("n_raw_results", 0),
+            "n_relevant": precheck.get("n_relevant", 0),
+            "relevance_errors": precheck.get("relevance_errors", []),
+            "relevant_candidate_ids": [r.get("id") for r in precheck.get("relevant_results", [])],
+        },
+    })
+    if include_nonrelevant:
+        rolling_metadata["direct_precheck"]["n_nonrelevant"] = precheck.get("n_nonrelevant", 0)
+    rolling_result["metadata"] = rolling_metadata
+    return rolling_result
 
 
 def _build_internal_questions_prompt(query: str, max_internal_questions: int = 3) -> str:

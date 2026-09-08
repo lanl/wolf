@@ -14,6 +14,7 @@ from framework.universes.base_universe import CreateKBRequest
 from framework.workflows.base_agent_action import AgentAction
 from framework.workflows.relevance_filtering import (
     search_direct,
+    search_direct_with_auto_fallback,
     search_with_rolling_window,
     search_with_agentic_internal_questions,
 )
@@ -156,6 +157,10 @@ class KBSearchArgs(BaseModel):
         default="direct_search",
         description="KB search strategy to use"
     )
+    auto_fallback_to_rolling_window: bool = Field(
+        default=True,
+        description="When search_mode is direct_search, automatically retry with rolling_window if direct-search results are not relevant enough to answer"
+    )
     batch_size: int = Field(default=10, description="Batch size for rolling-window search")
     max_batches: int = Field(default=5, description="Maximum number of batches to process for rolling-window search")
     max_relevant_results: Optional[int] = Field(default=None, description="Optional cap on relevant results returned by advanced search modes")
@@ -180,6 +185,7 @@ class UniverseKBSearchAction(AgentAction):
                               "k": <int> (optional, default=5),
                               "context_window": <int> (optional, default=1),
                               "search_mode": <string> (optional, default="direct_search"),
+                              "auto_fallback_to_rolling_window": <bool> (optional, default=true),
                               "batch_size": <int> (optional, default=10),
                               "max_batches": <int> (optional, default=5),
                               "max_relevant_results": <int|null> (optional),
@@ -211,14 +217,32 @@ class UniverseKBSearchAction(AgentAction):
         try:
             search_mode = self.payload.search_mode
             if search_mode == "direct_search":
-                result = search_direct(
-                    infra=infra,
-                    universe_name=univ_name,
-                    kb_name=self.payload.kb_name,
-                    query=self.payload.query,
-                    k=self.payload.k,
-                    context_window=self.payload.context_window,
-                )
+                if self.payload.auto_fallback_to_rolling_window:
+                    result = search_direct_with_auto_fallback(
+                        user_input=self.payload.query,
+                        agent=infra.agent,
+                        infra=infra,
+                        universe_name=univ_name,
+                        kb_name=self.payload.kb_name,
+                        k=self.payload.k,
+                        context_window=self.payload.context_window,
+                        batch_size=self.payload.batch_size,
+                        max_batches=self.payload.max_batches,
+                        dedupe_by=self.payload.dedupe_by,
+                        require_strict_yes_no=self.payload.require_strict_yes_no,
+                        include_nonrelevant=self.payload.include_nonrelevant,
+                        max_relevant_results=self.payload.max_relevant_results,
+                        show_steps=self.payload.show_steps,
+                    )
+                else:
+                    result = search_direct(
+                        infra=infra,
+                        universe_name=univ_name,
+                        kb_name=self.payload.kb_name,
+                        query=self.payload.query,
+                        k=self.payload.k,
+                        context_window=self.payload.context_window,
+                    )
             elif search_mode == "rolling_window":
                 result = search_with_rolling_window(
                     user_input=self.payload.query,
