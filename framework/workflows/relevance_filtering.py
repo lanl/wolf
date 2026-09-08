@@ -214,6 +214,41 @@ Provide only yes or no.
 """
 
 
+def _build_sufficiency_prompt(user_input: str, relevant_candidates: List[Dict[str, Any]]) -> str:
+    formatted_candidates: List[str] = []
+    for idx, candidate in enumerate(relevant_candidates, start=1):
+        formatted_candidates.append(
+            f"""<Relevant Result {idx}>
+  ** document_id **      : {candidate.get('id')}
+  ** modality **         : {candidate.get('modality')}
+  ** source **           : {candidate.get('source')}
+  ** uri **              : {candidate.get('uri')}
+  ** metadata **         : {candidate.get('metadata')}
+  ** document_content ** : {candidate.get('document')}
+</Relevant Result {idx}>"""
+        )
+
+    return f"""Determine whether the user question can be answered accurately and specifically from the retrieved results below alone.
+
+Important rules:
+- Relevance is not enough; judge answer sufficiency.
+- Answer yes only if the retrieved results contain enough evidence to answer the user's actual question directly.
+- If the question asks for an exact target such as an equation number, figure number, axis label, date, count, name, section, identifier, or similarly precise fact, answer no unless that exact target is present or directly recoverable from the retrieved results.
+- If the results are only topically related, partially related, or missing the key detail needed for the answer, answer no.
+- Do not guess. Do not assume missing information.
+
+<User Question>
+{user_input}
+</User Question>
+
+<Retrieved Relevant Results>
+{chr(10).join(formatted_candidates)}
+</Retrieved Relevant Results>
+
+Provide only yes or no.
+"""
+
+
 def _parse_yes_no(agent_output: Any) -> str:
     ans = str(agent_output or "").strip().lower()
     if ans.startswith("yes"):
@@ -235,6 +270,25 @@ def _ask_agent_relevance(
     if require_strict_yes_no and decision == "unknown":
         raise ValueError(
             f"Agent relevance answer is not strict yes/no for candidate {candidate.get('id')}: {raw_answer}"
+        )
+    return {
+        "decision": decision,
+        "raw_answer": raw_answer,
+    }
+
+
+def _ask_agent_sufficiency(
+    agent: Any,
+    user_input: str,
+    relevant_candidates: List[Dict[str, Any]],
+    require_strict_yes_no: bool = True,
+) -> Dict[str, Any]:
+    prompt = _build_sufficiency_prompt(user_input, relevant_candidates)
+    raw_answer = agent.get_chat_response(prompt)
+    decision = _parse_yes_no(raw_answer)
+    if require_strict_yes_no and decision == "unknown":
+        raise ValueError(
+            f"Agent sufficiency answer is not strict yes/no: {raw_answer}"
         )
     return {
         "decision": decision,
@@ -329,6 +383,58 @@ def evaluate_direct_search_relevance(
         result["nonrelevant_results"] = filtered.get("nonrelevant_results", [])
         result["n_nonrelevant"] = filtered.get("n_nonrelevant", 0)
     return result
+
+
+def evaluate_direct_search_sufficiency(
+    user_input: str,
+    agent: Any,
+    relevant_results: List[Dict[str, Any]],
+    require_strict_yes_no: bool = True,
+    max_results_to_check: int = 3,
+    show_steps: bool = False,
+) -> Dict[str, Any]:
+    if max_results_to_check <= 0:
+        raise ValueError("max_results_to_check must be > 0")
+
+    candidates_to_check = list(relevant_results[:max_results_to_check])
+    if not candidates_to_check:
+        return {
+            "attempted": False,
+            "sufficient": False,
+            "decision": "no",
+            "raw_answer": "No relevant results available for sufficiency evaluation.",
+            "evaluated_candidate_ids": [],
+            "error": None,
+        }
+
+    try:
+        decision_info = _ask_agent_sufficiency(
+            agent=agent,
+            user_input=user_input,
+            relevant_candidates=candidates_to_check,
+            require_strict_yes_no=require_strict_yes_no,
+        )
+        if show_steps:
+            print(f"   ---> [SUFFICIENCY CHECK]: {decision_info['raw_answer']}")
+        return {
+            "attempted": True,
+            "sufficient": decision_info["decision"] == "yes",
+            "decision": decision_info["decision"],
+            "raw_answer": decision_info["raw_answer"],
+            "evaluated_candidate_ids": [c.get("id") for c in candidates_to_check],
+            "error": None,
+        }
+    except Exception as e:
+        if show_steps:
+            print(f"   -> sufficiency error: {e}")
+        return {
+            "attempted": True,
+            "sufficient": False,
+            "decision": "unknown",
+            "raw_answer": None,
+            "evaluated_candidate_ids": [c.get("id") for c in candidates_to_check],
+            "error": str(e),
+        }
 
 
 def search_direct(
@@ -463,6 +569,9 @@ def search_direct_with_auto_fallback(
     include_nonrelevant: bool = False,
     max_relevant_results: int | None = None,
     show_steps: bool = False,
+    require_direct_answer_sufficiency: bool = True,
+    max_direct_results_for_sufficiency_check: int = 3,
+    min_relevant_results_for_direct_accept: int | None = None,
 ) -> Dict[str, Any]:
     direct_result = search_direct(
         infra=infra,
@@ -485,6 +594,37 @@ def search_direct_with_auto_fallback(
         show_steps=show_steps,
     )
 
+    sufficiency_check: Dict[str, Any] = {
+        "attempted": False,
+        "sufficient": False,
+        "decision": None,
+        "raw_answer": None,
+        "evaluated_candidate_ids": [],
+        "error": None,
+    }
+
+    fallback_reason: str | None = None
+    n_relevant = precheck.get("n_relevant", 0)
+
+    if n_relevant == 0:
+        fallback_reason = "direct_search_returned_no_relevant_results"
+    elif min_relevant_results_for_direct_accept is not None and n_relevant < min_relevant_results_for_direct_accept:
+        fallback_reason = "direct_search_too_few_relevant_results"
+    elif require_direct_answer_sufficiency:
+        sufficiency_check = evaluate_direct_search_sufficiency(
+            user_input=user_input,
+            agent=agent,
+            relevant_results=precheck.get("relevant_results", []),
+            require_strict_yes_no=require_strict_yes_no,
+            max_results_to_check=max_direct_results_for_sufficiency_check,
+            show_steps=show_steps,
+        )
+        if not sufficiency_check.get("sufficient", False):
+            if sufficiency_check.get("error"):
+                fallback_reason = "direct_search_sufficiency_check_error"
+            else:
+                fallback_reason = "direct_search_relevant_results_insufficient_to_answer"
+
     direct_metadata = dict(direct_result.get("metadata") or {})
     direct_metadata.update({
         "requested_mode": "direct_search",
@@ -494,15 +634,16 @@ def search_direct_with_auto_fallback(
         "fallback_reason": None,
         "direct_precheck": {
             "n_raw_results": precheck.get("n_raw_results", 0),
-            "n_relevant": precheck.get("n_relevant", 0),
+            "n_relevant": n_relevant,
             "relevance_errors": precheck.get("relevance_errors", []),
             "relevant_candidate_ids": [r.get("id") for r in precheck.get("relevant_results", [])],
         },
+        "direct_sufficiency_check": sufficiency_check,
     })
     if include_nonrelevant:
         direct_metadata["direct_precheck"]["n_nonrelevant"] = precheck.get("n_nonrelevant", 0)
 
-    if precheck.get("n_relevant", 0) > 0:
+    if fallback_reason is None:
         direct_result["metadata"] = direct_metadata
         return direct_result
 
@@ -527,13 +668,14 @@ def search_direct_with_auto_fallback(
         "executed_mode": "rolling_window",
         "auto_fallback_attempted": True,
         "fallback_from": "direct_search",
-        "fallback_reason": "direct_search_returned_no_relevant_results",
+        "fallback_reason": fallback_reason,
         "direct_precheck": {
             "n_raw_results": precheck.get("n_raw_results", 0),
-            "n_relevant": precheck.get("n_relevant", 0),
+            "n_relevant": n_relevant,
             "relevance_errors": precheck.get("relevance_errors", []),
             "relevant_candidate_ids": [r.get("id") for r in precheck.get("relevant_results", [])],
         },
+        "direct_sufficiency_check": sufficiency_check,
     })
     if include_nonrelevant:
         rolling_metadata["direct_precheck"]["n_nonrelevant"] = precheck.get("n_nonrelevant", 0)

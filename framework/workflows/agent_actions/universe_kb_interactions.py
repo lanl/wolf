@@ -170,6 +170,18 @@ class KBSearchArgs(BaseModel):
     show_steps: bool = Field(default=False, description="Print intermediate advanced-search steps for debugging")
     max_internal_questions: int = Field(default=3, description="Maximum number of generated internal questions")
     k_per_internal_question: Optional[int] = Field(default=None, description="Results to retrieve per internal question; defaults to k")
+    require_direct_answer_sufficiency: bool = Field(
+        default=True,
+        description="When auto fallback is enabled for direct_search, require a second-stage sufficiency check before accepting direct-search results"
+    )
+    max_direct_results_for_sufficiency_check: int = Field(
+        default=3,
+        description="Maximum number of top relevant direct-search results to inspect during the direct-answer sufficiency check"
+    )
+    min_relevant_results_for_direct_accept: Optional[int] = Field(
+        default=None,
+        description="Optional minimum number of relevant direct-search results required to accept direct_search without fallback; if unmet, rolling_window is triggered"
+    )
 
 
 class UniverseKBSearchAction(AgentAction):
@@ -194,7 +206,10 @@ class UniverseKBSearchAction(AgentAction):
                               "include_nonrelevant": <bool> (optional, default=false),
                               "show_steps": <bool> (optional, default=false),
                               "max_internal_questions": <int> (optional, default=3),
-                              "k_per_internal_question": <int|null> (optional)
+                              "k_per_internal_question": <int|null> (optional),
+                              "require_direct_answer_sufficiency": <bool> (optional, default=true),
+                              "max_direct_results_for_sufficiency_check": <int> (optional, default=3),
+                              "min_relevant_results_for_direct_accept": <int|null> (optional)
                               }
                               """
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
@@ -233,6 +248,9 @@ class UniverseKBSearchAction(AgentAction):
                         include_nonrelevant=self.payload.include_nonrelevant,
                         max_relevant_results=self.payload.max_relevant_results,
                         show_steps=self.payload.show_steps,
+                        require_direct_answer_sufficiency=self.payload.require_direct_answer_sufficiency,
+                        max_direct_results_for_sufficiency_check=self.payload.max_direct_results_for_sufficiency_check,
+                        min_relevant_results_for_direct_accept=self.payload.min_relevant_results_for_direct_accept,
                     )
                 else:
                     result = search_direct(
