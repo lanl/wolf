@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 import requests
 import chromadb
 from framework.data_store.data_models import EmbeddingParams
@@ -12,11 +13,8 @@ from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnow
 from framework.universes.base_universe import CreateKBRequest
 
 from framework.workflows.base_agent_action import AgentAction
-from framework.workflows.relevance_filtering import (
-    search_direct,
-    search_with_rolling_window,
-    search_with_agentic_internal_questions,
-)
+from framework.universes.endpoint_resolver import get_universe_base_url_or_error
+from framework.workflows.agent_actions.formatting_utils import resolve_text_list_source, resolve_text_source
 
 
 # Default timeout for all HTTP requests
@@ -29,7 +27,7 @@ DEFAULT_TIMEOUT = 30
 class CreateKBArgs(BaseModel):
     system: str = Field(description="System where the KB will be created, e.g., 'local'")
     univ_name: str = Field(description="Name for the Universe the KB belongs to")
-    kb_params: KnowledgeBaseParams | MultimodalKnowledgeBaseParams | Dict[str, Any] = Field(description="Parameters of the KB")
+    kb_params: KnowledgeBaseParams | MultimodalKnowledgeBaseParams = Field(description="Parameters of the KB")
     type: str = Field(default="text", description="Type of KB: 'text' for text-only or 'multimodal' for multimodal KB")
 
 
@@ -47,8 +45,9 @@ class CreateKBAction(AgentAction):
 
     def execute(self, infra) -> None:
         univ_name = self.payload.univ_name.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         kb_type = self.payload.type.lower()
-
+        
         # Check if universe exists in managed deployments
         deployments: Dict[str, Dict[str, Any]] = getattr(infra, "managed_deployments", {})
         if univ_name not in deployments:
@@ -56,50 +55,56 @@ class CreateKBAction(AgentAction):
                                    Try to create UNIV[{univ_name}] first."""
             infra.append_chat_history(actor="system", content=ERROR_MSG, action={"action": "system_info"}, log_console=True)
             return
-
-        kb_params = self.payload.kb_params
-        kb_name = getattr(kb_params, "name", None)
-
+        
         try:
             univ = infra.UNIVs[univ_name]
-            univ_base_url = univ.get_base_url()
-
-            # Normalize kb_params to the correct type based on kb_type without dropping fields
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
+            
+            # Prepare KB creation request
+            kb_params = self.payload.kb_params
+            
+            # Convert kb_params to the correct type based on kb_type
             if kb_type == "multimodal":
-                if isinstance(kb_params, MultimodalKnowledgeBaseParams):
-                    normalized_kb_params = kb_params
-                elif isinstance(kb_params, KnowledgeBaseParams):
-                    normalized_kb_params = MultimodalKnowledgeBaseParams(**kb_params.model_dump())
-                elif isinstance(kb_params, dict):
-                    normalized_kb_params = MultimodalKnowledgeBaseParams(**kb_params)
-                elif hasattr(kb_params, "model_dump"):
-                    normalized_kb_params = MultimodalKnowledgeBaseParams(**kb_params.model_dump())
-                else:
-                    normalized_kb_params = MultimodalKnowledgeBaseParams(**dict(kb_params))
+                # If kb_params is not already MultimodalKnowledgeBaseParams, construct it
+                if not isinstance(kb_params, MultimodalKnowledgeBaseParams):
+                    # Extract common fields and construct MultimodalKnowledgeBaseParams
+                    if isinstance(kb_params, dict):
+                        kb_params = MultimodalKnowledgeBaseParams(**kb_params)
+                    else:
+                        # Convert KnowledgeBaseParams to MultimodalKnowledgeBaseParams
+                        kb_params = MultimodalKnowledgeBaseParams(
+                            name=kb_params.name,
+                            chunk_size=kb_params.chunk_size if hasattr(kb_params, 'chunk_size') else 512,
+                            chunk_overlap=kb_params.chunk_overlap if hasattr(kb_params, 'chunk_overlap') else 64,
+                            inventory_path=kb_params.inventory_path if hasattr(kb_params, 'inventory_path') else None,
+                            persist_dir=kb_params.persist_dir if hasattr(kb_params, 'persist_dir') else None,
+                            rebuild_vstore=kb_params.rebuild_text_vstore if hasattr(kb_params, 'rebuild_text_vstore') else False,
+                            vrbz=kb_params.vrbz if hasattr(kb_params, 'vrbz') else 0
+                        )
             elif kb_type == "text":
-                if isinstance(kb_params, KnowledgeBaseParams):
-                    normalized_kb_params = kb_params
-                elif isinstance(kb_params, dict):
-                    normalized_kb_params = KnowledgeBaseParams(**kb_params)
-                elif hasattr(kb_params, "model_dump"):
-                    normalized_kb_params = KnowledgeBaseParams(**kb_params.model_dump())
-                else:
-                    error_msg = f"For 'text' type, kb_params must be KnowledgeBaseParams-compatible, got {type(kb_params).__name__}"
-                    infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
-                    return
+                # If kb_params is not already KnowledgeBaseParams, construct it
+                if not isinstance(kb_params, KnowledgeBaseParams):
+                    if isinstance(kb_params, dict):
+                        kb_params = KnowledgeBaseParams(**kb_params)
+                    else:
+                        error_msg = f"For 'text' type, kb_params must be KnowledgeBaseParams, got {type(kb_params).__name__}"
+                        infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
+                        return
             else:
                 error_msg = f"Invalid KB type: {kb_type}. Must be 'text' or 'multimodal'"
                 infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
                 return
 
-            kb_params = normalized_kb_params
-            kb_name = kb_params.name
-
+            # Serialize the request properly as a dictionary
             request_data = {
                 "kb_params": kb_params.model_dump(),
-                "type": kb_type,
+                "db_client": None,  # This field cannot be serialized; will be constructed server-side
+                "type": kb_type
             }
-
+            
+            # Call universe's POST /kbs endpoint
             response = requests.post(
                 f"{univ_base_url}/kbs",
                 json=request_data,
@@ -107,38 +112,28 @@ class CreateKBAction(AgentAction):
             )
             response.raise_for_status()
             result = response.json()
-
-            if getattr(infra.UNIVs[univ_name], "kbs", None) is None:
+            
+            # Update local reference if needed
+            if infra.UNIVs[univ_name].kbs is None:
                 infra.UNIVs[univ_name].kbs = {}
-
+            
             infra.append_chat_history(
                 actor="system",
                 content=f" KB[{kb_params.name}] ({kb_type}) successfully added to UNIV[{univ_name}] via API",
                 action={"action": "create_kb"},
                 log_console=True,
             )
-
+            
         except requests.exceptions.Timeout:
-            error_msg = f"Request timed out while creating KB[{kb_name or 'unknown'}] in UNIV[{univ_name}]"
+            error_msg = f"Request timed out while creating KB[{kb_params.name}] in UNIV[{univ_name}]"
             infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
-        except requests.exceptions.HTTPError as e:
-            response = getattr(e, "response", None)
-            error_detail = f"Failed to create KB[{kb_name or 'unknown'}] in UNIV[{univ_name}]: {str(e)}"
-            if response is not None:
-                error_detail += f"\nstatus_code={response.status_code}"
-                error_detail += f"\nresponse_text={response.text}"
-                try:
-                    error_detail += f"\nresponse_json={response.json()}"
-                except Exception:
-                    pass
-            infra.append_chat_history(actor="system", content=error_detail, action={"action": "system_info"}, log_console=True)
         except requests.exceptions.RequestException as e:
-            error_msg = f"Failed to create KB[{kb_name or 'unknown'}] in UNIV[{univ_name}]: {str(e)}"
+            error_msg = f"Failed to create KB[{kb_params.name}] in UNIV[{univ_name}]: {str(e)}"
             infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
         except Exception as e:
-            error_msg = f"Error creating KB[{kb_name or 'unknown'}] in UNIV[{univ_name}]: {str(e)}"
+            error_msg = f"Error creating KB[{kb_params.name}] in UNIV[{univ_name}]: {str(e)}"
             infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True)
-
+        
         return
 
 
@@ -152,19 +147,6 @@ class KBSearchArgs(BaseModel):
     query: str = Field(description="Search query")
     k: int = Field(default=5, description="Number of results to return")
     context_window: int = Field(default=1, description="Context window size for results")
-    search_mode: Literal["direct_search", "rolling_window", "agentic_internal_questions"] = Field(
-        default="direct_search",
-        description="KB search strategy to use"
-    )
-    batch_size: int = Field(default=10, description="Batch size for rolling-window search")
-    max_batches: int = Field(default=5, description="Maximum number of batches to process for rolling-window search")
-    max_relevant_results: Optional[int] = Field(default=None, description="Optional cap on relevant results returned by advanced search modes")
-    dedupe_by: str = Field(default="id", description="Candidate deduplication key: id, source, or document")
-    require_strict_yes_no: bool = Field(default=True, description="Require strict yes/no answers for relevance checks")
-    include_nonrelevant: bool = Field(default=False, description="Include nonrelevant results metadata for advanced modes")
-    show_steps: bool = Field(default=False, description="Print intermediate advanced-search steps for debugging")
-    max_internal_questions: int = Field(default=3, description="Maximum number of generated internal questions")
-    k_per_internal_question: Optional[int] = Field(default=None, description="Results to retrieve per internal question; defaults to k")
 
 
 class UniverseKBSearchAction(AgentAction):
@@ -178,100 +160,64 @@ class UniverseKBSearchAction(AgentAction):
                               "kb_name": <string>,
                               "query": <string>,
                               "k": <int> (optional, default=5),
-                              "context_window": <int> (optional, default=1),
-                              "search_mode": <string> (optional, default="direct_search"),
-                              "batch_size": <int> (optional, default=10),
-                              "max_batches": <int> (optional, default=5),
-                              "max_relevant_results": <int|null> (optional),
-                              "dedupe_by": <string> (optional, default="id"),
-                              "require_strict_yes_no": <bool> (optional, default=true),
-                              "include_nonrelevant": <bool> (optional, default=false),
-                              "show_steps": <bool> (optional, default=false),
-                              "max_internal_questions": <int> (optional, default=3),
-                              "k_per_internal_question": <int|null> (optional)
+                              "context_window": <int> (optional, default=1)
                               }
                               """
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
-
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
-        result: Dict[str, Any]
-        univ_base_url = f"universe={univ_name}"
-
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
-            if hasattr(univ, "get_base_url"):
-                univ_base_url = univ.get_base_url()
         except Exception as info_err:
             ctx_msg = (f"[ERROR] finding universe {univ_name}'s info:\n"
                        f"  {info_err}")
-            infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True)
+            infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
-
         try:
-            search_mode = self.payload.search_mode
-            if search_mode == "direct_search":
-                result = search_direct(
-                    infra=infra,
-                    universe_name=univ_name,
-                    kb_name=self.payload.kb_name,
-                    query=self.payload.query,
-                    k=self.payload.k,
-                    context_window=self.payload.context_window,
-                )
-            elif search_mode == "rolling_window":
-                result = search_with_rolling_window(
-                    user_input=self.payload.query,
-                    agent=infra.agent,
-                    infra=infra,
-                    universe_name=univ_name,
-                    kb_name=self.payload.kb_name,
-                    batch_size=self.payload.batch_size,
-                    max_batches=self.payload.max_batches,
-                    context_window=self.payload.context_window,
-                    dedupe_by=self.payload.dedupe_by,
-                    require_strict_yes_no=self.payload.require_strict_yes_no,
-                    include_nonrelevant=self.payload.include_nonrelevant,
-                    max_relevant_results=self.payload.max_relevant_results,
-                    show_steps=self.payload.show_steps,
-                )
-            elif search_mode == "agentic_internal_questions":
-                result = search_with_agentic_internal_questions(
-                    user_input=self.payload.query,
-                    agent=infra.agent,
-                    infra=infra,
-                    universe_name=univ_name,
-                    kb_name=self.payload.kb_name,
-                    k_per_internal_question=self.payload.k_per_internal_question or self.payload.k,
-                    context_window=self.payload.context_window,
-                    max_internal_questions=self.payload.max_internal_questions,
-                    dedupe_by=self.payload.dedupe_by,
-                    require_strict_yes_no=self.payload.require_strict_yes_no,
-                    include_nonrelevant=self.payload.include_nonrelevant,
-                    max_relevant_results=self.payload.max_relevant_results,
-                    show_steps=self.payload.show_steps,
-                )
-            else:
-                result = {"error": f"Unsupported search_mode: {search_mode}", "action": self.action}
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
+            response = requests.post(
+                f"{univ_base_url}/kbs/{self.payload.kb_name}/search",
+                json={"query": self.payload.query, "k": self.payload.k, "context_window": self.payload.context_window},
+                timeout=DEFAULT_TIMEOUT
+            )
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, list):
+                result = {"error": "Invalid response format, expected list", "action": self.action}
+            result = {"results": result, "count": len(result)}
         except requests.exceptions.Timeout:
             result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
             result = {"error": f"Request failed: {str(e)}", "action": self.action}
         except Exception as e:
             result = {"error": str(e), "action": self.action}
-
+        ## Show results
         ctx_msg = (f"[Universe: {univ_base_url}] Knowledgebase query results:\n"
                    f"{result}")
-        infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True)
-        return result
+        infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
+        return
 
 
 class KBAppendTextsArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "universe": "main", "kb_name": "kb", "text_lines": [["Document line 1", "Document line 2"]], "doc_source": "agent"}]})
+
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")
     kb_name: str = Field(description="Name of the knowledge base")
-    texts: List[str] = Field(description="List of text documents to add")
+    texts: Optional[List[str]] = Field(default=None, description="List of text documents to add")
+    text_lines: Optional[List[List[str]]] = Field(default=None, description="Safer document transport; each document is a list of lines")
+    texts_base64: Optional[List[str]] = Field(default=None, description="Base64 encoded UTF-8 documents")
     doc_source: str = Field(default="agent", description="Source identifier for the documents")
+
+    @model_validator(mode="after")
+    def normalize_text_transports(self):
+        self.texts = resolve_text_list_source(texts=self.texts, text_lines=self.text_lines, texts_base64=self.texts_base64, field_label="texts", required=True)
+        self.text_lines = None
+        self.texts_base64 = None
+        return self
 
 
 class UniverseKBAppendTextsAction(AgentAction):
@@ -283,7 +229,7 @@ class UniverseKBAppendTextsAction(AgentAction):
                               "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                               "universe": <string>: "Name of the universe you are interacting with",
                               "kb_name": <string>,
-                              "texts": <list[string]>,
+                              "texts" OR "text_lines" OR "texts_base64": <list[string]>,
                               "doc_source": <string> (optional, default="agent")
                               }
                               """
@@ -291,6 +237,7 @@ class UniverseKBAppendTextsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -299,7 +246,9 @@ class UniverseKBAppendTextsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/append_texts",
                 json={"texts": self.payload.texts, "doc_source": self.payload.doc_source},
@@ -341,6 +290,7 @@ class UniverseKBAddURLAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -349,7 +299,9 @@ class UniverseKBAddURLAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/add_url",
                 json={"url": self.payload.url},
@@ -390,6 +342,7 @@ class UniverseKBAddURLsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -397,7 +350,9 @@ class UniverseKBAddURLsAction(AgentAction):
                        f"  {info_err}")
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/add_urls",
                 json={"urls": self.payload.urls},
@@ -419,12 +374,23 @@ class UniverseKBAddURLsAction(AgentAction):
 
 
 class KBAddDocumentArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "universe": "main", "kb_name": "kb", "content_lines": ["Document line 1", "Document line 2"], "metadata": {"source": "agent"}, "modality": "text"}]})
+
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")
     kb_name: str = Field(description="Name of the knowledge base")
-    content: str = Field(description="Content of the document (text, base64-encoded data, or file path)")
+    content: Optional[str] = Field(default=None, description="Content of the document")
+    content_lines: Optional[List[str]] = Field(default=None, description="Safer multiline content transport; joined with newline characters")
+    content_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 document content")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata for the document")
     modality: str = Field(default="text", description="Modality type: 'text', 'image', 'audio', 'video', 'table', 'binary'")
+
+    @model_validator(mode="after")
+    def normalize_content_transport(self):
+        self.content = resolve_text_source(text=self.content, lines=self.content_lines, base64_text=self.content_base64, field_label="content", required=True)
+        self.content_lines = None
+        self.content_base64 = None
+        return self
 
 
 class UniverseKBAddDocumentAction(AgentAction):
@@ -436,13 +402,14 @@ class UniverseKBAddDocumentAction(AgentAction):
                             "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
                             "universe": <string>: "Name of the universe you are interacting with",
                             "kb_name": <string>,
-                            "content": <string>,
+                            "content" OR "content_lines" OR "content_base64": <string/list>,
                             "metadata": <dict> (optional),
                             "modality": <string> (optional, default="text")}"""
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -451,7 +418,9 @@ class UniverseKBAddDocumentAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/add_document",
                 json={
@@ -476,102 +445,6 @@ class UniverseKBAddDocumentAction(AgentAction):
         return
 
 
-class KBAddPDFArgs(BaseModel):
-    system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
-    universe: str = Field(description="Name of the universe you are interacting with")
-    kb_name: str = Field(description="Name of the knowledge base")
-    pdf_path: Optional[str] = Field(default=None, description="Path to PDF file on server")
-    pdf_content: Optional[str] = Field(default=None, description="Base64-encoded PDF content")
-    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata for the PDF")
-    extract_images: bool = Field(default=True, description="Whether to extract images from PDF")
-    extract_tables: bool = Field(default=True, description="Whether to extract tables from PDF")
-    persist_extracted_images: bool = Field(default=True, description="Whether extracted PDF images are physically saved to disk")
-    extracted_image_dir: Optional[str] = Field(default=None, description="Optional directory where extracted PDF images should be persisted")
-
-
-class UniverseKBAddPDFAction(AgentAction):
-    """Add a PDF document to a multimodal knowledge base, extracting text, images, and tables."""
-    action: Literal["universe_kb_add_pdf"] = "universe_kb_add_pdf"
-    description: Literal["Add a PDF document to a multimodal knowledge base, automatically extracting all elements"] = "Add a PDF document to a multimodal knowledge base, automatically extracting all elements"
-    payload: KBAddPDFArgs
-    payload_schema: str = """{
-                            "system": <string>: "Name of the system the universes are connected to i.e. 'local' for the local system",
-                            "universe": <string>: "Name of the universe you are interacting with",
-                            "kb_name": <string>,
-                            "pdf_path": <string> (optional): "Path to PDF file on server",
-                            "pdf_content": <string> (optional): "Base64-encoded PDF content",
-                            "metadata": <dict> (optional),
-                            "extract_images": <bool> (optional, default=True),
-                            "extract_tables": <bool> (optional, default=True),
-                            "persist_extracted_images": <bool> (optional, default=True),
-                            "extracted_image_dir": <string> (optional)}"""
-    yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
-
-    def execute(self, infra) -> Dict[str, Any]:
-        univ_name = self.payload.universe.strip()
-        try:
-            univ = infra.UNIVs[univ_name]
-        except Exception as info_err:
-            ctx_msg = (f"[ERROR] finding universe {univ_name}'s info:\n"
-                       f"  {info_err}")
-            infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
-            return
-        try:
-            univ_base_url = univ.get_base_url()
-
-            # Build request payload
-            request_payload = {
-                "metadata": self.payload.metadata,
-                "extract_images": self.payload.extract_images,
-                "extract_tables": self.payload.extract_tables,
-                "persist_extracted_images": self.payload.persist_extracted_images,
-                "extracted_image_dir": self.payload.extracted_image_dir,
-            }
-
-            # Add either pdf_path or pdf_content
-            if self.payload.pdf_path:
-                request_payload["pdf_path"] = self.payload.pdf_path
-            elif self.payload.pdf_content:
-                request_payload["pdf_content"] = self.payload.pdf_content
-            else:
-                error_msg = "Must provide either 'pdf_path' or 'pdf_content'"
-                infra.append_chat_history(actor="system", content=error_msg, action={"action": "system_info"}, log_console=True,)
-                return
-
-            response = requests.post(
-                f"{univ_base_url}/kbs/{self.payload.kb_name}/add_pdf",
-                json=request_payload,
-                timeout=DEFAULT_TIMEOUT
-            )
-            response.raise_for_status()
-            result = response.json()
-        except requests.exceptions.Timeout:
-            result = {"error": "Request timed out", "action": self.action}
-        except requests.exceptions.HTTPError as e:
-            response = getattr(e, "response", None)
-            error_detail: Dict[str, Any] = {
-                "error": f"Request failed: {str(e)}",
-                "action": self.action,
-            }
-            if response is not None:
-                error_detail["status_code"] = response.status_code
-                error_detail["response_text"] = response.text
-                try:
-                    error_detail["response_json"] = response.json()
-                except Exception:
-                    pass
-            result = error_detail
-        except requests.exceptions.RequestException as e:
-            result = {"error": f"Request failed: {str(e)}", "action": self.action}
-        except Exception as e:
-            result = {"error": str(e), "action": self.action}
-        ## Show results
-        ctx_msg = (f"[Universe: {univ_base_url}] Knowledgebase add PDF results:\n"
-                   f"{result}")
-        infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
-        return
-
-
 class KBStatsArgs(BaseModel):
     system: str = Field(description="The system the universes are connected to i.e. 'local' for the local system")
     universe: str = Field(description="Name of the universe you are interacting with")
@@ -591,6 +464,7 @@ class UniverseKBStatsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -599,7 +473,9 @@ class UniverseKBStatsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/kbs/{self.payload.kb_name}/stats", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -629,6 +505,7 @@ class UniverseKBSourcesAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -637,7 +514,9 @@ class UniverseKBSourcesAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/kbs/{self.payload.kb_name}/sources", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -667,6 +546,7 @@ class UniverseKBPurgeAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -675,7 +555,48 @@ class UniverseKBPurgeAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
+            if hasattr(infra, "request_permission"):
+                approval_request = {
+                    "action": self.action,
+                    "payload": self.payload.model_dump(mode="json"),
+                    "payload_summary": f"Purge all content from KB '{self.payload.kb_name}' in universe '{univ_name}'",
+                    "operation": "universe_kb_purge",
+                    "target_path": f"{univ_name}/{self.payload.kb_name}",
+                    "cwd": os.getcwd(),
+                    "purpose": self.purpose,
+                    "expectations": self.expectations,
+                    "risk_hints": [
+                        "destructive knowledgebase operation",
+                        "removes all KB content",
+                        "remote or sandbox state mutation",
+                    ],
+                    "metadata": {
+                        "universe": univ_name,
+                        "universe_url": univ_base_url,
+                        "kb_name": self.payload.kb_name,
+                    },
+                }
+                approval = infra.request_permission("universe_kb_purge", approval_request)
+                if not approval.get("approved", False):
+                    result = {
+                        "ok": False,
+                        "approved": False,
+                        "action": self.action,
+                        "universe": univ_name,
+                        "kb_name": self.payload.kb_name,
+                        "error": approval.get("reason") or "universe_kb_purge was denied by user approval policy",
+                        "approval": approval,
+                    }
+                    infra.append_chat_history(
+                        actor="system",
+                        content=f"[UniverseKBPurgeAction][denied]: {result}",
+                        action={"action": "system_info"},
+                        log_console=True,
+                    )
+                    return result
             response = requests.post(f"{univ_base_url}/kbs/{self.payload.kb_name}/purge", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -686,7 +607,7 @@ class UniverseKBPurgeAction(AgentAction):
         except Exception as e:
             result = {"error": str(e), "action": self.action}
         ## Show results
-        ctx_msg = (f"[Universe: {univ_base_url}] Purge Knowledgebase<{self.payload.kb_name}> query results:\n"
+        ctx_msg = (f"[Universe: {univ_base_url}] Purge Knowledgebase<self.payload.kb_name> query results:\n"
                    f"{result}"
                    )
         infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
@@ -713,6 +634,7 @@ class UniverseKBGetDocumentAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -721,7 +643,9 @@ class UniverseKBGetDocumentAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/document/{self.payload.document_id}",
                 timeout=DEFAULT_TIMEOUT

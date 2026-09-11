@@ -12,6 +12,7 @@ from framework.cli.config_loader import build_launch_config, print_launch_config
 from framework.cli.discovery import get_actions, get_workflows
 from framework.cli.launchers import launch_api, launch_cli, launch_gateway, launch_gui, launch_tui, launch_join_session
 from framework.cli.session_commands import inspect_session, list_sessions
+from framework.utils.frame_dashboard import add_frame_parser
 
 
 MODES = {"cli", "tui", "gui", "api", "gateway"}
@@ -189,6 +190,9 @@ def _gateway_default_agent_config(args: argparse.Namespace) -> Dict[str, Any]:
         "ctx_window_length": "ctx_window_length",
         "mode": "gateway_mode",
         "max_steps": "max_steps",
+        "orchestration_worker_count": "orchestration_worker_count",
+        "orchestration_max_active_tasks": "orchestration_max_active_tasks",
+        "orchestration_max_total_tasks": "orchestration_max_total_tasks",
         "action_policy": "action_policy",
         "gui_url": "gui_url",
         "gui_action_route": "gui_action_route",
@@ -202,9 +206,17 @@ def _gateway_default_agent_config(args: argparse.Namespace) -> Dict[str, Any]:
         values = _csv_values(getattr(args, attr, None))
         if values is not None:
             cfg[key] = values
-    for key, attr in {"enable_write": "enable_write", "enable_syscall": "enable_syscall", "syscall_allow_shell": "syscall_allow_shell"}.items():
+    for key, attr in {
+        "enable_write": "enable_write",
+        "enable_syscall": "enable_syscall",
+        "syscall_allow_shell": "syscall_allow_shell",
+        "orchestration_enabled": "orchestration_enabled",
+    }.items():
         if getattr(args, attr, False):
             cfg[key] = True
+    env_orchestration = os.getenv("WOLF_GATEWAY_ORCHESTRATION_ENABLED")
+    if env_orchestration is not None and str(env_orchestration).strip().lower() in {"1", "true", "yes", "on", "enabled"}:
+        cfg["orchestration_enabled"] = True
     return cfg
 
 
@@ -252,7 +264,16 @@ def command_join_session(args: argparse.Namespace) -> int:
         account_id=args.account_id,
         session_id=args.session_id,
         token=args.token,
+        invite_token=args.invite_token,
+        invite_url=args.invite_url,
+        approval_token=args.approval_token,
+        join_request_id=args.join_request_id,
+        request_approval=args.request_approval,
+        role=args.role,
+        client_type=args.client_type,
         participant_id=args.participant_id,
+        reason=args.reason,
+        mode=args.join_mode,
         dry_run=args.dry_run,
         explain=args.explain,
     )
@@ -357,7 +378,7 @@ def command_config_validate(args: argparse.Namespace) -> int:
         errors.append(f"Unsupported mode: {cfg.get('mode')}")
     try:
         from framework.workflows.workflow_space import get_workflow_class
-        get_workflow_class(cfg.get("workflow") or "TurnBasedWorkflow")
+        get_workflow_class(cfg.get("workflow") or "FastTurnBasedWorkflow")
     except Exception as exc:
         errors.append(f"Workflow not discoverable: {exc}")
     llms = cfg.get("session", {}).get("LLMs", {})
@@ -429,6 +450,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version="wolf launcher prototype")
     sub = parser.add_subparsers(dest="command")
 
+    add_frame_parser(sub)
+
     for mode in ["cli", "tui", "gui"]:
         p = sub.add_parser(mode, help=f"Launch {mode.upper()} mode")
         _add_common_launch_args(p)
@@ -453,7 +476,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_launch_args(p_gateway)
     p_gateway.add_argument("--gateway-host", "--host", default="127.0.0.1", help="Gateway bind host (default: 127.0.0.1)")
     p_gateway.add_argument("--gateway-port", "--port", dest="gateway_port", type=int, default=8000, help="Gateway bind port (default: 8000)")
-    p_gateway.add_argument("--static-dir", default="./framework/ui/webapp", help="Static web UI directory for gateway root/static routes")
+    p_gateway.add_argument("--static-dir", default="./framework/pack/webapp", help="Static web UI directory for gateway root/static routes")
     p_gateway.add_argument("--model", help="Default gateway agent model")
     p_gateway.add_argument("--host-address", help="Default inference provider base URL")
     p_gateway.add_argument("--host-port", type=int, help="Default inference provider port")
@@ -465,6 +488,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_gateway.add_argument("--ctx-window-length", type=int, help="Default context window length")
     p_gateway.add_argument("--gateway-mode", choices=["single_step", "wolf_loop"], help="Gateway workflow turn mode")
     p_gateway.add_argument("--max-steps", type=int, help="Max gateway workflow steps per user message")
+    p_gateway.add_argument("--orchestration-enabled", action="store_true", help="Enable multi-task gateway orchestration sessions by default; can also be set with WOLF_GATEWAY_ORCHESTRATION_ENABLED=1")
+    p_gateway.add_argument("--orchestration-worker-count", type=int, help="Default orchestration worker count")
+    p_gateway.add_argument("--orchestration-max-active-tasks", type=int, help="Default maximum simultaneously active orchestration tasks")
+    p_gateway.add_argument("--orchestration-max-total-tasks", type=int, help="Default maximum total orchestration tasks per session")
     p_gateway.add_argument("--action-policy", "--policy", choices=["safe", "limited", "write", "dev", "advanced", "master", "custom"], help="Gateway action policy")
     p_gateway.add_argument("--action-names", help="Comma-separated explicit allowed action names for custom policy")
     p_gateway.add_argument("--enable-write", action="store_true", help="Enable write-capable gateway actions where policy allows")
@@ -518,13 +545,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_cfg_validate.add_argument("--mode", choices=sorted(MODES), default="cli")
     p_cfg_validate.set_defaults(func=command_config_validate)
 
-    p_join = sub.add_parser("join-session", help="Join an active gateway session as a message-level participant")
+    p_join = sub.add_parser("join-session", help="Join an active gateway session as a collaborative participant")
     _add_common_launch_args(p_join)
-    p_join.add_argument("--gateway", required=True, help="Gateway URL, e.g. http://127.0.0.1:8000")
-    p_join.add_argument("--account-id", required=True, help="Gateway account id")
-    p_join.add_argument("--session-id", required=True, help="Gateway session id to join")
-    p_join.add_argument("--token", required=True, help="Gateway auth token")
+    p_join.add_argument("--gateway", help="Gateway URL, e.g. http://127.0.0.1:8000")
+    p_join.add_argument("--account-id", help="Gateway account id for account-token joins")
+    p_join.add_argument("--session-id", help="Gateway session id to join")
+    auth_group = p_join.add_mutually_exclusive_group()
+    auth_group.add_argument("--token", help="Gateway account auth token")
+    auth_group.add_argument("--invite-token", help="One-time/limited collaboration invite token")
+    auth_group.add_argument("--approval-token", help="Short-lived token issued after owner approval")
+    auth_group.add_argument("--request-approval", action="store_true", help="Request owner approval when no token/invite is available")
+    p_join.add_argument("--invite-url", help="wolf://join?... URL containing gateway/session/invite parameters")
+    p_join.add_argument("--join-request-id", help="Join request id required with --approval-token")
     p_join.add_argument("--participant-id", default="wolf_cli_agent", help="Name/id for this joined entity")
+    p_join.add_argument("--role", default="assistant_agent", help="Requested collaboration role")
+    p_join.add_argument("--client-type", default="wolf_cli", help="Client type metadata for Gateway participant list")
+    p_join.add_argument("--reason", help="Reason shown to owners when requesting approval")
+    p_join.add_argument("--join-mode", choices=["message", "agent-passive", "agent-active"], default="message", help="Collaboration behavior mode. agent-passive/agent-active register Gateway metadata; message bridge remains the active transport.")
     p_join.set_defaults(func=command_join_session)
 
     p_doctor = sub.add_parser("doctor", help="Run startup/environment diagnostics")

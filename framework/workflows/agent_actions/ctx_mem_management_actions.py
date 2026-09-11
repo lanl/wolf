@@ -14,6 +14,44 @@ from pydantic import BaseModel, Field
 from framework.workflows.base_agent_action import AgentAction
 from framework.utils.io_tools import console
 
+
+def _request_destructive_memory_permission(infra: Any, action_name: str, payload: BaseModel, *, summary: str, operation: str, purpose: Optional[str] = None):
+    """Request shared runtime approval before destructive memory mutations."""
+    if infra is None or not hasattr(infra, "request_permission"):
+        return None
+    approval_request = {
+        "action": action_name,
+        "payload": payload.model_dump(mode="json", exclude_none=True),
+        "payload_summary": summary,
+        "operation": operation,
+        "purpose": purpose,
+        "risk_hints": [
+            "destructive memory mutation",
+            "durable memory may be deleted or reorganized",
+        ],
+    }
+    approval = infra.request_permission(action_name, approval_request)
+    if approval.get("approved", False):
+        return None
+    result = {
+        "ok": False,
+        "approved": False,
+        "action": action_name,
+        "operation": operation,
+        "error": approval.get("reason") or f"{action_name} was denied by user approval policy",
+        "approval": approval,
+    }
+    try:
+        infra.append_chat_history(
+            actor="system",
+            content=f"[{action_name}][denied]: {result}",
+            action={"action": "system_info"},
+            log_console=True,
+        )
+    except Exception:
+        pass
+    return result
+
 # =============================================================================
 # MEMORY MANAGEMENT ACTIONS
 # =============================================================================
@@ -105,6 +143,16 @@ class ForgetMemory(AgentAction):
     def execute(self, infra) -> None:
         category = self.payload.category.strip().lower()
         key = self.payload.key
+        denied = _request_destructive_memory_permission(
+            infra,
+            self.action,
+            self.payload,
+            summary=f"Forget memory fragment '{key}' from category '{category}'",
+            operation="forget_memory",
+            purpose=self.payload.purpose or self.purpose,
+        )
+        if denied is not None:
+            return denied
         try:
             infra.memory_manager.forget(key, category=category)
             ctx_msg = f"[MEMORY] Forgot memory fragment '{key}' from category '{category}'"
@@ -137,6 +185,16 @@ class ClearMemoryCategory(AgentAction):
             infra.append_chat_history(actor="system", content=warn_msg, action={"action": "system_warn"}, log_console=True)
             return
         category = self.payload.category.strip().lower()
+        denied = _request_destructive_memory_permission(
+            infra,
+            self.action,
+            self.payload,
+            summary=f"Clear all memories from category '{category}'",
+            operation="clear_memory_category",
+            purpose=self.payload.purpose or self.purpose,
+        )
+        if denied is not None:
+            return denied
         try:
             infra.memory_manager.clear(category=category)
             ctx_msg = f"[MEMORY] Cleared all memories from category '{category}'"
@@ -196,6 +254,16 @@ class BatchForgetMemory(AgentAction):
             warn_msg = "[WARN][MEMORY] Batch forget requires 'confirm': true to execute"
             infra.append_chat_history(actor="system", content=warn_msg, action={"action": "system_warn"}, log_console=True)
             return
+        denied = _request_destructive_memory_permission(
+            infra,
+            self.action,
+            self.payload,
+            summary=f"Batch forget memories category={self.payload.category!r} pattern={self.payload.key_pattern!r}",
+            operation="batch_forget_memory",
+            purpose=self.payload.purpose or self.purpose,
+        )
+        if denied is not None:
+            return denied
         try:
             deleted = infra.memory_manager.batch_forget(
                 category=self.payload.category,
@@ -232,6 +300,16 @@ class RenameMemoryCategory(AgentAction):
             warn_msg = "[WARN][MEMORY] Rename operation requires 'confirm': true to execute"
             infra.append_chat_history(actor="system", content=warn_msg, action={"action": "system_warn"}, log_console=True)
             return
+        denied = _request_destructive_memory_permission(
+            infra,
+            self.action,
+            self.payload,
+            summary=f"Rename memory category '{self.payload.old_category}' to '{self.payload.new_category}'",
+            operation="rename_memory_category",
+            purpose=self.payload.purpose or self.purpose,
+        )
+        if denied is not None:
+            return denied
         try:
             infra.memory_manager.rename_category(self.payload.old_category, self.payload.new_category)
             ctx_msg = f"[MEMORY] Renamed category '{self.payload.old_category}' to '{self.payload.new_category}'"

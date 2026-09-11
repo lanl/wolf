@@ -58,12 +58,24 @@ class TurnBasedWorkflow(BaseWorkflow):
         *name*  – string identifier used for routing the next turn.
         """
         self.infra.show_updated_history()
+        self.emit_event("workflow_step_started", "running", actor=name, content=f"{name} is starting an interactive workflow step.")
         
         # Get the current context buffer (no rebuild unless threshold exceeded)
+        self.emit_event("context_build_started", "running", actor=name, content="Building compacted context for model call.")
         context_str = self.context_manager.get_compacted_context()
         diagnostics = self.context_manager.get_context_diagnostics()
+        self.emit_event(
+            "context_build_completed",
+            "done",
+            actor=name,
+            content="Compacted context ready.",
+            context_tokens=diagnostics.get("current_ctx_tokens") if isinstance(diagnostics, dict) else None,
+            max_ctx_tokens=diagnostics.get("max_ctx_tokens") if isinstance(diagnostics, dict) else None,
+            utilization_pct=diagnostics.get("utilization_pct") if isinstance(diagnostics, dict) else None,
+        )
         
         # Build agent prompt with the current context
+        self.emit_event("prompt_assembly_started", "running", actor=name, content="Assembling agent prompt.")
         AGENT_PROMPT = (
             f"{self.agent_role_prompt}\n\n"
             "Below is the context formed from the current chat history:\n"
@@ -86,8 +98,17 @@ class TurnBasedWorkflow(BaseWorkflow):
         )
         pending_agent_content = self.infra.consume_pending_agent_content()
         AGENT_INPUT = combine_prompt_with_user_content(AGENT_PROMPT, pending_agent_content)
+        self.emit_event(
+            "prompt_assembly_completed",
+            "done",
+            actor=name,
+            content="Agent prompt assembled.",
+            has_multimodal_content=bool(pending_agent_content),
+            active_action_count=len(getattr(self, "action_names_to_use", []) or []),
+        )
         
         # Obtain a response (structured or free‑form)
+        self.emit_event("model_request_started", "running", actor=name, content=f"Calling model for {name}.", structured_output="structured_output" in getattr(actor, "capabilities", []))
         if "structured_output" in getattr(actor, "capabilities", []):
             response = actor.get_structured_output(user_prompt=AGENT_INPUT, output_format=self.Actions)
         else:
@@ -95,16 +116,20 @@ class TurnBasedWorkflow(BaseWorkflow):
             if bad_format:
                 # fallback to user turn on failure
                 self.WORKFLOW_TURN = "user"
+                err = f"{actor.name} could not produce a valid response:\n {raw_response}"
+                self.emit_event("model_request_failed", "error", actor=name, content=err, error=err)
                 self.update_history(
                     actor="system",
-                    content=f"{actor.name} could not produce a valid response:\n {raw_response}",
+                    content=err,
                     action={"action": "system_info"},
                     log_console=True,
                 )
                 return
+        self.emit_event("model_request_completed", "done", actor=name, content="Model response received.")
         
         # Validate payload
         if isinstance(response, dict) and "action" in response:
+            self.emit_event("action_validation_started", "running", actor=name, action=response.get("action"), content="Validating model action response.")
             bad_format, err_msg, action_obj, normalized = self.normalize_and_validate_agent_response(response, actor)
             if bad_format:
                 # Validation failures should fail closed to the user rather than
@@ -113,6 +138,7 @@ class TurnBasedWorkflow(BaseWorkflow):
                 # the same context plus the validation error and may emit the same
                 # invalid action repeatedly.
                 self.WORKFLOW_TURN = "user"
+                self.emit_event("action_validation_failed", "error", actor=name, action=response.get("action"), content=err_msg)
                 self.update_history(
                     actor="system",
                     content=err_msg,
@@ -121,6 +147,7 @@ class TurnBasedWorkflow(BaseWorkflow):
                 )
                 return
             
+            self.emit_event("action_validation_completed", "done", actor=name, action=normalized.get("action"), content=f"Validated action {normalized.get('action')}.")
             # Show Actor's action
             self.update_history(
                 actor=actor.name,
@@ -130,6 +157,7 @@ class TurnBasedWorkflow(BaseWorkflow):
             )
             
             # Execute the concrete action
+            self.emit_event("action_execution_started", "running", actor=name, action=normalized.get("action"), content=f"Executing {normalized.get('action')}.")
             result = action_obj.execute(infra=self.infra)
             
             # Determine next turn
@@ -139,10 +167,14 @@ class TurnBasedWorkflow(BaseWorkflow):
                 self.WORKFLOW_TURN = action_obj.receiver
             else:
                 self.WORKFLOW_TURN = "system"
+            self.emit_event("action_execution_completed", "done", actor=name, action=normalized.get("action"), content=f"Action {normalized.get('action')} completed.", next_turn=self.WORKFLOW_TURN)
+            self.emit_event("workflow_step_completed", "done", actor=name, action=normalized.get("action"), content="Interactive workflow step completed.", next_turn=self.WORKFLOW_TURN)
         else:
+            err = f"[ERROR] Invalid action payload: {response}"
+            self.emit_event("workflow_error", "error", actor=name, content=err, error=err)
             self.update_history(
                 actor="system",
-                content=f"[ERROR] Invalid action payload: {response}",
+                content=err,
                 action={"action": "system_error"},
                 log_console=True,
             )
@@ -170,6 +202,7 @@ class TurnBasedWorkflow(BaseWorkflow):
         self.WF_USER = user_name
         self.infra.ROLEs[user_name] = "user"
         self.WORKFLOW_TURN = wf_first_turn
+        self.emit_event("workflow_started", "running", content="Interactive TurnBasedWorkflow started.", user_name=user_name, first_turn=wf_first_turn)
 
         # Orchestrate turn-base interactions
         while True:

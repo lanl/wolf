@@ -60,6 +60,16 @@ class WolfCommandCompleter(Completer):
         self.commands = {
             "/show": {"agent": {"params": {}}},
             "/config": {"agent": {"params": {}}},
+            "/participants": {},
+            "/collaboration": {},
+            "/invites": {},
+            "/invite": {"create": {}, "revoke": {}},
+            "/join-requests": {},
+            "/approve": {},
+            "/reject": {},
+            "/snapshot": {},
+            "/tasks": {},
+            "/infra": {},
             "/theme": {},
             "/reset": {},
             "/quit": {},
@@ -212,6 +222,8 @@ class WolfTUIClient:
                 response = requests.post(url, json=json_data, params=request_params, headers=headers)
             elif method == "PATCH":
                 response = requests.patch(url, json=json_data, params=request_params, headers=headers)
+            elif method == "DELETE":
+                response = requests.delete(url, params=request_params, headers=headers)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
@@ -365,6 +377,10 @@ class WolfTUIClient:
             self._safe_print(f"[dim]policy: {policy} | actions: {actions}[/dim]")
         elif msg_type == "presence":
             self._safe_print(f"[dim]presence: {content}[/dim]")
+        elif msg_type == "permission_denied":
+            self._bubble("Permission denied", content or data.get("capability", "not permitted"), border_style="red")
+        elif msg_type in {"join_request_pending", "collaboration_join_approved", "collaboration_join_rejected", "collaboration_invite_created", "collaboration_invite_revoked"}:
+            self._bubble("Collaboration", content or json.dumps(data, indent=2), border_style="yellow")
         elif msg_type == "participant_message":
             sender = data.get("sender") or data.get("participant_id") or "participant"
             self._bubble(str(sender), content, border_style="white", markdown=True)
@@ -378,7 +394,7 @@ class WolfTUIClient:
         header.append("\n╭──────────────────────────────────────────────────────╮\n", style="bold cyan")
         header.append("│                 WOLF Terminal V5                    │\n", style="bold white")
         header.append("╰──────────────────────────────────────────────────────╯\n", style="bold cyan")
-        header.append("Commands: /show agent params | /config agent params key='value' | /theme compact|comfortable | /reset | /help | /quit\n", style="dim")
+        header.append("Commands: /participants | /collaboration | /invites | /invite create role=human ttl=3600 | /join-requests | /approve <id> | /reject <id> | /snapshot | /infra | /help | /quit\n", style="dim")
         self._safe_print(header)
 
     def _parse_config_updates(self, raw: str) -> dict:
@@ -388,6 +404,82 @@ class WolfTUIClient:
                 k, v = tok.split("=", 1)
                 updates[k] = v
         return updates
+
+    def _print_key_value_table(self, title: str, rows: list):
+        table = Table(title=title, show_header=True, header_style="bold cyan", expand=False)
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", style="white")
+        for key, value in rows:
+            table.add_row(str(key), str(value))
+        self._safe_print(table)
+
+    def _print_participants(self, participants: list):
+        table = Table(title="Participants", show_header=True, header_style="bold cyan", expand=False)
+        table.add_column("Participant", style="magenta")
+        table.add_column("Role", style="cyan")
+        table.add_column("Client", style="white")
+        table.add_column("Auth", style="yellow")
+        table.add_column("Active", style="green")
+        for p in participants or []:
+            table.add_row(
+                str(p.get("participant_id") or p.get("id") or ""),
+                str(p.get("role") or p.get("participant_role") or ""),
+                str(p.get("client_type") or ""),
+                str(p.get("auth_mode") or "account_token"),
+                "yes" if p.get("active") is not False else "no",
+            )
+        self._safe_print(table)
+
+    def _print_invites(self, invites: list):
+        table = Table(title="Collaboration Invites", show_header=True, header_style="bold cyan", expand=False)
+        table.add_column("Invite", style="magenta")
+        table.add_column("Role", style="cyan")
+        table.add_column("Status", style="yellow")
+        table.add_column("Uses", style="white")
+        table.add_column("Expires", style="dim")
+        for inv in invites or []:
+            table.add_row(
+                str(inv.get("invite_id") or ""),
+                str(inv.get("role") or ""),
+                str(inv.get("status") or ""),
+                f"{inv.get('used_count', 0)} / {inv.get('max_uses', 1)}",
+                str(inv.get("expires_at") or "never"),
+            )
+        self._safe_print(table)
+
+    def _print_join_requests(self, join_requests: list):
+        table = Table(title="Join Requests", show_header=True, header_style="bold cyan", expand=False)
+        table.add_column("Request", style="magenta")
+        table.add_column("Participant", style="cyan")
+        table.add_column("Role", style="white")
+        table.add_column("Client", style="yellow")
+        table.add_column("Status", style="green")
+        table.add_column("Reason", style="dim")
+        for req in join_requests or []:
+            table.add_row(
+                str(req.get("request_id") or ""),
+                str(req.get("requested_participant_id") or ""),
+                str(req.get("approved_role") or req.get("requested_role") or ""),
+                str(req.get("client_type") or ""),
+                str(req.get("status") or ""),
+                str(req.get("reason") or ""),
+            )
+        self._safe_print(table)
+
+    def _parse_invite_create_args(self, raw: str) -> dict:
+        body = {"role": "human", "expires_in_seconds": 3600, "max_uses": 1}
+        for tok in shlex.split(raw):
+            if "=" not in tok:
+                continue
+            key, value = tok.split("=", 1)
+            key = key.strip().lstrip("-").replace("-", "_")
+            if key in {"role", "participant_id_hint", "client_type_hint"}:
+                body[key] = value
+            elif key in {"ttl", "expires_in_seconds"}:
+                body["expires_in_seconds"] = int(value)
+            elif key in {"max_uses", "uses"}:
+                body["max_uses"] = int(value)
+        return body
 
     async def handle_command(self, user_input: str):
         line = user_input.strip()
@@ -399,7 +491,28 @@ class WolfTUIClient:
             return
 
         if line.startswith("/help"):
-            self._bubble("Help", "Use tab completion for /show and /config. Toggle density with /theme compact or /theme comfortable.", border_style="blue")
+            self._bubble("Help", """
+Core:
+- /show agent params
+- /config agent params key='value'
+- /theme compact|comfortable
+- /reset
+
+Collaboration:
+- /participants
+- /collaboration
+- /invites
+- /invite create role=human ttl=3600 max_uses=1 participant_id_hint=name
+- /invite revoke <invite_id>
+- /join-requests
+- /approve <request_id> [role]
+- /reject <request_id> [reason]
+
+Currentness/parity:
+- /snapshot       orchestration snapshot summary
+- /tasks          compact task list
+- /infra          infrastructure summary
+""", border_style="blue", markdown=True)
             return
 
         if line.startswith("/theme"):
@@ -414,6 +527,114 @@ class WolfTUIClient:
         if line.startswith("/reset"):
             data = await self._http_request("POST", f"/sessions/{self.current_session_id}/reset")
             self._safe_print("[green]✓ Agent context reset.[/green]" if data.get("status") == "reset" else "[red]Failed to reset agent context.[/red]")
+            return
+
+        if line.startswith("/participants"):
+            data = await self._http_request("GET", f"/sessions/{self.current_session_id}/participants")
+            self._print_participants(data.get("participants") or [])
+            return
+
+        if line.startswith("/collaboration"):
+            data = await self._http_request("GET", f"/sessions/{self.current_session_id}/collaboration/snapshot")
+            if data:
+                metrics = data.get("metrics") or {}
+                self._print_key_value_table("Collaboration Snapshot", [
+                    ("participants", metrics.get("participants", 0)),
+                    ("active", metrics.get("active_participants", 0)),
+                    ("invites", metrics.get("invites", 0)),
+                    ("pending joins", metrics.get("pending_join_requests", 0)),
+                ])
+                self._print_participants(data.get("participants") or [])
+                self._print_join_requests(data.get("join_requests") or [])
+            return
+
+        if line.startswith("/invites"):
+            data = await self._http_request("GET", f"/sessions/{self.current_session_id}/invites")
+            self._print_invites(data.get("invites") or [])
+            return
+
+        if line.startswith("/invite create"):
+            raw = line.replace("/invite create", "", 1).strip()
+            body = self._parse_invite_create_args(raw)
+            data = await self._http_request("POST", f"/sessions/{self.current_session_id}/invites", body)
+            if data:
+                self._bubble("Invite created", f"Copy now; raw token is shown once only.\n\nCommand:\n{data.get('command')}\n\nInvite URL:\n{data.get('invite_url')}\n\nToken:\n{data.get('invite_token')}", border_style="green")
+            return
+
+        if line.startswith("/invite revoke"):
+            parts = line.split()
+            if len(parts) < 3:
+                self._safe_print("[yellow]Usage: /invite revoke <invite_id>[/yellow]")
+                return
+            data = await self._http_request("DELETE", f"/sessions/{self.current_session_id}/invites/{parts[2]}")
+            self._safe_print("[green]✓ Invite revoked.[/green]" if data else "[red]Failed to revoke invite.[/red]")
+            return
+
+        if line.startswith("/join-requests"):
+            data = await self._http_request("GET", f"/sessions/{self.current_session_id}/join-requests")
+            self._print_join_requests(data.get("join_requests") or [])
+            return
+
+        if line.startswith("/approve"):
+            parts = line.split()
+            if len(parts) < 2:
+                self._safe_print("[yellow]Usage: /approve <request_id> [role][/yellow]")
+                return
+            body = {"role": parts[2] if len(parts) > 2 else "human", "expires_in_seconds": 120}
+            data = await self._http_request("POST", f"/sessions/{self.current_session_id}/join-requests/{parts[1]}/approve", body)
+            self._safe_print("[green]✓ Join request approved.[/green]" if data else "[red]Failed to approve join request.[/red]")
+            return
+
+        if line.startswith("/reject"):
+            parts = line.split(maxsplit=2)
+            if len(parts) < 2:
+                self._safe_print("[yellow]Usage: /reject <request_id> [reason][/yellow]")
+                return
+            body = {"reason": parts[2] if len(parts) > 2 else "rejected from TUI"}
+            data = await self._http_request("POST", f"/sessions/{self.current_session_id}/join-requests/{parts[1]}/reject", body)
+            self._safe_print("[green]✓ Join request rejected.[/green]" if data else "[red]Failed to reject join request.[/red]")
+            return
+
+        if line.startswith("/snapshot"):
+            data = await self._http_request("GET", f"/sessions/{self.current_session_id}/orchestration/snapshot")
+            if data:
+                tasks = data.get("tasks") or []
+                self._print_key_value_table("Orchestration Snapshot", [
+                    ("enabled", data.get("enabled")),
+                    ("started", data.get("started")),
+                    ("tasks", len(tasks)),
+                    ("adapter", data.get("adapter")),
+                ])
+            return
+
+        if line.startswith("/tasks"):
+            data = await self._http_request("GET", f"/sessions/{self.current_session_id}/orchestration/snapshot")
+            tasks = data.get("tasks") or []
+            table = Table(title="Tasks", show_header=True, header_style="bold cyan", expand=False)
+            table.add_column("Task", style="magenta")
+            table.add_column("Status", style="cyan")
+            table.add_column("Name", style="white")
+            for task in tasks:
+                spec = task.get("spec") or {}
+                table.add_row(str(task.get("id") or task.get("task_id") or "")[:12], str(task.get("status") or ""), str(spec.get("name") or task.get("name") or "")[:60])
+            self._safe_print(table)
+            return
+
+        if line.startswith("/infra"):
+            data = await self._http_request("GET", f"/sessions/{self.current_session_id}/infrastructure/snapshot")
+            if data:
+                counts = data.get("resource_counts") or {}
+                orch = data.get("orchestration") or {}
+                self._print_key_value_table("Infrastructure Snapshot", [
+                    ("orchestration", "enabled" if orch.get("enabled") else "disabled"),
+                    ("tasks", orch.get("task_count", 0)),
+                    ("workers", len(data.get("worker_sessions") or [])),
+                    ("KBs", counts.get("kbs", 0)),
+                    ("TBs", counts.get("tbs", 0)),
+                    ("Universes", counts.get("universes", 0)),
+                    ("VStores", counts.get("vstores", 0)),
+                    ("Warnings", len(data.get("warnings") or [])),
+                ])
             return
 
         if line.startswith("/show agent params"):

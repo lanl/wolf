@@ -19,6 +19,7 @@ from pydantic import Field
 from .base_agent_action import AgentAction
 from framework.utils.tokenomics import num_tokens_from_string
 from framework.utils.io_tools import console
+from framework.workflows.action_registry import payload_example_for_action
 
 # ---------------------------------------------------------------------
 # Dynamically collect every concrete subclass of ``AgentAction``.
@@ -153,10 +154,11 @@ def _generate_schema_string() -> str:
         return "value"
 
     def _payload_example(cls_: type[AgentAction]) -> dict:
-        schema = cls_.model_json_schema()
-        payload_schema = schema.get("properties", {}).get("payload", {})
-        example = _example_for_schema(payload_schema, schema)
-        return example if isinstance(example, dict) else {}
+        # Canonical model-facing payload examples live in action_registry.py.
+        # Do not recursively include every optional payload field here: many
+        # actions intentionally expose mutually-exclusive transports such as
+        # content/content_lines/content_base64 or command/command_args/script_lines.
+        return payload_example_for_action(cls_)
 
     parts: list[str] = []
     parts.append("You must always respond with exactly one valid JSON object and no surrounding prose or Markdown.")
@@ -269,10 +271,11 @@ def get_actions_subset(action_names: List) -> tuple:
         return "value"
 
     def _payload_example(cls_: type[AgentAction]) -> dict:
-        schema = cls_.model_json_schema()
-        payload_schema = schema.get("properties", {}).get("payload", {})
-        example = _example_for_schema(payload_schema, schema)
-        return example if isinstance(example, dict) else {}
+        # Canonical model-facing payload examples live in action_registry.py.
+        # Do not recursively include every optional payload field here: many
+        # actions intentionally expose mutually-exclusive transports such as
+        # content/content_lines/content_base64 or command/command_args/script_lines.
+        return payload_example_for_action(cls_)
 
     parts: List[str] = []
     for i, cls in enumerate(matching_classes, start=1):

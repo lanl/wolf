@@ -9,6 +9,45 @@ from typing import Literal, Dict, Optional, List, Any
 from pydantic import BaseModel, Field
 from framework.workflows.base_agent_action import AgentAction
 
+
+def _request_context_permission(infra: Any, action_name: str, payload: BaseModel, *, summary: str, operation: str, purpose: Optional[str] = None):
+    """Request shared runtime approval before destructive active-context mutation."""
+    if infra is None or not hasattr(infra, "request_permission"):
+        return None
+    approval_request = {
+        "action": action_name,
+        "payload": payload.model_dump(mode="json", exclude_none=True),
+        "payload_summary": summary,
+        "operation": operation,
+        "purpose": purpose,
+        "risk_hints": [
+            "destructive active context mutation",
+            "older active context may be hidden from future agent turns",
+            "durable chat history is not deleted",
+        ],
+    }
+    approval = infra.request_permission(action_name, approval_request)
+    if approval.get("approved", False):
+        return None
+    result = {
+        "ok": False,
+        "approved": False,
+        "action": action_name,
+        "operation": operation,
+        "error": approval.get("reason") or f"{action_name} was denied by user approval policy",
+        "approval": approval,
+    }
+    try:
+        infra.append_chat_history(
+            actor="system",
+            content=f"[{action_name}][denied]: {result}",
+            action={"action": "system_info"},
+            log_console=True,
+        )
+    except Exception:
+        pass
+    return result
+
 # =============================================================================
 # CONTEXT WINDOW SURGICAL ACTIONS
 # =============================================================================
@@ -27,6 +66,16 @@ class TruncateContextWindow(AgentAction):
     """
 
     def execute(self, infra) -> None:
+        denied = _request_context_permission(
+            infra,
+            self.action,
+            self.payload,
+            summary=f"Truncate active context window to start at history index {self.payload.start_index}",
+            operation="truncate_context_window",
+            purpose=self.payload.purpose or self.purpose,
+        )
+        if denied is not None:
+            return denied
         try:
             # Instruct context_manager to slide the window
             infra.context_manager.set_window_start(self.payload.start_index)

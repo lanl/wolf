@@ -8,6 +8,21 @@ import time
 from .models import AgentRequirements
 
 
+_SECRET_KEYS = {"api_key", "apikey", "authorization", "access_token", "refresh_token", "token", "password", "secret"}
+
+
+def _redact_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            out[key_text] = "***redacted***" if key_text.lower() in _SECRET_KEYS else _redact_metadata(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_metadata(item) for item in value]
+    return value
+
+
 @dataclass(slots=True)
 class AgentLease:
     agent_name: str
@@ -25,6 +40,10 @@ class AgentDescriptor:
     busy: bool = False
     current_task_id: Optional[str] = None
     last_assigned_at: float = 0.0
+    profile_id: Optional[str] = None
+    agent_kind: Optional[str] = None
+    draining: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_agent(cls, agent: Any) -> 'AgentDescriptor':
@@ -33,7 +52,10 @@ class AgentDescriptor:
             name=getattr(agent, 'name', f'agent-{id(agent)}'),
             capabilities=list(getattr(agent, 'capabilities', []) or []),
             model_family=getattr(agent, 'model', None),
-            context_window=getattr(agent, 'max_ctx_tokens', None),
+            context_window=getattr(agent, 'max_ctx_tokens', getattr(agent, 'ctx_window_length', None)),
+            profile_id=getattr(agent, 'profile_id', None),
+            agent_kind=getattr(agent, 'agent_kind', None),
+            metadata=dict(getattr(agent, 'metadata', {}) or {}),
         )
 
 
@@ -45,7 +67,7 @@ class AgentPool:
     async def acquire(self, task_id: str, requirements: Optional[AgentRequirements] = None) -> AgentLease:
         requirements = requirements or AgentRequirements()
         async with self._lock:
-            eligible = [d for d in self._eligible(requirements) if not d.busy]
+            eligible = [d for d in self._eligible(requirements) if not d.busy and not d.draining]
             if not eligible:
                 raise RuntimeError('No compatible free agents are currently available')
             eligible.sort(key=lambda d: d.last_assigned_at)
@@ -57,9 +79,32 @@ class AgentPool:
 
     async def release(self, lease: AgentLease) -> None:
         async with self._lock:
-            desc = self._agents[lease.agent_name]
+            desc = self._agents.get(lease.agent_name)
+            if desc is None:
+                return
             desc.busy = False
             desc.current_task_id = None
+            if desc.draining:
+                self._agents.pop(lease.agent_name, None)
+
+    async def add(self, agent: Any, *, profile_id: Optional[str] = None, agent_kind: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
+        desc = AgentDescriptor.from_agent(agent)
+        desc.profile_id = profile_id or desc.profile_id
+        desc.agent_kind = agent_kind or desc.agent_kind
+        desc.metadata = dict(metadata or desc.metadata or {})
+        async with self._lock:
+            self._agents[desc.name] = desc
+
+    async def remove(self, agent_name: str, *, drain: bool = True) -> bool:
+        async with self._lock:
+            desc = self._agents.get(agent_name)
+            if desc is None:
+                return True
+            if desc.busy and drain:
+                desc.draining = True
+                return False
+            self._agents.pop(agent_name, None)
+            return True
 
     async def get(self, agent_name: str) -> Any:
         async with self._lock:
@@ -68,7 +113,7 @@ class AgentPool:
     async def stats(self) -> List[Dict[str, Any]]:
         async with self._lock:
             return [
-                {'name': d.name, 'busy': d.busy, 'current_task_id': d.current_task_id, 'capabilities': list(d.capabilities), 'model_family': d.model_family, 'context_window': d.context_window, 'last_assigned_at': d.last_assigned_at}
+                {'name': d.name, 'busy': d.busy, 'current_task_id': d.current_task_id, 'capabilities': list(d.capabilities), 'model_family': d.model_family, 'context_window': d.context_window, 'last_assigned_at': d.last_assigned_at, 'profile_id': d.profile_id, 'agent_kind': d.agent_kind, 'draining': d.draining, 'metadata': _redact_metadata(d.metadata or {})}
                 for d in self._agents.values()
             ]
 

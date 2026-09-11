@@ -6,6 +6,7 @@ import requests
 from framework.workflows.base_agent_action import AgentAction
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams
 from framework.universes.universe_tools import get_universe_info, build_params_from_info, get_base_universe_params
+from framework.universes.endpoint_resolver import get_universe_base_url_or_error, resolve_universe_endpoint
 
 # Default timeout for all HTTP requests
 DEFAULT_TIMEOUT = 30
@@ -45,6 +46,8 @@ class FindKnownUniversesAction(AgentAction):
             for univ in infra.UNIVs.keys():
                 try:
                     u_info = infra.UNIVs[univ].info
+                    resolve_universe_endpoint(infra, univ, repair=True, verify=False)
+                    u_info = infra.UNIVs[univ].info
                     u_host = u_info.host.strip().lower()
                     if u_host.startswith("https"): u_host = u_host.lstrip('https').lstrip("://")
                     if u_host.startswith("http"): u_host = u_host.lstrip('http').lstrip("://")
@@ -61,7 +64,8 @@ class FindKnownUniversesAction(AgentAction):
                                       scheme=u_scheme)
                     result.append({f"{u_info.name}": univ_stat})
                 except Exception as e:
-                    result.append({f"{u_info.name}": f"UNAVAILABLE: {str(e)}"})
+                    fallback_name = getattr(locals().get("u_info", None), "name", univ)
+                    result.append({f"{fallback_name}": f"UNAVAILABLE: {str(e)}"})
         univ_info = {"system":{self.payload.system}, "universes": result}
         ctx_msg = (f"[RESPONSE] Universes known to system = {self.payload.system}:\n"
                    f"{univ_info}")
@@ -81,6 +85,7 @@ class UniverseInfoAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -89,7 +94,9 @@ class UniverseInfoAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"},  log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/info", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -121,6 +128,7 @@ class UniverseHealthAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -129,7 +137,9 @@ class UniverseHealthAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/health", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -162,6 +172,7 @@ class UniverseStatsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -170,7 +181,9 @@ class UniverseStatsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/stats", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -203,6 +216,7 @@ class UniverseListToolsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -211,7 +225,9 @@ class UniverseListToolsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/tools", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()

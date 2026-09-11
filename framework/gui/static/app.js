@@ -3,10 +3,16 @@ const state = {
   dockMode: 'float',
   annotations: [],
   messages: [],
+  approvals: [],
+  showSystemMessages: true,
+  chatScale: 1.0,
+  hiddenSystemAlertSignature: '',
+  hiddenSystemAlertInitialized: false,
   workflows: {},
   sessions: [],
   apps: [],
   dashboards: [],
+  dashboardActivity: {},
   annotateMode: null,
   dashboardFloat: false,
   latestSeq: 0,
@@ -36,6 +42,7 @@ const els = {
   clearAnnotations: $('clear-annotations'),
   dashboardFloatToggle: $('dashboard-float-toggle'),
   dashboardSnapGrid: $('dashboard-snap-grid'),
+  dashboardSwitcher: $('dashboard-switcher'),
   healthDot: $('gui-health-dot'),
   panel: $('agent-panel'),
   panelHeader: $('agent-panel-header'),
@@ -49,6 +56,11 @@ const els = {
   collapsePanel: $('collapse-panel'),
   refreshState: $('refresh-state'),
   messages: $('messages'),
+  toggleSystemMessages: $('toggle-system-messages'),
+  chatScaleDown: $('chat-scale-down'),
+  chatScaleUp: $('chat-scale-up'),
+  chatScaleLabel: $('chat-scale-label'),
+  chatScaleReset: $('chat-scale-reset'),
   messageForm: $('message-form'),
   messageInput: $('message-input'),
   includeVisualContext: $('include-visual-context'),
@@ -58,6 +70,11 @@ const els = {
   workflowCount: $('workflow-count'),
   sessionCount: $('session-count'),
   toast: $('toast'),
+  approvalPanel: $('approval-panel'),
+  approvalList: $('approval-list'),
+  approvalEmpty: $('approval-empty'),
+  approvalCount: $('approval-count'),
+  approvalRefresh: $('approval-refresh'),
 };
 
 const UI_PREFS_KEY = 'wolf.gui.uiPrefs.v2';
@@ -89,10 +106,104 @@ state.toolbarSize = state.uiPrefs.toolbarSize || 'toolbar-mid';
 state.dockMode = state.uiPrefs.dockMode || state.dockMode || 'float';
 state.dashboardLayouts = state.uiPrefs.dashboardLayouts || {};
 state.dashboardFloatById = state.uiPrefs.dashboardFloatById || {};
+state.dashboardActivity = state.uiPrefs.dashboardActivity || {};
+state.showSystemMessages = state.uiPrefs.showSystemMessages !== false;
+state.chatScale = Number.isFinite(Number(state.uiPrefs.chatScale)) ? Number(state.uiPrefs.chatScale) : 1.0;
 
 state.attachWorkspaceView = state.uiPrefs.attachWorkspaceView !== undefined ? Boolean(state.uiPrefs.attachWorkspaceView) : true;
 state.allowAgentInspect = Boolean(state.uiPrefs.allowAgentInspect);
 state.allowAgentCapture = Boolean(state.uiPrefs.allowAgentCapture);
+
+
+function clampChatScale(value) {
+  const scale = Number(value);
+  if (!Number.isFinite(scale)) return 1.0;
+  return Math.max(0.75, Math.min(1.6, Math.round(scale * 1000) / 1000));
+}
+
+function chatScaleLabel(scale = state.chatScale) {
+  return `${Math.round(clampChatScale(scale) * 100)}%`;
+}
+
+function applyChatScale(scale = state.chatScale, options = {}) {
+  const next = clampChatScale(scale);
+  state.chatScale = next;
+  const target = els.panel || document.documentElement;
+  const setPx = (name, value) => target.style.setProperty(name, `${Math.round(value * 10) / 10}px`);
+  target.style.setProperty('--chat-scale', String(next));
+  setPx('--chat-font-size', 13 * next);
+  setPx('--chat-compact-font-size', 12 * next);
+  setPx('--chat-meta-font-size', 11 * next);
+  setPx('--chat-detail-font-size', 11 * next);
+  setPx('--chat-bubble-pad-y', 10 * next);
+  setPx('--chat-bubble-pad-x', 12 * next);
+  setPx('--chat-compact-pad-y', 7 * next);
+  setPx('--chat-compact-pad-x', 10 * next);
+  setPx('--chat-message-gap', 10 * next);
+  setPx('--chat-message-padding-y', 14 * next);
+  setPx('--chat-message-padding-x', 12 * next);
+  setPx('--chat-composer-font-size', 13 * next);
+  setPx('--chat-composer-padding', 10 * next);
+  setPx('--chat-toolbar-font-size', 11 * next);
+  if (els.chatScaleLabel) {
+    els.chatScaleLabel.textContent = chatScaleLabel(next);
+    els.chatScaleLabel.title = `Chat content size ${chatScaleLabel(next)} — click to reset`;
+  }
+  if (options.persist !== false) updateUiPrefs({ chatScale: next });
+  return next;
+}
+
+async function setChatScale(scale, options = {}) {
+  const next = clampChatScale(scale);
+  if (options.localOnly) {
+    applyChatScale(next);
+    return { chat_scale: next };
+  }
+  const data = await api('/api/gui/chat_scale', {
+    method: 'POST',
+    body: JSON.stringify({ scale: next, source: options.source || 'user' }),
+  });
+  applyChatScale(data?.chat_scale ?? data?.result?.chat_scale ?? next);
+  showToast(`Chat size ${chatScaleLabel()}`, 1500);
+  return data;
+}
+
+async function adjustChatScale(delta, options = {}) {
+  const amount = Number.isFinite(Number(delta)) ? Number(delta) : 0.1;
+  try {
+    const data = await api('/api/gui/chat_scale_delta', {
+      method: 'POST',
+      body: JSON.stringify({ delta: amount, source: options.source || 'user' }),
+    });
+    applyChatScale(data?.chat_scale ?? data?.result?.chat_scale ?? (state.chatScale + amount));
+    showToast(`Chat size ${chatScaleLabel()}`, 1500);
+    return data;
+  } catch (error) {
+    applyChatScale(state.chatScale + amount);
+    showToast(`Chat size ${chatScaleLabel()} (local)`, 1500);
+    return { ok: false, error: error.message, chat_scale: state.chatScale };
+  }
+}
+
+async function resetChatScale(options = {}) {
+  try {
+    const data = await api('/api/gui/chat_scale_reset', {
+      method: 'POST',
+      body: JSON.stringify({ source: options.source || 'user' }),
+    });
+    applyChatScale(data?.chat_scale ?? data?.result?.chat_scale ?? 1.0);
+    showToast('Chat size reset to 100%', 1500);
+    return data;
+  } catch (error) {
+    applyChatScale(1.0);
+    showToast('Chat size reset locally', 1500);
+    return { ok: false, error: error.message, chat_scale: state.chatScale };
+  }
+}
+
+window.wolfGuiSetChatScale = (scale) => setChatScale(scale, { source: 'script' });
+window.wolfGuiAdjustChatScale = (delta) => adjustChatScale(delta, { source: 'script' });
+window.wolfGuiResetChatScale = () => resetChatScale({ source: 'script' });
 
 function syncComposerContextControls(options = {}) {
   const attach = Boolean(state.attachWorkspaceView);
@@ -258,6 +369,192 @@ function showToast(message, ms = 2200) {
   }, ms);
 }
 
+
+function requestDisplayValue(request, key) {
+  const value = request?.[key];
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+  }
+  return String(value);
+}
+
+
+function addApprovalRequest(request = {}) {
+  const req = { ...(request || {}) };
+  const requestId = String(req.id || req.request_id || '');
+  if (!requestId) return null;
+  req.id = requestId;
+  req.request_id = requestId;
+  req.status = req.status || 'pending';
+  state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== requestId);
+  state.approvals.unshift(req);
+  renderApprovals();
+  return req;
+}
+
+function resolveApprovalRequest(requestId, patch = {}) {
+  const id = String(requestId || '');
+  if (!id) return;
+  state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== id);
+  renderApprovals();
+}
+
+function renderApprovals() {
+  const panel = els.approvalPanel;
+  const list = els.approvalList;
+  if (!panel || !list) return;
+  const pending = (state.approvals || []).filter((r) => String(r.status || 'pending') === 'pending');
+  panel.hidden = pending.length === 0;
+  list.innerHTML = '';
+  if (els.approvalCount) els.approvalCount.textContent = `${pending.length} pending`;
+  if (els.approvalEmpty) els.approvalEmpty.hidden = pending.length !== 0;
+
+  pending.forEach((request) => {
+    const card = document.createElement('article');
+    card.className = 'approval-card';
+    const title = document.createElement('div');
+    title.className = 'approval-card-title';
+    title.textContent = `${request.kind || request.action || 'permission'} · ${request.id || request.request_id || ''}`;
+    const details = document.createElement('pre');
+    details.className = 'approval-card-details';
+    const summary = {
+      action: request.action,
+      kind: request.kind,
+      command: request.command_display,
+      target_path: request.target_path,
+      operation: request.operation,
+      shell: request.shell,
+      timeout: request.timeout,
+      cwd: request.cwd,
+      purpose: request.purpose,
+      expectations: request.expectations,
+      risk_hints: request.risk_hints,
+      payload_summary: request.payload_summary,
+      payload: request.payload,
+    };
+    try { details.textContent = JSON.stringify(summary, null, 2); }
+    catch (_) { details.textContent = String(summary); }
+
+    const reason = document.createElement('input');
+    reason.type = 'text';
+    reason.className = 'approval-reason';
+    reason.placeholder = 'Optional reason/feedback';
+
+    const actions = document.createElement('div');
+    actions.className = 'approval-card-actions';
+    const once = document.createElement('button');
+    once.type = 'button';
+    once.textContent = 'Approve once';
+    const session = document.createElement('button');
+    session.type = 'button';
+    session.textContent = 'Approve session';
+    const deny = document.createElement('button');
+    deny.type = 'button';
+    deny.className = 'danger';
+    deny.textContent = 'Deny';
+    const requestId = String(request.id || request.request_id || '');
+    once.addEventListener('click', () => decideApproval(requestId, true, false, reason.value || 'approved once from Wolf GUI'));
+    session.addEventListener('click', () => decideApproval(requestId, true, true, reason.value || 'approved for session from Wolf GUI'));
+    deny.addEventListener('click', () => decideApproval(requestId, false, false, reason.value || 'denied from Wolf GUI'));
+    actions.appendChild(once);
+    actions.appendChild(session);
+    actions.appendChild(deny);
+
+    card.appendChild(title);
+    card.appendChild(details);
+    card.appendChild(reason);
+    card.appendChild(actions);
+    list.appendChild(card);
+  });
+}
+
+async function refreshApprovals() {
+  try {
+    const data = await api('/api/gui/approvals');
+    const serverRequests = Array.isArray(data?.requests) ? data.requests : [];
+
+    // Local WOLF GUI can also receive Gateway websocket permission requests.
+    // Those requests are not owned by the local /api/gui/approvals HTTP queue,
+    // so a periodic HTTP refresh must not replace/drop them.  Dropping them
+    // made the permission card flash briefly, disappear, and leave the agent
+    // blocked waiting for a decision that the user could no longer submit.
+    const gatewayPending = (state.approvals || []).filter((r) => {
+      const status = String(r?.status || 'pending');
+      return Boolean(r?.gateway_permission) && status === 'pending';
+    });
+    const seen = new Set(serverRequests.map((r) => String(r?.id || r?.request_id || '')));
+    const mergedGateway = gatewayPending.filter((r) => !seen.has(String(r?.id || r?.request_id || '')));
+    state.approvals = [...mergedGateway, ...serverRequests];
+    renderApprovals();
+  } catch (_) {
+    // Older/minimal GUI runtimes may not expose approval endpoints.
+  }
+}
+
+async function decideApproval(requestId, approved, approveForSession = false, reason = '') {
+  if (!requestId) return;
+  const id = String(requestId);
+  const existing = (state.approvals || []).find((r) => String(r.id || r.request_id) === id) || {};
+
+  // Gateway websocket permission requests are not owned by the local GUI HTTP
+  // approval queue. Send the decision back over the gateway websocket so the
+  // worker-thread PermissionManager future can unblock immediately.
+  if (existing.gateway_permission) {
+    const sent = Boolean(window.WolfGatewayUI?.sendPermissionDecision?.({
+      request_id: id,
+      kind: existing.kind,
+      action: existing.action,
+      approved: Boolean(approved),
+      approve_for_session: Boolean(approveForSession),
+      reason,
+      feedback: reason,
+    }));
+    if (sent) {
+      resolveApprovalRequest(id);
+      showToast(`Gateway permission ${approved ? 'approved' : 'denied'}`, 1800);
+    } else {
+      showToast('Gateway websocket is not open; reconnect the selected session.', 4200);
+    }
+    return;
+  }
+
+  try {
+    const data = await api(`/api/gui/approvals/${encodeURIComponent(id)}/decision`, {
+      method: 'POST',
+      body: JSON.stringify({ approved: Boolean(approved), approve_for_session: Boolean(approveForSession), reason, feedback: reason }),
+    });
+    const request = data?.request;
+    if (request?.id) {
+      state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== String(request.id || request.request_id));
+    }
+    renderApprovals();
+    showToast(`Permission ${approved ? 'approved' : 'denied'}`, 1800);
+  } catch (error) {
+    showToast(error.message || 'Failed to decide permission request', 4200);
+  }
+}
+
+function pulseHiddenSystemNotice(severity = 'warning') {
+  const level = severity === 'error' ? 'error' : 'warning';
+  const className = `system-notice-pulse-${level}`;
+  const targets = [
+    document.querySelector('.agent-panel'),
+    document.querySelector('.agent-panel-header'),
+    document.querySelector('.agent-panel-orb'),
+  ].filter(Boolean);
+  targets.forEach((target) => {
+    target.classList.remove('system-notice-pulse-warning', 'system-notice-pulse-error');
+    // Force animation restart when repeated alerts arrive close together.
+    void target.offsetWidth;
+    target.classList.add(className);
+  });
+  clearTimeout(pulseHiddenSystemNotice.timer);
+  pulseHiddenSystemNotice.timer = setTimeout(() => {
+    targets.forEach((target) => target.classList.remove(className));
+  }, 1500);
+}
+
 function normalizedPointFromEvent(event) {
   return {
     x: event.clientX / Math.max(1, window.innerWidth),
@@ -327,6 +624,90 @@ function activeDashboard() {
   return Array.isArray(state.dashboards) && state.dashboards.length ? state.dashboards[0] : null;
 }
 
+function dashboardLabel(dashboard) {
+  if (!dashboard) return 'Dashboard';
+  const panels = Array.isArray(dashboard.panels) ? dashboard.panels.length : 0;
+  return `${dashboard.name || dashboard.id || 'Dashboard'}${panels ? ` (${panels})` : ''}`;
+}
+
+function markDashboardActivity(dashboardId) {
+  if (!dashboardId) return;
+  const activeId = activeDashboard()?.id;
+  const inDashboard = state.workspace?.mode === 'dashboard';
+  if (inDashboard && activeId === dashboardId) return;
+  state.dashboardActivity = { ...(state.dashboardActivity || {}), [dashboardId]: Date.now() };
+  updateUiPrefs({ dashboardActivity: state.dashboardActivity });
+  renderDashboardSwitcher();
+}
+
+function clearDashboardActivity(dashboardId) {
+  if (!dashboardId || !state.dashboardActivity?.[dashboardId]) return;
+  const next = { ...(state.dashboardActivity || {}) };
+  delete next[dashboardId];
+  state.dashboardActivity = next;
+  updateUiPrefs({ dashboardActivity: state.dashboardActivity });
+}
+
+function renderDashboardSwitcher() {
+  const select = els.dashboardSwitcher;
+  if (!select) return;
+  const dashboards = Array.isArray(state.dashboards) ? state.dashboards : [];
+  const active = activeDashboard();
+  const activeId = active?.id || '';
+  select.innerHTML = '';
+  select.disabled = dashboards.length === 0;
+  select.classList.toggle('has-hidden-activity', dashboards.some((d) => d.id && state.dashboardActivity?.[d.id] && d.id !== activeId));
+
+  if (!dashboards.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No dashboards';
+    select.appendChild(option);
+    select.title = 'No dashboards are available yet';
+    return;
+  }
+
+  dashboards.forEach((dashboard) => {
+    const option = document.createElement('option');
+    option.value = dashboard.id || '';
+    const hasActivity = Boolean(dashboard.id && state.dashboardActivity?.[dashboard.id] && dashboard.id !== activeId);
+    option.textContent = `${hasActivity ? '• ' : ''}${dashboardLabel(dashboard)}`;
+    if (hasActivity) option.dataset.activity = 'true';
+    select.appendChild(option);
+  });
+  select.value = activeId || dashboards[0]?.id || '';
+  select.title = select.classList.contains('has-hidden-activity') ? 'Switch dashboard — bullet indicates hidden dashboard activity' : 'Switch dashboard';
+}
+
+async function openDashboard(dashboardId) {
+  const id = (dashboardId || '').trim();
+  if (!id) return;
+  clearDashboardActivity(id);
+  const local = state.dashboards.find((d) => d.id === id);
+  state.workspace = {
+    ...(state.workspace || {}),
+    mode: 'dashboard',
+    url: `about:dashboard/${encodeURIComponent(id)}`,
+    title: local?.name || 'Dashboard',
+    metadata: { ...((state.workspace || {}).metadata || {}), active_dashboard_id: id },
+  };
+  renderWorkspace();
+
+  try {
+    const data = await api('/api/gui/dashboards/open', {
+      method: 'POST',
+      body: JSON.stringify({ dashboard_id: id }),
+    });
+    if (data?.dashboard) upsertDashboard(data.dashboard);
+    if (data?.workspace) state.workspace = data.workspace;
+    clearDashboardActivity(id);
+    renderWorkspace();
+    renderDiscovery();
+  } catch (error) {
+    showToast(error.message || 'Dashboard switched locally', 2600);
+  }
+}
+
 function panelSource(panel) {
   if (panel.content_html) {
     return `data:text/html;charset=utf-8,${encodeURIComponent(panel.content_html)}`;
@@ -334,11 +715,79 @@ function panelSource(panel) {
   return panel.url || 'about:blank';
 }
 
+
+function panelZoom(panel) {
+  const value = Number(panel?.zoom);
+  const min = Number(panel?.min_zoom || 0.25);
+  const max = Number(panel?.max_zoom || 3.0);
+  const zoom = Number.isFinite(value) && value > 0 ? value : 1.0;
+  return Math.max(min, Math.min(max, zoom));
+}
+
+function panelZoomLabel(panel) {
+  return `${Math.round(panelZoom(panel) * 100)}%`;
+}
+
+function upsertDashboardFromPayload(payload) {
+  if (payload?.dashboard) upsertDashboard(payload.dashboard);
+  if (payload?.workspace) state.workspace = payload.workspace;
+  renderWorkspace();
+  renderDiscovery();
+}
+
+async function adjustDashboardPanelZoom(panel, delta) {
+  const data = await api('/api/gui/dashboards/panel_zoom_delta', {
+    method: 'POST',
+    body: JSON.stringify({ panel_id: panel.id, delta, source: 'user' }),
+  });
+  upsertDashboardFromPayload(data);
+  showToast(`Panel zoom ${Math.round((data.zoom || data.panel?.zoom || 1) * 100)}%`, 1500);
+}
+
+async function resetDashboardPanelZoom(panel) {
+  const data = await api('/api/gui/dashboards/panel_zoom_reset', {
+    method: 'POST',
+    body: JSON.stringify({ panel_id: panel.id, source: 'user' }),
+  });
+  upsertDashboardFromPayload(data);
+  showToast('Panel zoom reset to 100%', 1500);
+}
+
+async function closeDashboardPanel(panel) {
+  if (!panel?.id) return;
+  if (!window.confirm(`Close panel "${panel.title || panel.name || panel.id}"?`)) return;
+  const data = await api('/api/gui/dashboards/remove_panel', {
+    method: 'POST',
+    body: JSON.stringify({ panel_id: panel.id, source: 'user' }),
+  });
+  upsertDashboardFromPayload(data);
+  showToast('Dashboard panel closed', 1800);
+}
+
+async function closeDashboard(dashboard) {
+  const target = dashboard || activeDashboard();
+  if (!target?.id) return;
+  if (!window.confirm(`Close dashboard "${target.name || target.id}"?`)) return;
+  const data = await api('/api/gui/dashboards/remove', {
+    method: 'POST',
+    body: JSON.stringify({ dashboard_id: target.id, source: 'user' }),
+  });
+  if (data?.dashboard_id) {
+    state.dashboards = (state.dashboards || []).filter((d) => d.id !== data.dashboard_id);
+  }
+  if (data?.next_dashboard) upsertDashboard(data.next_dashboard);
+  if (data?.workspace) state.workspace = data.workspace;
+  renderWorkspace();
+  renderDiscovery();
+  showToast('Dashboard closed', 1800);
+}
+
 function updateDashboardToolbar() {
   const root = $('app');
   const dashboard = activeDashboard();
   const inDashboard = Boolean((state.workspace || {}).mode === 'dashboard' && dashboard);
   root?.classList.toggle('dashboard-active', inDashboard);
+  renderDashboardSwitcher();
   if (!els.dashboardFloatToggle || !els.dashboardSnapGrid) return;
 
   els.dashboardFloatToggle.disabled = !inDashboard;
@@ -361,6 +810,7 @@ function renderDashboard() {
   const dashboard = activeDashboard();
   els.dashboard.innerHTML = '';
   if (!dashboard) {
+    renderDashboardSwitcher();
     const empty = document.createElement('div');
     empty.className = 'dashboard-empty glass';
     empty.textContent = 'Dashboard mode is active, but no dashboard panels are available yet.';
@@ -370,15 +820,35 @@ function renderDashboard() {
   }
 
   state.dashboardFloat = getDashboardFloat(dashboard);
+  clearDashboardActivity(dashboard.id);
+  renderDashboardSwitcher();
   updateDashboardToolbar();
-  const panels = dashboard.panels || [];
-  const header = document.createElement('div');
+  const header = document.createElement('header');
   header.className = 'dashboard-header glass dashboard-header-compact';
-  const title = document.createElement('div');
-  title.innerHTML = `<strong>${dashboard.name || 'Agent Dashboard'}</strong><span>${dashboard.description || `${panels.length} panel(s)`}</span>`;
-  header.appendChild(title);
+  const headerText = document.createElement('div');
+  const headerTitle = document.createElement('strong');
+  headerTitle.textContent = dashboard.name || 'Dashboard';
+  const headerMeta = document.createElement('span');
+  headerMeta.textContent = `${dashboard.panels?.length || 0} panel${(dashboard.panels?.length || 0) === 1 ? '' : 's'} · ${dashboard.layout || 'grid'}`;
+  headerText.appendChild(headerTitle);
+  headerText.appendChild(headerMeta);
+  const headerActions = document.createElement('div');
+  headerActions.className = 'dashboard-actions';
+  const closeDashboardButton = document.createElement('button');
+  closeDashboardButton.type = 'button';
+  closeDashboardButton.className = 'dashboard-close-button';
+  closeDashboardButton.textContent = 'Close dashboard';
+  closeDashboardButton.title = 'Close this dashboard and notify the agent';
+  closeDashboardButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    closeDashboard(dashboard).catch((error) => showToast(error.message || 'Failed to close dashboard', 3000));
+  });
+  headerActions.appendChild(closeDashboardButton);
+  header.appendChild(headerText);
+  header.appendChild(headerActions);
   els.dashboard.appendChild(header);
 
+  const panels = dashboard.panels || [];
   const grid = document.createElement('div');
   grid.className = `dashboard-grid layout-${dashboard.layout || 'grid'}${state.dashboardFloat ? ' is-floating' : ''}`;
   panels.forEach((panel, index) => {
@@ -414,11 +884,22 @@ function renderDashboard() {
     titleGroup.appendChild(name);
     titleGroup.appendChild(meta);
 
+    const zoom = panelZoom(panel);
+    const viewport = document.createElement('div');
+    viewport.className = 'dashboard-panel-viewport';
+    viewport.dataset.zoom = String(zoom);
+    const zoomSurface = document.createElement('div');
+    zoomSurface.className = 'dashboard-panel-zoom-surface';
+    zoomSurface.style.transform = `scale(${zoom})`;
+    zoomSurface.style.transformOrigin = 'top left';
+
     const frame = document.createElement('iframe');
     frame.className = 'dashboard-panel-frame';
     frame.title = panel.title || panel.name || 'Dashboard panel';
     frame.sandbox = 'allow-same-origin allow-scripts allow-forms allow-popups allow-downloads';
     frame.src = panelSource(panel);
+    zoomSurface.appendChild(frame);
+    viewport.appendChild(zoomSurface);
 
     const controls = document.createElement('div');
     controls.className = 'dashboard-panel-nav';
@@ -441,16 +922,66 @@ function renderDashboard() {
       controls.appendChild(button);
     });
 
+    const zoomControls = document.createElement('div');
+    zoomControls.className = 'dashboard-panel-zoom-controls';
+    const zoomOut = document.createElement('button');
+    zoomOut.type = 'button';
+    zoomOut.textContent = '−';
+    zoomOut.title = 'Zoom panel out';
+    zoomOut.addEventListener('click', (event) => {
+      event.stopPropagation();
+      adjustDashboardPanelZoom(panel, -(Number(panel.zoom_step || 0.1))).catch((error) => showToast(error.message || 'Failed to zoom panel', 3000));
+    });
+    const zoomLabel = document.createElement('button');
+    zoomLabel.type = 'button';
+    zoomLabel.className = 'dashboard-panel-zoom-label';
+    zoomLabel.textContent = panelZoomLabel(panel);
+    zoomLabel.title = 'Reset panel zoom to 100%';
+    zoomLabel.addEventListener('click', (event) => {
+      event.stopPropagation();
+      resetDashboardPanelZoom(panel).catch((error) => showToast(error.message || 'Failed to reset zoom', 3000));
+    });
+    const zoomIn = document.createElement('button');
+    zoomIn.type = 'button';
+    zoomIn.textContent = '+';
+    zoomIn.title = 'Zoom panel in';
+    zoomIn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      adjustDashboardPanelZoom(panel, Number(panel.zoom_step || 0.1)).catch((error) => showToast(error.message || 'Failed to zoom panel', 3000));
+    });
+    const zoomReset = document.createElement('button');
+    zoomReset.type = 'button';
+    zoomReset.textContent = '100';
+    zoomReset.title = 'Reset panel zoom';
+    zoomReset.addEventListener('click', (event) => {
+      event.stopPropagation();
+      resetDashboardPanelZoom(panel).catch((error) => showToast(error.message || 'Failed to reset zoom', 3000));
+    });
+    zoomControls.appendChild(zoomOut);
+    zoomControls.appendChild(zoomLabel);
+    zoomControls.appendChild(zoomIn);
+    zoomControls.appendChild(zoomReset);
+    controls.appendChild(zoomControls);
+
+    const closePanelButton = document.createElement('button');
+    closePanelButton.type = 'button';
+    closePanelButton.className = 'dashboard-panel-close';
+    closePanelButton.textContent = '×';
+    closePanelButton.title = 'Close this panel and notify the agent';
+    closePanelButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeDashboardPanel(panel).catch((error) => showToast(error.message || 'Failed to close panel', 3000));
+    });
+    controls.appendChild(closePanelButton);
+
     bar.appendChild(titleGroup);
     bar.appendChild(controls);
     card.appendChild(bar);
-    card.appendChild(frame);
-    if (state.dashboardFloat) {
-      const resize = document.createElement('div');
-      resize.className = 'dashboard-panel-resize';
-      resize.title = 'Resize dashboard panel';
-      card.appendChild(resize);
-    }
+    card.appendChild(viewport);
+    const resize = document.createElement('div');
+    resize.className = 'dashboard-panel-resize';
+    resize.title = state.dashboardFloat ? 'Resize floating dashboard panel' : 'Resize dashboard panel';
+    card.appendChild(resize);
     grid.appendChild(card);
   });
   els.dashboard.appendChild(grid);
@@ -461,6 +992,7 @@ function upsertDashboard(dashboard) {
   const idx = state.dashboards.findIndex((d) => d.id === dashboard.id);
   if (idx >= 0) state.dashboards[idx] = dashboard;
   else state.dashboards.unshift(dashboard);
+  renderDashboardSwitcher();
 }
 
 function renderWorkspace() {
@@ -468,6 +1000,7 @@ function renderWorkspace() {
   els.toolbarMode.value = workspace.mode || 'browser';
   els.urlInput.value = workspace.url && workspace.url !== 'about:blank' && workspace.mode !== 'dashboard' ? workspace.url : '';
   els.workspaceSummary.textContent = `${workspace.mode || 'browser'} · ${workspace.title || workspace.url || 'blank'}`;
+  renderDashboardSwitcher();
 
   $('app')?.classList.toggle('dashboard-active', workspace.mode === 'dashboard');
   updateDashboardToolbar();
@@ -540,9 +1073,88 @@ function renderAnnotations() {
 
 function renderMessages() {
   els.messages.innerHTML = '';
-  state.messages.forEach((message) => {
+  const showSystemMessages = state.showSystemMessages !== false;
+  let hiddenSystemCount = 0;
+  const hiddenSystemSeverityCounts = { neutral: 0, warning: 0, error: 0 };
+  const hiddenSystemAlertItems = [];
+  let pendingSystem = [];
+
+  const messageTime = (message) => {
+    if (!message?.created_at) return null;
+    const date = new Date(message.created_at * 1000);
+    return Number.isFinite(date.getTime()) ? date : null;
+  };
+
+  const roleLabelFor = (role) => ({ user: 'You', assistant: 'Agent', system: 'System' }[role] || String(role || 'Message').replace(/(^|[-_\s])([a-z])/g, (_, sep, ch) => `${sep}${ch.toUpperCase()}`));
+
+  const isSystemNotice = (message) => {
+    // Only actual system-role messages should be grouped/hidden.
+    // Assistant/user messages from the gateway often carry gateway_event metadata;
+    // those must remain visible as normal chat bubbles.  Also honor a
+    // force_visible escape hatch for gateway messages that should never be
+    // folded into a notice bundle.
+    if (message?.metadata?.force_visible) return false;
+    return (message?.role || 'assistant') === 'system';
+  };
+
+  const systemNoticeSeverity = (message) => {
+    const metadata = message?.metadata || {};
+
+
+    const tokens = [
+      metadata.severity, metadata.level, metadata.tone, metadata.status, metadata.type,
+      metadata.gateway_event?.severity, metadata.gateway_event?.level, metadata.gateway_event?.status, metadata.gateway_event?.type,
+      metadata.system_event?.severity, metadata.system_event?.level, metadata.system_event?.status, metadata.system_event?.type,
+      message?.content,
+    ].filter(Boolean).map((value) => String(value).toLowerCase()).join(' ');
+
+    if (/\b(error|failed|failure|fatal|exception|denied|blocked|unauthorized|forbidden|offline|unhealthy)\b/.test(tokens)) return 'error';
+    if (/\b(warn|warning|caution|degraded|retry|timeout|paused|pending|rate.?limit)\b/.test(tokens)) return 'warning';
+    return 'neutral';
+  };
+
+  const systemNoticeSeverityRank = { neutral: 0, warning: 1, error: 2 };
+  const strongestSystemNoticeSeverity = (counts) => (counts.error ? 'error' : counts.warning ? 'warning' : 'neutral');
+  const systemNoticeCountSummary = (counts) => {
+    const parts = [];
+    if (counts.error) parts.push(`${counts.error} error${counts.error === 1 ? '' : 's'}`);
+    if (counts.warning) parts.push(`${counts.warning} warning${counts.warning === 1 ? '' : 's'}`);
+    if (!parts.length && counts.neutral) parts.push(`${counts.neutral} neutral`);
+    return parts.join(', ');
+  };
+
+  const systemNoticeIdentity = (message, index = 0) => {
+    const metadata = message?.metadata || {};
+    return String(metadata.id || metadata.event_id || metadata.gateway_event?.id || metadata.system_event?.id || `${message?.created_at || ''}:${index}:${message?.content || ''}`);
+  };
+
+  const detailPayloadFor = (message) => {
+    const metadata = message?.metadata || {};
+    return metadata.gateway_event || metadata.system_event || metadata.gateway_result || metadata.gateway_policy || null;
+  };
+
+  const appendDetailsButton = (meta, details, title = 'Show details') => {
+    const info = document.createElement('button');
+    info.type = 'button';
+    info.className = 'message-info';
+    info.title = title;
+    info.setAttribute('aria-label', title);
+    info.setAttribute('aria-expanded', 'false');
+    info.textContent = 'i';
+    info.addEventListener('click', () => {
+      const open = details.hidden;
+      details.hidden = !open;
+      info.classList.toggle('is-open', open);
+      info.setAttribute('aria-expanded', open ? 'true' : 'false');
+      info.title = open ? 'Hide details' : title;
+    });
+    meta.appendChild(info);
+  };
+
+  const appendMessage = (message) => {
     const metadata = message.metadata || {};
-    const classes = ['message', message.role || 'assistant'];
+    const roleName = message.role || 'assistant';
+    const classes = ['message', roleName];
     if (metadata.compact) classes.push('compact');
     if (metadata.card) classes.push('card');
     if (metadata.tone) classes.push(`tone-${String(metadata.tone).replace(/[^a-z0-9_-]/gi, '')}`);
@@ -553,25 +1165,19 @@ function renderMessages() {
     const meta = document.createElement('div');
     meta.className = 'message-meta';
     const label = document.createElement('span');
-    const date = message.created_at ? new Date(message.created_at * 1000).toLocaleTimeString() : '';
-    label.textContent = `${message.role || 'message'} ${date}`;
+    const date = messageTime(message);
+    const roleLabel = roleLabelFor(roleName);
+    label.textContent = date ? `${roleLabel} · ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : roleLabel;
+    if (date) label.title = date.toLocaleString();
     meta.appendChild(label);
 
     const body = document.createElement('div');
     body.className = 'message-content';
     body.textContent = message.content || '';
 
-    const detailPayload = metadata.gateway_event || metadata.system_event || null;
+    const detailPayload = detailPayloadFor(message);
     let details = null;
     if (detailPayload) {
-      const info = document.createElement('button');
-      info.type = 'button';
-      info.className = 'message-info';
-      info.title = 'Show system details';
-      info.setAttribute('aria-label', 'Show system details');
-      info.setAttribute('aria-expanded', 'false');
-      info.textContent = 'i';
-
       details = document.createElement('pre');
       details.className = 'message-details';
       details.hidden = true;
@@ -580,26 +1186,125 @@ function renderMessages() {
       } catch (_) {
         details.textContent = String(detailPayload);
       }
-
-      info.addEventListener('click', () => {
-        const open = details.hidden;
-        details.hidden = !open;
-        info.classList.toggle('is-open', open);
-        info.setAttribute('aria-expanded', open ? 'true' : 'false');
-        info.title = open ? 'Hide system details' : 'Show system details';
-      });
-      meta.appendChild(info);
+      appendDetailsButton(meta, details, 'Show system details');
     }
 
     node.appendChild(meta);
     node.appendChild(body);
     if (details) node.appendChild(details);
     els.messages.appendChild(node);
+  };
+
+  const flushSystemGroup = () => {
+    if (!pendingSystem.length) return;
+    if (!showSystemMessages) {
+      pendingSystem.forEach((msg, index) => {
+        const severity = systemNoticeSeverity(msg);
+        hiddenSystemSeverityCounts[severity] += 1;
+        if (severity !== 'neutral') hiddenSystemAlertItems.push(`${severity}:${systemNoticeIdentity(msg, index)}`);
+      });
+      hiddenSystemCount += pendingSystem.length;
+      pendingSystem = [];
+      return;
+    }
+
+    const groupCounts = { neutral: 0, warning: 0, error: 0 };
+    pendingSystem.forEach((msg) => { groupCounts[systemNoticeSeverity(msg)] += 1; });
+    const groupSeverity = strongestSystemNoticeSeverity(groupCounts);
+
+    const group = document.createElement('article');
+    group.className = `message system system-group compact severity-${groupSeverity}`;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'system-group-toggle';
+    button.setAttribute('aria-expanded', 'false');
+    const firstTime = messageTime(pendingSystem[0]);
+    const groupSummary = systemNoticeCountSummary(groupCounts);
+    button.classList.add(`severity-${groupSeverity}`);
+    button.textContent = `${pendingSystem.length} system notice${pendingSystem.length === 1 ? '' : 's'}${groupSummary ? ` · ${groupSummary}` : ''}${firstTime ? ` · ${firstTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}`;
+
+    const details = document.createElement('div');
+    details.className = 'system-group-details';
+    details.hidden = true;
+    pendingSystem.forEach((msg) => {
+      const item = document.createElement('div');
+      const itemSeverity = systemNoticeSeverity(msg);
+      item.className = `system-group-item severity-${itemSeverity}`;
+      const t = messageTime(msg);
+      item.textContent = `${t ? `${t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ` : ''}${msg.content || 'System event'}`;
+      const payload = detailPayloadFor(msg);
+      if (payload) {
+        const pre = document.createElement('pre');
+        pre.className = 'message-details system-group-payload';
+        try { pre.textContent = JSON.stringify(payload, null, 2); }
+        catch (_) { pre.textContent = String(payload); }
+        item.appendChild(pre);
+      }
+      details.appendChild(item);
+    });
+
+    button.addEventListener('click', () => {
+      const open = details.hidden;
+      details.hidden = !open;
+      button.classList.toggle('is-open', open);
+      button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+
+    group.appendChild(button);
+    group.appendChild(details);
+    els.messages.appendChild(group);
+    pendingSystem = [];
+  };
+
+  state.messages.forEach((message) => {
+    if (isSystemNotice(message)) {
+      pendingSystem.push(message);
+      return;
+    }
+    flushSystemGroup();
+    appendMessage(message);
   });
+  flushSystemGroup();
+
+  const hiddenSeverity = strongestSystemNoticeSeverity(hiddenSystemSeverityCounts);
+  const hiddenSeveritySummary = systemNoticeCountSummary(hiddenSystemSeverityCounts);
+  if (!showSystemMessages && hiddenSystemCount) {
+    const summary = document.createElement('article');
+    summary.className = `message system compact system-summary severity-${hiddenSeverity}`;
+    summary.textContent = `${hiddenSystemCount} system notice${hiddenSystemCount === 1 ? '' : 's'} hidden${hiddenSeveritySummary ? ` · ${hiddenSeveritySummary}` : ''}`;
+    els.messages.prepend(summary);
+  }
+  const hiddenAlertSignature = hiddenSystemAlertItems.join('|');
+  if (!showSystemMessages) {
+    // Treat the first hidden render as the baseline, then pulse only when a
+    // new hidden warning/error appears. This avoids alarming on page load or
+    // immediately when the user intentionally hides existing notices.
+    if (hiddenAlertSignature && state.hiddenSystemAlertInitialized && state.hiddenSystemAlertSignature !== hiddenAlertSignature) {
+      pulseHiddenSystemNotice(hiddenSeverity);
+    }
+    state.hiddenSystemAlertSignature = hiddenAlertSignature;
+    state.hiddenSystemAlertInitialized = true;
+  } else {
+    state.hiddenSystemAlertSignature = '';
+    state.hiddenSystemAlertInitialized = false;
+  }
+  if (els.toggleSystemMessages) {
+    els.toggleSystemMessages.classList.toggle('is-active', showSystemMessages);
+    els.toggleSystemMessages.classList.remove('severity-neutral', 'severity-warning', 'severity-error');
+    if (!showSystemMessages) els.toggleSystemMessages.classList.add(`severity-${hiddenSeverity}`);
+    els.toggleSystemMessages.setAttribute('aria-pressed', showSystemMessages ? 'true' : 'false');
+    els.toggleSystemMessages.textContent = showSystemMessages ? 'System notices on' : `System notices hidden${hiddenSeveritySummary && hiddenSeverity !== 'neutral' ? ` · ${hiddenSeveritySummary}` : ''}`;
+  }
   els.messages.scrollTop = els.messages.scrollHeight;
 }
 
 window.wolfGuiRenderMessages = renderMessages;
+window.wolfGuiAddApprovalRequest = addApprovalRequest;
+window.wolfGuiResolveApprovalRequest = resolveApprovalRequest;
+window.wolfGuiRenderApprovals = renderApprovals;
+window.wolfGuiShowToast = showToast;
+window.wolfGuiPulsePermissionPanel = pulseHiddenSystemNotice;
 
 function renderDiscovery() {
   const workflowCount = state.workflows && !state.workflows.error ? Object.keys(state.workflows).length : 0;
@@ -629,6 +1334,9 @@ function applyDockMode(mode, options = {}) {
 
   if (els.dockModeToolbar) els.dockModeToolbar.value = next;
   if (els.dockModePanel) els.dockModePanel.value = next;
+  document.querySelectorAll('[data-dock-mode]').forEach((button) => {
+    button.classList.toggle('is-active', button.getAttribute('data-dock-mode') === next);
+  });
   if (options.persist !== false) persistAgentPanelPrefs();
 }
 
@@ -646,7 +1354,9 @@ function renderAll() {
   renderWorkspace();
   renderAnnotations();
   renderMessages();
+  renderApprovals();
   renderDiscovery();
+  applyChatScale(state.chatScale, { persist: false });
 }
 
 function setAnnotationMode(mode) {
@@ -662,6 +1372,7 @@ async function bootstrap() {
   state.workspace = data.workspace || state.workspace;
   state.annotations = data.annotations || [];
   state.messages = data.messages || [];
+  state.approvals = data.approvals || state.approvals || [];
   state.apps = data.apps || [];
   state.dashboards = data.dashboards || [];
   state.workflows = data.workflows || {};
@@ -766,6 +1477,67 @@ function currentVisualContext() {
     };
   }) : [];
 
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const rectsIntersect = (a, b) => {
+    if (!a || !b || !a.visible || !b.visible) return false;
+    return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+  };
+  const pointInRect = (point, rect) => {
+    if (!point || !rect || !rect.visible) return false;
+    return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+  };
+  const annotationPixelGeometry = (annotation) => {
+    const x = clamp(Number(annotation.x || 0), 0, 1) * window.innerWidth;
+    const y = clamp(Number(annotation.y || 0), 0, 1) * window.innerHeight;
+    if (annotation.kind === 'rect') {
+      const w = Math.max(0, Number(annotation.w || 0) * window.innerWidth);
+      const h = Math.max(0, Number(annotation.h || 0) * window.innerHeight);
+      return {
+        point: { x: Math.round(x + w / 2), y: Math.round(y + h / 2) },
+        box: {
+          x: Math.round(x),
+          y: Math.round(y),
+          width: Math.round(w),
+          height: Math.round(h),
+          visible: w > 0 && h > 0,
+        },
+      };
+    }
+    return {
+      point: { x: Math.round(x), y: Math.round(y) },
+      box: {
+        x: Math.round(Math.max(0, x - 12)),
+        y: Math.round(Math.max(0, y - 12)),
+        width: 24,
+        height: 24,
+        visible: true,
+      },
+    };
+  };
+  const annotationTargets = (state.annotations || []).map((annotation, index) => {
+    const geometry = annotationPixelGeometry(annotation);
+    const matchedPanels = panels.filter((panel) => {
+      const box = panel.bounding_box;
+      return annotation.kind === 'rect' ? rectsIntersect(geometry.box, box) : pointInRect(geometry.point, box);
+    }).map((panel) => ({
+      panel_id: panel.id,
+      panel_key: panel.key,
+      panel_title: panel.title,
+      panel_index: panel.index,
+      bounding_box: panel.bounding_box,
+    }));
+    const surface = matchedPanels.length ? 'dashboard_panel' : (dashboard ? 'dashboard_workspace' : 'workspace_frame');
+    return {
+      ...annotation,
+      index,
+      pixel_point: geometry.point,
+      pixel_box: geometry.box,
+      target_surface: surface,
+      target_panels: matchedPanels,
+      capture_hint: annotation.kind === 'rect' ? 'crop_pixel_box' : 'crop_around_pixel_point',
+    };
+  });
+
   return {
     schema_version: 'wolf_gui_visual_context.v1',
     kind: 'wolf_gui_visual_context',
@@ -780,14 +1552,16 @@ function currentVisualContext() {
       workspace_state: true,
       viewport_geometry: true,
       annotations: true,
+      annotation_pixel_geometry: true,
+      annotation_panel_association: true,
       dashboard_panel_metadata: true,
       dashboard_inline_html_excerpt: true,
       same_origin_iframe_dom_excerpt: 'best_effort',
-      full_gui_pixel_screenshot: agentCaptureAllowed() ? "backend_capture_action_available" : false,
+      full_gui_pixel_screenshot: agentCaptureAllowed() ? "live_client_surface_or_backend_capture_available" : false,
       cross_origin_iframe_dom: false,
-      cross_origin_iframe_pixels: agentCaptureAllowed() ? "requires_gui_capture_url_or_workspace" : false,
-      backend_capture_action: agentCaptureAllowed() ? 'gui_capture_url/gui_capture_workspace permitted by user toggle' : 'disabled_by_user_toggle',
-      limitation_note: 'The browser can describe the Wolf GUI workspace and same-origin/inline dashboard content. Cross-origin iframe DOM or rendered pixels require the permissioned backend Playwright capture action and the Allow agent capture toggle.'
+      cross_origin_iframe_pixels: agentCaptureAllowed() ? "requires_permissioned_live_client_or_backend_capture" : false,
+      backend_capture_action: agentCaptureAllowed() ? 'gui_capture_url/gui_capture_workspace permitted by user toggle; live client surface capture may prompt for browser sharing permission' : 'disabled_by_user_toggle',
+      limitation_note: 'The browser can describe the Wolf GUI workspace and same-origin/inline dashboard content. Exact live rendered pixels require the Allow agent capture toggle and browser screen/tab sharing permission; backend Playwright replay remains a fallback.'
     },
     viewport: {
       width: window.innerWidth,
@@ -821,11 +1595,91 @@ function currentVisualContext() {
     dashboards_summary: (state.dashboards || []).map((d) => ({ id: d.id, name: d.name, panel_count: (d.panels || []).length })),
     apps_summary: (state.apps || []).map((a) => ({ id: a.id, name: a.name, url: a.url, kind: a.kind, status: a.host_status || a.status })),
     annotations: state.annotations,
+    annotation_targets: annotationTargets,
     annotation_count: state.annotations.length,
   };
 }
 
 window.wolfGuiCurrentVisualContext = currentVisualContext;
+
+function installToolbarGroupHandlers() {
+  const groups = Array.from(document.querySelectorAll('.toolbar-group'));
+  if (!groups.length) return;
+  let openGroup = null;
+
+  const setExpanded = (group, expanded) => {
+    const trigger = group?.querySelector?.('.toolbar-group-trigger');
+    if (trigger) trigger.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  };
+
+  const closeGroup = (group) => {
+    if (!group) return;
+    clearTimeout(group._wolfCloseTimer);
+    group.classList.remove('is-open', 'is-hovering');
+    setExpanded(group, false);
+    if (openGroup === group) openGroup = null;
+  };
+
+  const closeOtherGroups = (keep = null) => {
+    groups.forEach((group) => {
+      if (group !== keep) closeGroup(group);
+    });
+  };
+
+  groups.forEach((group) => {
+    const trigger = group.querySelector('.toolbar-group-trigger');
+    if (trigger) {
+      trigger.setAttribute('aria-haspopup', 'true');
+      trigger.setAttribute('aria-expanded', 'false');
+    }
+
+    group.addEventListener('pointerenter', () => {
+      clearTimeout(group._wolfCloseTimer);
+      closeOtherGroups(group);
+      group.classList.add('is-hovering');
+      setExpanded(group, true);
+    });
+
+    group.addEventListener('pointerleave', () => {
+      clearTimeout(group._wolfCloseTimer);
+      group._wolfCloseTimer = setTimeout(() => {
+        if (!group.classList.contains('is-open')) {
+          group.classList.remove('is-hovering');
+          setExpanded(group, false);
+        }
+      }, 260);
+    });
+
+    trigger?.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const willOpen = !group.classList.contains('is-open');
+      closeOtherGroups(group);
+      group.classList.toggle('is-open', willOpen);
+      group.classList.toggle('is-hovering', willOpen);
+      setExpanded(group, willOpen);
+      openGroup = willOpen ? group : null;
+    });
+
+    group.addEventListener('click', (event) => {
+      // Let toolbar item buttons run normally, then close only click-pinned groups.
+      if (!event.target.closest('.toolbar-group-items button')) return;
+      if (group.classList.contains('is-open')) {
+        setTimeout(() => closeGroup(group), 0);
+      }
+    });
+  });
+
+  document.addEventListener('click', (event) => {
+    if (event.target.closest('.toolbar-group')) return;
+    closeOtherGroups(null);
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    closeOtherGroups(null);
+  });
+}
 
 function installWorkspaceHandlers() {
   els.openUrlForm?.addEventListener('submit', async (event) => {
@@ -877,6 +1731,11 @@ function installWorkspaceHandlers() {
     snapDashboardPanelsToGrid();
     updateDashboardToolbar();
   });
+  els.dashboardSwitcher?.addEventListener('change', (event) => {
+    const dashboardId = event.target.value;
+    if (!dashboardId) return;
+    openDashboard(dashboardId);
+  });
 
   els.workspaceBack?.addEventListener('click', () => {
     navigateFrame(els.frame, 'back', workspaceFrameUrl());
@@ -894,6 +1753,22 @@ function installWorkspaceHandlers() {
   els.toggleAnnotate.addEventListener('click', () => setAnnotationMode('point'));
   els.dockModeToolbar?.addEventListener('change', (e) => applyDockMode(e.target.value));
   els.dockModePanel?.addEventListener('change', (e) => applyDockMode(e.target.value));
+  document.querySelectorAll('[data-dock-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const mode = button.getAttribute('data-dock-mode') || 'float';
+      if (els.dockModePanel) els.dockModePanel.value = mode;
+      applyDockMode(mode);
+    });
+  });
+  els.toggleSystemMessages?.addEventListener('click', () => {
+    state.showSystemMessages = state.showSystemMessages === false;
+    updateUiPrefs({ showSystemMessages: state.showSystemMessages });
+    renderMessages();
+  });
+  els.chatScaleDown?.addEventListener('click', () => adjustChatScale(-0.1));
+  els.chatScaleUp?.addEventListener('click', () => adjustChatScale(0.1));
+  els.chatScaleLabel?.addEventListener('click', () => resetChatScale());
+  els.chatScaleReset?.addEventListener('click', () => resetChatScale());
   els.toggleRect.addEventListener('click', () => setAnnotationMode('rect'));
 
   els.clearAnnotations.addEventListener('click', async () => {
@@ -1076,6 +1951,7 @@ function installPanelHandlers() {
     els.panelTab.hidden = true;
   });
   els.refreshState.addEventListener('click', bootstrap);
+  els.approvalRefresh?.addEventListener('click', refreshApprovals);
   els.includeVisualContext?.addEventListener('change', () => {
     state.attachWorkspaceView = Boolean(els.includeVisualContext.checked);
     updateUiPrefs({ attachWorkspaceView: state.attachWorkspaceView });
@@ -1090,6 +1966,13 @@ function installPanelHandlers() {
     state.allowAgentCapture = Boolean(els.allowAgentCapture.checked);
     updateUiPrefs({ allowAgentCapture: state.allowAgentCapture });
     syncComposerContextControls({ toast: true });
+  });
+
+  els.messageInput?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || !event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
+    event.preventDefault();
+    if (typeof els.messageForm.requestSubmit === 'function') els.messageForm.requestSubmit();
+    else els.messageForm.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
   });
 
   els.messageForm.addEventListener('submit', async (event) => {
@@ -1120,17 +2003,17 @@ function installDashboardPanelHandlers() {
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
   els.dashboard.addEventListener('pointerdown', (event) => {
-    if (!state.dashboardFloat) return;
     const card = event.target.closest('.dashboard-panel');
     if (!card) return;
-    const grid = event.target.closest('.dashboard-grid.is-floating');
+    const grid = event.target.closest('.dashboard-grid');
+    const floating = Boolean(grid?.classList.contains('is-floating'));
     const gridRect = grid?.getBoundingClientRect();
     const rect = card.getBoundingClientRect();
     card.style.zIndex = String(Date.now() % 100000);
 
     const resizeHandle = event.target.closest('.dashboard-panel-resize');
     if (resizeHandle) {
-      sizing = { card, gridRect, left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+      sizing = { card, gridRect, floating, left: rect.left, top: rect.top, width: rect.width, height: rect.height };
       changedCard = card;
       resizeHandle.setPointerCapture?.(event.pointerId);
       event.preventDefault();
@@ -1138,6 +2021,7 @@ function installDashboardPanelHandlers() {
       return;
     }
 
+    if (!floating) return;
     const bar = event.target.closest('.dashboard-panel-bar');
     if (!bar || event.target.closest('button')) return;
     moving = { card, gridRect, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
@@ -1149,10 +2033,15 @@ function installDashboardPanelHandlers() {
   window.addEventListener('pointermove', (event) => {
     if (sizing) {
       const gridRight = sizing.gridRect ? sizing.gridRect.right : window.innerWidth;
-      const width = clamp(event.clientX - sizing.left, 280, gridRight - sizing.left - 12);
-      const height = clamp(event.clientY - sizing.top, 220, window.innerHeight - sizing.top - 12);
-      sizing.card.style.width = `${width}px`;
+      const width = clamp(event.clientX - sizing.left, 280, Math.max(280, gridRight - sizing.left - 12));
+      const height = clamp(event.clientY - sizing.top, 220, Math.max(220, window.innerHeight - sizing.top - 12));
       sizing.card.style.height = `${height}px`;
+      sizing.card.style.minHeight = `${height}px`;
+      if (sizing.floating) {
+        sizing.card.style.width = `${width}px`;
+      } else {
+        sizing.card.style.setProperty('--dashboard-panel-custom-width', `${width}px`);
+      }
       return;
     }
     if (!moving) return;
@@ -1201,21 +2090,44 @@ function applyEvent(event) {
 
   if (t === 'dashboard_created') {
     upsertDashboard(payload);
+    markDashboardActivity(payload?.id);
     renderDiscovery();
     if (state.workspace?.mode === 'dashboard') renderWorkspace();
     return;
   }
 
-  if (t === 'dashboard_panel_added' || t === 'dashboard_panel_updated') {
+  if (t === 'dashboard_panel_added' || t === 'dashboard_panel_updated' || t === 'dashboard_panel_zoom_changed') {
+    if (payload?.dashboard) {
+      upsertDashboard(payload.dashboard);
+      markDashboardActivity(payload.dashboard.id);
+    }
+    renderDiscovery();
+    if (state.workspace?.mode === 'dashboard') renderWorkspace();
+    return;
+  }
+
+  if (t === 'dashboard_panel_removed') {
     if (payload?.dashboard) upsertDashboard(payload.dashboard);
     renderDiscovery();
     if (state.workspace?.mode === 'dashboard') renderWorkspace();
+    showToast(`Dashboard panel closed: ${payload?.panel?.title || payload?.panel?.name || 'panel'}`, 2200);
+    return;
+  }
+
+  if (t === 'dashboard_removed') {
+    if (payload?.dashboard_id) state.dashboards = (state.dashboards || []).filter((d) => d.id !== payload.dashboard_id);
+    if (payload?.next_dashboard) upsertDashboard(payload.next_dashboard);
+    if (payload?.workspace) state.workspace = payload.workspace;
+    renderWorkspace();
+    renderDiscovery();
+    showToast(`Dashboard closed: ${payload?.dashboard?.name || 'dashboard'}`, 2200);
     return;
   }
 
   if (t === 'dashboard_opened') {
     if (payload?.dashboard) upsertDashboard(payload.dashboard);
     if (payload?.workspace) state.workspace = payload.workspace;
+    clearDashboardActivity(payload?.dashboard?.id || payload?.workspace?.metadata?.active_dashboard_id);
     renderWorkspace();
     renderDiscovery();
     showToast(`Agent opened dashboard: ${payload?.dashboard?.name || 'dashboard'}`, 2200);
@@ -1260,9 +2172,36 @@ function applyEvent(event) {
     return;
   }
 
+  if (t === 'chat_scale_changed') {
+    applyChatScale(payload?.chat_scale ?? state.chatScale);
+    showToast(`Chat size ${chatScaleLabel()}`, 1500);
+    return;
+  }
+
   if (t === 'agent_status') {
     const msg = payload?.message || 'Agent updated workspace';
     showToast(msg, 2200);
+    return;
+  }
+
+  if (t === 'approval_requested') {
+    const request = payload?.request || payload;
+    if (request?.id) {
+      state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== String(request.id || request.request_id));
+      state.approvals.unshift(request);
+      renderApprovals();
+      showToast(`Permission requested: ${request.kind || request.action || 'agent action'}`, 4000);
+    }
+    return;
+  }
+
+  if (t === 'approval_decided') {
+    const request = payload?.request || {};
+    const id = request.id || request.request_id || payload?.request_id;
+    if (id) {
+      state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== String(id));
+      renderApprovals();
+    }
     return;
   }
 
@@ -1289,10 +2228,14 @@ async function pollEvents() {
 }
 
 installWorkspaceHandlers();
+installToolbarGroupHandlers();
 installPanelHandlers();
 installDashboardPanelHandlers();
 restoreAgentPanelPrefs();
+applyChatScale(state.chatScale, { persist: false });
 syncComposerContextControls();
+renderDashboardSwitcher();
 bootstrap().catch((error) => showToast(error.message, 5000));
 setInterval(refreshHealth, 5000);
+setInterval(() => refreshApprovals().catch(() => {}), 2500);
 pollEvents();

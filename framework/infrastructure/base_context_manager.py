@@ -576,7 +576,19 @@ class ContextManager:
         # older approach was fragile for non-string content and duplicate rows.
         recent_indices = set(range(len(chat_history) - len(new_ctx), len(chat_history)))
         for offset, ctx_entry in enumerate(new_ctx):
-            ctx_entry.setdefault("history_index", len(chat_history) - len(new_ctx) + offset)
+            expected_idx = len(chat_history) - len(new_ctx) + offset
+            # Older/newly-created entries may carry ``history_index=None``.  A
+            # plain setdefault() preserves that None and later chronological
+            # insertion compares it with ints, crashing forced rebuilds.
+            if not isinstance(ctx_entry.get("history_index"), int):
+                ctx_entry["history_index"] = expected_idx
+
+        def _ctx_history_index(ctx_entry: Dict[str, Any], fallback: int) -> int:
+            """Return an integer index for rebuild ordering/comparisons."""
+            if not isinstance(ctx_entry, dict):
+                return fallback
+            value = ctx_entry.get("history_index")
+            return value if isinstance(value, int) else fallback
 
         for idx in critical_indices:
             if idx not in recent_indices and new_ctx_tokens < target_tokens:
@@ -584,8 +596,10 @@ class ContextManager:
                 ctx_entry = self._create_context_entry(entry)
                 ctx_entry["history_index"] = idx
                 if new_ctx_tokens + ctx_entry["tokens"] <= target_tokens:
-                    # Insert in chronological position.
-                    insert_pos = sum(1 for e in new_ctx if e.get("history_index", len(chat_history)) < idx)
+                    # Insert in chronological position.  Be defensive about
+                    # legacy active-context entries whose history_index is None
+                    # or another non-integer metadata value.
+                    insert_pos = sum(1 for e in new_ctx if _ctx_history_index(e, len(chat_history)) < idx)
                     new_ctx.insert(insert_pos, ctx_entry)
                     new_ctx_tokens += ctx_entry["tokens"]
         
@@ -595,6 +609,11 @@ class ContextManager:
             for pin in self.pinned_entries.values():
                 entry = pin.get("entry")
                 if isinstance(entry, dict) and str(entry.get("entry_id")) not in existing_ids:
+                    # Legacy pinned entries can also carry ``history_index=None``.
+                    # Normalize before they re-enter the active context so later
+                    # context-window operations never compare None with ints.
+                    if not isinstance(entry.get("history_index"), int):
+                        entry["history_index"] = len(chat_history) + len(new_ctx)
                     new_ctx.append(entry)
                     existing_ids.add(str(entry.get("entry_id")))
 
@@ -605,7 +624,7 @@ class ContextManager:
                 new_ctx = [e for e in new_ctx if not (isinstance(e, dict) and e.get("entry_id") == "working_memory_packet")]
                 new_ctx.insert(0, wm_entry)
 
-        new_ctx.sort(key=lambda e: e.get("history_index", 10**12) if isinstance(e, dict) and e.get("history_index") != -1 else -1)
+        new_ctx.sort(key=lambda e: _ctx_history_index(e, 10**12) if _ctx_history_index(e, 10**12) != -1 else -1)
         new_ctx_tokens = sum(int(e.get("tokens", 0)) for e in new_ctx if isinstance(e, dict))
 
         # Update current context
@@ -1024,8 +1043,13 @@ class ContextManager:
         Args:
             snapshot_data: Dictionary containing all state information needed to restore the instance.
         """
-        # Restore context buffer and metrics
+        # Restore context buffer and metrics.  Normalize legacy/restored
+        # None/non-int history_index metadata during resume so later context
+        # operations never compare None with ints.
         self.current_ctx = snapshot_data.get("current_ctx", [])
+        for pos, entry in enumerate(self.current_ctx):
+            if isinstance(entry, dict) and entry.get("entry_id") != "working_memory_packet" and not isinstance(entry.get("history_index"), int):
+                entry["history_index"] = pos
         self.current_ctx_tokens = snapshot_data.get("current_ctx_tokens", 0)
         self.context_version = snapshot_data.get("context_version", 0)
         self.rebuild_count = snapshot_data.get("rebuild_count", 0)
@@ -1034,6 +1058,13 @@ class ContextManager:
         self.last_rebuild_timestamp = snapshot_data.get("last_rebuild_timestamp")
         self.context_manifest = snapshot_data.get("context_manifest", self._new_context_manifest())
         self.pinned_entries = snapshot_data.get("pinned_entries", {})
+        for pin_id, pin in list(self.pinned_entries.items()):
+            if isinstance(pin, dict):
+                entry = pin.get("entry")
+                if isinstance(entry, dict) and entry.get("entry_id") != "working_memory_packet" and not isinstance(entry.get("history_index"), int):
+                    entry["history_index"] = len(self.current_ctx)
+                if isinstance(entry, dict) and not isinstance(pin.get("history_index"), int):
+                    pin["history_index"] = entry.get("history_index")
         self.working_memory_packet = snapshot_data.get("working_memory_packet", {})
         self.context_policy = self._merge_context_policy(snapshot_data.get("context_policy", getattr(self, "context_policy", {})))
         if self.working_memory_packet and self.context_policy.get("preserve_working_memory", True):

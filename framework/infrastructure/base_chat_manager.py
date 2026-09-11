@@ -36,6 +36,11 @@ class BaseChatManager:
         self.chat_block_divider = chat_block_divider
         self.time_stamp_format = time_stamp_format
 
+        # Ensure persistence directories exist before add_chat_entries() writes
+        # initial chat history/header pickle files.
+        os.makedirs(self.session_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+
         # Initialize chat containers
         self.CHAT_HISTORY: List[ChatEntry] = []
         self.CHAT_ENTRY = {}
@@ -151,7 +156,7 @@ class BaseChatManager:
         """
         snapshot_data = {
             "CHAT_HISTORY": [ entry if isinstance(entry, dict) else entry.model_dump() for entry in self.CHAT_HISTORY],
-            "CHAT_ENTRY": {k: v.model_dump() for k, v in self.CHAT_ENTRY.items()},
+            "CHAT_ENTRY": {k: (v if isinstance(v, dict) else v.model_dump()) for k, v in self.CHAT_ENTRY.items()},
             "CHAT_HEAD_IDX": self.CHAT_HEAD_IDX,
             "LAST_CHAT_ENTRY_IDX": self.LAST_CHAT_ENTRY_IDX,
             "LAST_COUNTED_ENTRY_IDX": self.LAST_COUNTED_ENTRY_IDX,
@@ -166,40 +171,55 @@ class BaseChatManager:
         Args:
             snapshot_data: Dictionary containing state information from a previous snapshot.
         """
-        # Restore CHAT_HISTORY
+        # Restore CHAT_HISTORY.  Preserve dict metadata such as action,
+        # history_index, and entry_id; converting to ChatEntry is lossy because
+        # ChatEntry only models sender/timestamp/content.
         self.CHAT_HISTORY = []
-        for entry in snapshot_data.get("CHAT_HISTORY", []): 
+        for pos, entry in enumerate(snapshot_data.get("CHAT_HISTORY", [])):
             if isinstance(entry, dict):
-                # Debug output (can remove later)
-                if verbose>0:
-                    print(f"[!!] entry struct = {entry.keys()}")
-                    print(f"[!!] content type = {type(entry.get('content'))}")
-                # FIX: Ensure content is always a string (as ChatEntry expects)
-                content = entry.get('content')
-                if isinstance(content, dict):
-                    if verbose>0: print(f"[!!] content value = {content}")
-                    # Extract the actual message from the nested structure
-                    if 'payload' in content and 'message' in content['payload']:
-                        entry['content'] = content['payload']['message']
-                    else:
-                        # Fallback: serialize the entire dict
-                        entry['content'] = json.dumps(content)
-                    if verbose>0: print(f"[!!] Converted to: {entry['content']}") 
-                if verbose>0: print(f"[!!] ---")
-                self.CHAT_HISTORY.append(ChatEntry(**entry))
+                restored = copy.deepcopy(entry)
+                restored.setdefault("sender", "system")
+                restored.setdefault("content", "")
+                restored.setdefault("timestamp", self.get_timestamp())
+                if not isinstance(restored.get("history_index"), int):
+                    restored["history_index"] = pos
+                self.CHAT_HISTORY.append(restored)
+            elif isinstance(entry, ChatEntry):
+                restored = entry.model_dump()
+                restored["history_index"] = pos
+                self.CHAT_HISTORY.append(restored)
             else:
-                self.CHAT_HISTORY.append(entry)
-         
-        # Restore CHAT_ENTRY
-        self.CHAT_ENTRY = {
-            k: ChatEntry(**v) if isinstance(v, dict) else v
-            for k, v in snapshot_data.get("CHAT_ENTRY", {}).items()
-        }
+                restored = {"sender": "system", "content": str(entry), "timestamp": self.get_timestamp(), "history_index": pos}
+                self.CHAT_HISTORY.append(restored)
+
+        # Restore CHAT_ENTRY with the same metadata-preserving behavior.
+        self.CHAT_ENTRY = {}
+        for raw_key, raw_value in snapshot_data.get("CHAT_ENTRY", {}).items():
+            try:
+                key = int(raw_key)
+            except Exception:
+                key = raw_key
+            if isinstance(raw_value, dict):
+                restored = copy.deepcopy(raw_value)
+                restored.setdefault("sender", "system")
+                restored.setdefault("content", "")
+                restored.setdefault("timestamp", self.get_timestamp())
+                if isinstance(key, int) and not isinstance(restored.get("history_index"), int):
+                    restored["history_index"] = key
+                self.CHAT_ENTRY[key] = restored
+            elif isinstance(raw_value, ChatEntry):
+                restored = raw_value.model_dump()
+                if isinstance(key, int):
+                    restored["history_index"] = key
+                self.CHAT_ENTRY[key] = restored
+            else:
+                self.CHAT_ENTRY[key] = raw_value
         
-        # Restore indexes and counts
+        # Restore indexes and counts.  Ensure append paths continue after the
+        # restored history rather than reusing stale/null index values.
         self.CHAT_HEAD_IDX = snapshot_data.get("CHAT_HEAD_IDX", 0)
-        self.LAST_CHAT_ENTRY_IDX = snapshot_data.get("LAST_CHAT_ENTRY_IDX", 0)
-        self.LAST_COUNTED_ENTRY_IDX = snapshot_data.get("LAST_COUNTED_ENTRY_IDX", 0)
+        self.LAST_CHAT_ENTRY_IDX = max(int(snapshot_data.get("LAST_CHAT_ENTRY_IDX", 0) or 0), len(self.CHAT_HISTORY))
+        self.LAST_COUNTED_ENTRY_IDX = max(int(snapshot_data.get("LAST_COUNTED_ENTRY_IDX", 0) or 0), len(self.CHAT_HISTORY))
         self.CHAT_HISTORY_TOKEN_COUNT = snapshot_data.get("CHAT_HISTORY_TOKEN_COUNT", 0)
         
         # Save restored state to disk for persistence
