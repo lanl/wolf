@@ -64,6 +64,20 @@ CREATE INDEX IF NOT EXISTS idx_chunks_modality ON chunks(modality);
 """
 
 
+FIGURE_CAPTION_START_RE = re.compile(
+    r"^\s*((?:Fig\.?|Figure|FIGURE|Image)\s*\d+[A-Za-z]?(?:\s*[.:\-]|\s*\([A-Za-z0-9]+\))?)",
+    re.IGNORECASE,
+)
+TABLE_CAPTION_START_RE = re.compile(
+    r"^\s*((?:Table|TABLE)\s*\d+[A-Za-z]?(?:\s*[.:\-]|\s*\([A-Za-z0-9]+\))?)",
+    re.IGNORECASE,
+)
+OTHER_CAPTION_START_RE = re.compile(
+    r"^\s*(?:Fig\.?|Figure|FIGURE|Image|Table)\s*\d+[A-Za-z]?",
+    re.IGNORECASE,
+)
+
+
 def _now_iso() -> str:
     dt = datetime.now(timezone.utc).replace(microsecond=0)
     return dt.isoformat().replace("+00:00", "Z")
@@ -111,6 +125,129 @@ def _rows_to_csv(rows: list[list[str]]) -> str:
     return "\n".join(
         [",".join("" if cell is None else str(cell) for cell in r) for r in rows]
     )
+
+
+def _normalize_caption_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _bbox_vertical_gap(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    if by0 >= ay1:
+        return by0 - ay1
+    if ay0 >= by1:
+        return ay0 - by1
+    return 0.0
+
+
+def _bbox_horizontal_overlap_ratio(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax0, _ay0, ax1, _ay1 = a
+    bx0, _by0, bx1, _by1 = b
+    overlap = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    base = max(1.0, min(ax1 - ax0, bx1 - bx0))
+    return overlap / base
+
+
+def _bbox_intersection_area(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0 = max(ax0, bx0)
+    iy0 = max(ay0, by0)
+    ix1 = min(ax1, bx1)
+    iy1 = min(ay1, by1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0)
+
+
+def _bbox_area(b: Tuple[float, float, float, float]) -> float:
+    x0, y0, x1, y1 = b
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _bbox_overlap_ratio(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    inter = _bbox_intersection_area(a, b)
+    if inter <= 0:
+        return 0.0
+    denom = max(1.0, min(_bbox_area(a), _bbox_area(b)))
+    return inter / denom
+
+
+def _union_bboxes(boxes: List[Tuple[float, float, float, float]]) -> Optional[Tuple[float, float, float, float]]:
+    if not boxes:
+        return None
+    x0 = min(b[0] for b in boxes)
+    y0 = min(b[1] for b in boxes)
+    x1 = max(b[2] for b in boxes)
+    y1 = max(b[3] for b in boxes)
+    return (x0, y0, x1, y1)
+
+
+def _extract_text_blocks(page: "fitz.Page") -> List[Dict[str, Any]]:
+    blocks = page.get_text("dict").get("blocks", [])
+    out: List[Dict[str, Any]] = []
+
+    for block_index, block in enumerate(blocks):
+        lines = block.get("lines") or []
+        if not lines:
+            continue
+
+        line_texts: List[str] = []
+        font_sizes: List[float] = []
+        for line in lines:
+            spans = line.get("spans") or []
+            line_text = " ".join(span.get("text", "") for span in spans).strip()
+            if line_text:
+                line_texts.append(line_text)
+            for span in spans:
+                size = span.get("size")
+                if isinstance(size, (int, float)):
+                    font_sizes.append(float(size))
+
+        text = _normalize_caption_text(" ".join(line_texts))
+        if not text:
+            continue
+
+        bbox = tuple(block.get("bbox", [0, 0, 0, 0]))
+        out.append({
+            "block_index": block_index,
+            "text": text,
+            "bbox": bbox,
+            "y_center": (bbox[1] + bbox[3]) / 2,
+            "x_center": (bbox[0] + bbox[2]) / 2,
+            "font_size_max": max(font_sizes) if font_sizes else 0.0,
+        })
+
+    out.sort(key=lambda b: (b["bbox"][1], b["bbox"][0], b["block_index"]))
+    return out
+
+
+def _extract_word_items(page: "fitz.Page") -> List[Dict[str, Any]]:
+    words = page.get_text("words") or []
+    out: List[Dict[str, Any]] = []
+    for item in words:
+        if len(item) < 5:
+            continue
+        x0, y0, x1, y1, text = item[:5]
+        block_no = item[5] if len(item) > 5 else -1
+        line_no = item[6] if len(item) > 6 else -1
+        word_no = item[7] if len(item) > 7 else -1
+        if not str(text).strip():
+            continue
+        out.append({
+            "text": str(text),
+            "bbox": (float(x0), float(y0), float(x1), float(y1)),
+            "block_no": int(block_no),
+            "line_no": int(line_no),
+            "word_no": int(word_no),
+            "x0": float(x0),
+            "y0": float(y0),
+            "x1": float(x1),
+            "y1": float(y1),
+        })
+    out.sort(key=lambda w: (w["y0"], w["x0"], w["block_no"], w["line_no"], w["word_no"]))
+    return out
 
 
 def _extract_section_context(page: "fitz.Page", page_text: str) -> Dict[str, Any]:
@@ -241,6 +378,445 @@ def _find_text_anchors(page_text: str, element_type: str = "image") -> List[str]
     return list(set(anchors))
 
 
+def _extract_figure_caption(page: "fitz.Page", element_bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
+    try:
+        text_blocks = _extract_text_blocks(page)
+        if not text_blocks:
+            return {}
+
+        page_height = float(page.rect.height or 0.0)
+        if page_height <= 0:
+            page_height = 1000.0
+
+        x0, y0, x1, y1 = element_bbox
+        search_specs = [
+            ("below", lambda b: b["bbox"][1] >= y1 - 2.0),
+            ("above", lambda b: b["bbox"][3] <= y0 + 2.0),
+        ]
+
+        for position, predicate in search_specs:
+            candidates: List[Tuple[float, Dict[str, Any]]] = []
+            for block in text_blocks:
+                if not predicate(block):
+                    continue
+                text = block["text"]
+                if not FIGURE_CAPTION_START_RE.match(text):
+                    continue
+
+                gap = _bbox_vertical_gap(element_bbox, block["bbox"])
+                overlap = _bbox_horizontal_overlap_ratio(element_bbox, block["bbox"])
+                center_distance = abs(((block["bbox"][0] + block["bbox"][2]) / 2) - ((x0 + x1) / 2))
+                score = gap - (120.0 * overlap) + (0.05 * center_distance)
+                candidates.append((score, block))
+
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: item[0])
+            start_block = candidates[0][1]
+            start_text = start_block["text"]
+            label_match = FIGURE_CAPTION_START_RE.match(start_text)
+            caption_label = _normalize_caption_text(label_match.group(1)) if label_match else ""
+
+            caption_blocks = [start_block]
+            start_index = next((i for i, b in enumerate(text_blocks) if b["block_index"] == start_block["block_index"]), None)
+            if start_index is None:
+                start_index = text_blocks.index(start_block)
+
+            max_gap = max(18.0, page_height * 0.025)
+            caption_left = start_block["bbox"][0]
+            caption_right = start_block["bbox"][2]
+            caption_font = start_block.get("font_size_max", 0.0)
+
+            for next_block in text_blocks[start_index + 1:]:
+                if position == "below" and next_block["bbox"][1] < start_block["bbox"][1]:
+                    continue
+                if position == "above" and next_block["bbox"][1] < start_block["bbox"][1]:
+                    continue
+
+                next_text = next_block["text"]
+                if OTHER_CAPTION_START_RE.match(next_text):
+                    break
+
+                prev_block = caption_blocks[-1]
+                vertical_gap = max(0.0, next_block["bbox"][1] - prev_block["bbox"][3])
+                if vertical_gap > max_gap:
+                    break
+
+                horizontal_overlap = _bbox_horizontal_overlap_ratio(prev_block["bbox"], next_block["bbox"])
+                left_shift = abs(next_block["bbox"][0] - caption_left)
+                right_shift = abs(next_block["bbox"][2] - caption_right)
+                similar_font = abs(float(next_block.get("font_size_max", 0.0)) - float(caption_font)) <= max(1.5, caption_font * 0.2 if caption_font else 2.0)
+
+                if horizontal_overlap < 0.15 and left_shift > 80 and right_shift > 80:
+                    break
+                if not similar_font and vertical_gap > (max_gap * 0.5):
+                    break
+
+                caption_blocks.append(next_block)
+                caption_left = min(caption_left, next_block["bbox"][0])
+                caption_right = max(caption_right, next_block["bbox"][2])
+
+            caption_text = _normalize_caption_text(" ".join(block["text"] for block in caption_blocks))
+            if not caption_text:
+                continue
+
+            confidence = "high"
+            start_gap = _bbox_vertical_gap(element_bbox, start_block["bbox"])
+            start_overlap = _bbox_horizontal_overlap_ratio(element_bbox, start_block["bbox"])
+            if start_gap > max_gap or start_overlap < 0.2:
+                confidence = "medium"
+            if start_gap > max_gap * 2 or start_overlap < 0.05:
+                confidence = "low"
+
+            return {
+                "caption": caption_text,
+                "caption_label": caption_label,
+                "caption_position": position,
+                "caption_blocks": len(caption_blocks),
+                "caption_source": "pdf_geometric_extraction",
+                "caption_confidence": confidence,
+            }
+
+        return {}
+    except Exception as e:
+        return {"caption_extraction_error": str(e)}
+
+
+def _extract_table_caption(page: "fitz.Page", element_bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
+    try:
+        text_blocks = _extract_text_blocks(page)
+        if not text_blocks:
+            return {}
+
+        page_height = float(page.rect.height or 0.0)
+        if page_height <= 0:
+            page_height = 1000.0
+
+        x0, y0, x1, y1 = element_bbox
+        search_specs = [
+            ("above", lambda b: b["bbox"][3] <= y0 + 2.0),
+            ("below", lambda b: b["bbox"][1] >= y1 - 2.0),
+        ]
+
+        for position, predicate in search_specs:
+            candidates: List[Tuple[float, Dict[str, Any]]] = []
+            for block in text_blocks:
+                if not predicate(block):
+                    continue
+                text = block["text"]
+                if not TABLE_CAPTION_START_RE.match(text):
+                    continue
+
+                gap = _bbox_vertical_gap(element_bbox, block["bbox"])
+                overlap = _bbox_horizontal_overlap_ratio(element_bbox, block["bbox"])
+                center_distance = abs(((block["bbox"][0] + block["bbox"][2]) / 2) - ((x0 + x1) / 2))
+                position_bias = -10.0 if position == "above" else 0.0
+                score = gap - (120.0 * overlap) + (0.05 * center_distance) + position_bias
+                candidates.append((score, block))
+
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: item[0])
+            start_block = candidates[0][1]
+            start_text = start_block["text"]
+            label_match = TABLE_CAPTION_START_RE.match(start_text)
+            caption_label = _normalize_caption_text(label_match.group(1)) if label_match else ""
+
+            caption_blocks = [start_block]
+            start_index = next((i for i, b in enumerate(text_blocks) if b["block_index"] == start_block["block_index"]), None)
+            if start_index is None:
+                start_index = text_blocks.index(start_block)
+
+            max_gap = max(18.0, page_height * 0.025)
+            caption_left = start_block["bbox"][0]
+            caption_right = start_block["bbox"][2]
+            caption_font = start_block.get("font_size_max", 0.0)
+
+            for next_block in text_blocks[start_index + 1:]:
+                next_text = next_block["text"]
+                if OTHER_CAPTION_START_RE.match(next_text):
+                    break
+
+                prev_block = caption_blocks[-1]
+                vertical_gap = max(0.0, next_block["bbox"][1] - prev_block["bbox"][3])
+                if vertical_gap > max_gap:
+                    break
+
+                horizontal_overlap = _bbox_horizontal_overlap_ratio(prev_block["bbox"], next_block["bbox"])
+                left_shift = abs(next_block["bbox"][0] - caption_left)
+                right_shift = abs(next_block["bbox"][2] - caption_right)
+                similar_font = abs(float(next_block.get("font_size_max", 0.0)) - float(caption_font)) <= max(1.5, caption_font * 0.2 if caption_font else 2.0)
+
+                if horizontal_overlap < 0.15 and left_shift > 80 and right_shift > 80:
+                    break
+                if not similar_font and vertical_gap > (max_gap * 0.5):
+                    break
+
+                caption_blocks.append(next_block)
+                caption_left = min(caption_left, next_block["bbox"][0])
+                caption_right = max(caption_right, next_block["bbox"][2])
+
+            caption_text = _normalize_caption_text(" ".join(block["text"] for block in caption_blocks))
+            if not caption_text:
+                continue
+
+            confidence = "high"
+            start_gap = _bbox_vertical_gap(element_bbox, start_block["bbox"])
+            start_overlap = _bbox_horizontal_overlap_ratio(element_bbox, start_block["bbox"])
+            if start_gap > max_gap or start_overlap < 0.2:
+                confidence = "medium"
+            if start_gap > max_gap * 2 or start_overlap < 0.05:
+                confidence = "low"
+
+            return {
+                "caption": caption_text,
+                "caption_label": caption_label,
+                "caption_position": position,
+                "caption_blocks": len(caption_blocks),
+                "caption_source": "pdf_geometric_extraction",
+                "caption_confidence": confidence,
+            }
+
+        return {}
+    except Exception as e:
+        return {"caption_extraction_error": str(e)}
+
+
+def _row_to_text(row_words: List[Dict[str, Any]]) -> str:
+    return " ".join(str(w.get("text", "")).strip() for w in row_words if str(w.get("text", "")).strip()).strip()
+
+
+def _cluster_words_into_rows(words: List[Dict[str, Any]], y_tol: float = 3.0) -> List[List[Dict[str, Any]]]:
+    rows: List[List[Dict[str, Any]]] = []
+    for word in sorted(words, key=lambda w: (w["y0"], w["x0"])):
+        placed = False
+        word_y = (word["y0"] + word["y1"]) / 2
+        for row in rows:
+            row_y = sum((w["y0"] + w["y1"]) / 2 for w in row) / max(1, len(row))
+            if abs(word_y - row_y) <= y_tol:
+                row.append(word)
+                placed = True
+                break
+        if not placed:
+            rows.append([word])
+
+    for row in rows:
+        row.sort(key=lambda w: w["x0"])
+    rows.sort(key=lambda row: min(w["y0"] for w in row))
+    return rows
+
+
+def _estimate_column_boundaries(rows: List[List[Dict[str, Any]]], x_tol: float = 12.0) -> List[float]:
+    anchors: List[float] = []
+    for row in rows:
+        for word in row:
+            x = float(word["x0"])
+            matched = False
+            for i, anchor in enumerate(anchors):
+                if abs(x - anchor) <= x_tol:
+                    anchors[i] = (anchor + x) / 2.0
+                    matched = True
+                    break
+            if not matched:
+                anchors.append(x)
+    anchors.sort()
+    return anchors
+
+
+def _assign_row_to_columns(row: List[Dict[str, Any]], column_anchors: List[float], x_tol: float = 18.0) -> List[str]:
+    if not column_anchors:
+        return [_row_to_text(row)] if row else []
+
+    cells: List[List[str]] = [[] for _ in column_anchors]
+    overflow: List[str] = []
+
+    for word in row:
+        x = float(word["x0"])
+        nearest_idx = min(range(len(column_anchors)), key=lambda i: abs(column_anchors[i] - x))
+        if abs(column_anchors[nearest_idx] - x) <= x_tol:
+            cells[nearest_idx].append(word["text"])
+        else:
+            overflow.append(word["text"])
+
+    if overflow:
+        if cells:
+            cells[-1].extend(overflow)
+        else:
+            cells.append(overflow)
+
+    return [" ".join(str(tok).strip() for tok in cell if str(tok).strip()).strip() for cell in cells]
+
+
+def _looks_like_paragraph_row(row_text: str) -> bool:
+    text = _normalize_caption_text(row_text)
+    if not text:
+        return True
+    words = text.split()
+    if len(words) >= 14 and not re.search(r"\d", text):
+        return True
+    if text.endswith(('.', ';')) and len(words) >= 10:
+        return True
+    return False
+
+
+def _infer_table_rows_from_caption_region(page: "fitz.Page", caption_block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    page_rect = page.rect
+    page_width = float(page_rect.width or 0.0)
+    page_height = float(page_rect.height or 0.0)
+    if page_width <= 0 or page_height <= 0:
+        return None
+
+    words = _extract_word_items(page)
+    if not words:
+        return None
+
+    cap_x0, cap_y0, cap_x1, cap_y1 = caption_block["bbox"]
+    max_vertical_span = min(page_height * 0.45, 260.0)
+    region_top = cap_y1 + 2.0
+    region_bottom = min(page_height, cap_y1 + max_vertical_span)
+    region_left = max(0.0, cap_x0 - page_width * 0.03)
+    region_right = min(page_width, max(cap_x1 + page_width * 0.20, page_width * 0.92))
+
+    candidate_words = [
+        w for w in words
+        if w["y0"] >= region_top and w["y1"] <= region_bottom and w["x0"] >= region_left and w["x1"] <= region_right
+    ]
+    if not candidate_words:
+        return None
+
+    rows = _cluster_words_into_rows(candidate_words, y_tol=3.0)
+    if not rows:
+        return None
+
+    accepted_rows: List[List[Dict[str, Any]]] = []
+    stop_due_to_gap = False
+    last_y1: Optional[float] = None
+    max_gap = max(14.0, page_height * 0.018)
+
+    for row in rows:
+        row_text = _row_to_text(row)
+        if not row_text:
+            continue
+
+        row_y0 = min(w["y0"] for w in row)
+        row_y1 = max(w["y1"] for w in row)
+        if last_y1 is not None and (row_y0 - last_y1) > max_gap and len(accepted_rows) >= 2:
+            stop_due_to_gap = True
+            break
+
+        if OTHER_CAPTION_START_RE.match(row_text):
+            break
+
+        if _looks_like_paragraph_row(row_text) and len(accepted_rows) >= 2:
+            break
+
+        accepted_rows.append(row)
+        last_y1 = row_y1
+
+    if len(accepted_rows) < 2:
+        return None
+
+    candidate_counts = [len(r) for r in accepted_rows if len(r) >= 2]
+    if len(candidate_counts) < 2:
+        return None
+
+    column_count = max(candidate_counts)
+    if column_count < 2:
+        return None
+
+    column_anchors = _estimate_column_boundaries(accepted_rows, x_tol=12.0)
+    if len(column_anchors) < 2:
+        return None
+    if len(column_anchors) > column_count:
+        column_anchors = column_anchors[:column_count]
+
+    normalized_rows: List[List[str]] = []
+    populated_rows = 0
+    for row in accepted_rows:
+        cells = _assign_row_to_columns(row, column_anchors, x_tol=18.0)
+        if len(cells) < len(column_anchors):
+            cells.extend([""] * (len(column_anchors) - len(cells)))
+        elif len(cells) > len(column_anchors):
+            cells = cells[:len(column_anchors)]
+        non_empty = sum(1 for c in cells if str(c).strip())
+        if non_empty >= 2:
+            populated_rows += 1
+        normalized_rows.append(cells)
+
+    if populated_rows < 2:
+        return None
+
+    row_bboxes = [
+        (
+            min(w["x0"] for w in row),
+            min(w["y0"] for w in row),
+            max(w["x1"] for w in row),
+            max(w["y1"] for w in row),
+        )
+        for row in accepted_rows
+    ]
+    table_bbox = _union_bboxes(row_bboxes)
+    if table_bbox is None:
+        return None
+
+    return {
+        "rows": normalized_rows,
+        "bbox": table_bbox,
+        "row_count": len(normalized_rows),
+        "col_count": len(column_anchors),
+        "candidate_word_count": len(candidate_words),
+        "stopped_due_to_gap": stop_due_to_gap,
+    }
+
+
+def _find_caption_anchored_table_candidates(page: "fitz.Page") -> List[Dict[str, Any]]:
+    text_blocks = _extract_text_blocks(page)
+    if not text_blocks:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    seen_labels: set[str] = set()
+
+    for block in text_blocks:
+        text = block["text"]
+        match = TABLE_CAPTION_START_RE.match(text)
+        if not match:
+            continue
+
+        caption_label = _normalize_caption_text(match.group(1))
+        if caption_label.lower() in seen_labels:
+            continue
+
+        inferred = _infer_table_rows_from_caption_region(page, block)
+        if not inferred:
+            continue
+
+        seen_labels.add(caption_label.lower())
+        candidates.append({
+            "caption": _normalize_caption_text(text),
+            "caption_label": caption_label,
+            "caption_block": block,
+            "bbox": inferred["bbox"],
+            "rows": inferred["rows"],
+            "table_rows": inferred["row_count"],
+            "table_cols": inferred["col_count"],
+            "candidate_word_count": inferred["candidate_word_count"],
+            "table_detection_method": "caption_layout_fallback",
+            "table_detection_confidence": "medium",
+        })
+
+    return candidates
+
+
+def _table_candidate_overlaps_existing(candidate_bbox: Tuple[float, float, float, float], existing_bboxes: List[Tuple[float, float, float, float]]) -> bool:
+    for bbox in existing_bboxes:
+        if _bbox_overlap_ratio(candidate_bbox, bbox) >= 0.35:
+            return True
+    return False
+
+
 def _get_element_spatial_metadata(page: "fitz.Page", element_bbox: Tuple[float, float, float, float],
                                  element_type: str, page_num: int) -> Dict[str, Any]:
     page_rect = page.rect
@@ -287,6 +863,30 @@ def _get_element_spatial_metadata(page: "fitz.Page", element_bbox: Tuple[float, 
             spatial_metadata["section_context"] = nearest_section
 
     return spatial_metadata
+
+
+def _detect_query_intent(query: str) -> Dict[str, bool]:
+    q = str(query or "")
+    visual_patterns = [
+        r"\bimage\b", r"\bimages\b", r"\bpicture\b", r"\bpictures\b", r"\bphoto\b", r"\bphotos\b",
+        r"\bfigure\b", r"\bfigures\b", r"\bdiagram\b", r"\bdiagrams\b", r"\billustration\b", r"\billustrations\b",
+        r"\bscreenshot\b", r"\bshow\b", r"\bdisplay\b", r"\bdepict\b", r"\bdepicts\b", r"\bshown\b",
+        r"which\s+(?:picture|image|figure|diagram)",
+        r"describe\s+the\s+(?:picture|image|figure|diagram)",
+        r"what\s+does\s+the\s+(?:picture|image|figure|diagram)\s+show",
+    ]
+    table_patterns = [
+        r"\btable\b", r"\btables\b", r"\brow\b", r"\brows\b", r"\bcolumn\b", r"\bcolumns\b",
+        r"\bspreadsheet\b", r"\btabular\b",
+    ]
+
+    is_visual = any(re.search(pattern, q, re.IGNORECASE) for pattern in visual_patterns)
+    is_table = any(re.search(pattern, q, re.IGNORECASE) for pattern in table_patterns)
+    return {
+        "is_visual": is_visual,
+        "is_table": is_table,
+        "is_text": not is_visual and not is_table,
+    }
 
 
 class MultimodalKnowledgeBase:
@@ -589,15 +1189,17 @@ class MultimodalKnowledgeBase:
                             base_image = doc.extract_image(xref)
                             image_bytes = base_image["image"]
                             image_ext = base_image["ext"]
-                            img_rects = page.get_image_rects(xref)
-                            if img_rects:
+                            caption_meta: Dict[str, Any] = {}
+                            if img_rects := page.get_image_rects(xref):
                                 img_bbox = img_rects[0]
+                                bbox_tuple = (img_bbox.x0, img_bbox.y0, img_bbox.x1, img_bbox.y1)
                                 spatial_meta = _get_element_spatial_metadata(
                                     page,
-                                    (img_bbox.x0, img_bbox.y0, img_bbox.x1, img_bbox.y1),
+                                    bbox_tuple,
                                     "image",
                                     page_num + 1
                                 )
+                                caption_meta = _extract_figure_caption(page, bbox_tuple)
                             else:
                                 spatial_meta = {"bbox_note": "bbox not available"}
 
@@ -618,13 +1220,20 @@ class MultimodalKnowledgeBase:
                             img_metadata["image_format"] = image_ext
                             img_metadata.update(spatial_meta)
                             img_metadata.update(persistence_meta)
+                            if caption_meta.get("caption"):
+                                img_metadata.update(caption_meta)
+                            elif caption_meta.get("caption_extraction_error"):
+                                img_metadata["caption_extraction_error"] = caption_meta["caption_extraction_error"]
 
                             self._logger.info(
-                                "PDF page %s image %s extracted bytes=%s format=%s; attempting add_document(image)",
+                                "PDF page %s image %s extracted bytes=%s format=%s caption_found=%s caption_label=%s caption_chars=%s; attempting add_document(image)",
                                 page_num + 1,
                                 img_index,
                                 len(image_bytes),
                                 image_ext,
+                                bool(img_metadata.get("caption")),
+                                img_metadata.get("caption_label", ""),
+                                len(img_metadata.get("caption", "") or ""),
                             )
                             image_results = self.add_document(
                                 content=image_bytes,
@@ -653,6 +1262,10 @@ class MultimodalKnowledgeBase:
 
             if extract_tables:
                 try:
+                    page_table_results: List[Dict[str, Any]] = []
+                    detected_table_bboxes: List[Tuple[float, float, float, float]] = []
+                    next_table_index = 0
+
                     if hasattr(page, "find_tables"):
                         found_tables = page.find_tables()
                         table_iter = found_tables.tables if hasattr(found_tables, "tables") else found_tables
@@ -667,15 +1280,25 @@ class MultimodalKnowledgeBase:
                             try:
                                 rows = tbl.extract()
                                 if not rows:
+                                    self._logger.info(
+                                        "PDF page %s table %s detected by PyMuPDF but extract() returned no rows",
+                                        page_num + 1,
+                                        table_index,
+                                    )
                                     continue
 
                                 table_text = _rows_to_csv(rows)
                                 if not table_text.strip():
+                                    self._logger.info(
+                                        "PDF page %s table %s detected by PyMuPDF but CSV text was blank",
+                                        page_num + 1,
+                                        table_index,
+                                    )
                                     continue
 
                                 table_bbox = None
                                 if hasattr(tbl, "bbox") and tbl.bbox:
-                                    table_bbox = tbl.bbox
+                                    table_bbox = tuple(tbl.bbox)
                                 elif hasattr(tbl, "rect") and tbl.rect:
                                     r = tbl.rect
                                     table_bbox = (r.x0, r.y0, r.x1, r.y1)
@@ -687,21 +1310,30 @@ class MultimodalKnowledgeBase:
                                         "table",
                                         page_num + 1,
                                     )
+                                    caption_meta = _extract_table_caption(page, tuple(table_bbox))
+                                    detected_table_bboxes.append(tuple(table_bbox))
                                 else:
                                     spatial_meta = {"bbox_note": "table bbox not available"}
+                                    caption_meta = {}
 
                                 table_metadata = dict(page_metadata)
                                 table_metadata["modality"] = "table"
                                 table_metadata["element_type"] = "extracted_table"
-                                table_metadata["table_index"] = table_index
+                                table_metadata["table_index"] = next_table_index
                                 table_metadata["table_rows"] = len(rows)
                                 table_metadata["table_cols"] = max((len(r) for r in rows), default=0)
+                                table_metadata["table_detection_method"] = "pymupdf_find_tables"
+                                table_metadata["table_detection_confidence"] = "high"
                                 table_metadata.update(spatial_meta)
+                                if caption_meta.get("caption"):
+                                    table_metadata.update(caption_meta)
+                                elif caption_meta.get("caption_extraction_error"):
+                                    table_metadata["caption_extraction_error"] = caption_meta["caption_extraction_error"]
 
                                 self._logger.info(
                                     "PDF page %s table %s rows=%s cols=%s csv_chars=%s; attempting add_document(table)",
                                     page_num + 1,
-                                    table_index,
+                                    next_table_index,
                                     len(rows),
                                     max((len(r) for r in rows), default=0),
                                     len(table_text),
@@ -712,14 +1344,16 @@ class MultimodalKnowledgeBase:
                                     modality="table",
                                     collection=collection,
                                 )
+                                page_table_results.extend(table_results)
                                 all_table_results.extend(table_results)
                                 self._logger.info(
                                     "PDF page %s table %s add_document succeeded; items_added=%s cumulative_tables=%s",
                                     page_num + 1,
-                                    table_index,
+                                    next_table_index,
                                     len(table_results),
                                     len(all_table_results),
                                 )
+                                next_table_index += 1
                             except Exception as e:
                                 error_msg = (
                                     f"Failed to ingest table {table_index} "
@@ -730,8 +1364,89 @@ class MultimodalKnowledgeBase:
                                 extraction_errors.append(error_msg)
                     else:
                         self._logger.warning(
-                            "PyMuPDF page.find_tables() not available in this version; skipping table extraction"
+                            "PyMuPDF page.find_tables() not available in this version; switching directly to fallback table extraction"
                         )
+
+                    fallback_candidates = _find_caption_anchored_table_candidates(page)
+                    self._logger.info(
+                        "PDF page %s caption-anchored fallback table candidates=%s",
+                        page_num + 1,
+                        len(fallback_candidates),
+                    )
+
+                    for fallback in fallback_candidates:
+                        try:
+                            bbox = tuple(fallback["bbox"])
+                            if _table_candidate_overlaps_existing(bbox, detected_table_bboxes):
+                                self._logger.info(
+                                    "PDF page %s skipping fallback table %s due to overlap with an existing detected table",
+                                    page_num + 1,
+                                    fallback.get("caption_label", "unknown"),
+                                )
+                                continue
+
+                            rows = fallback.get("rows") or []
+                            if not rows:
+                                continue
+
+                            table_text = _rows_to_csv(rows)
+                            if not table_text.strip():
+                                continue
+
+                            spatial_meta = _get_element_spatial_metadata(
+                                page,
+                                bbox,
+                                "table",
+                                page_num + 1,
+                            )
+
+                            table_metadata = dict(page_metadata)
+                            table_metadata["modality"] = "table"
+                            table_metadata["element_type"] = "extracted_table"
+                            table_metadata["table_index"] = next_table_index
+                            table_metadata["table_rows"] = int(fallback.get("table_rows", len(rows)))
+                            table_metadata["table_cols"] = int(fallback.get("table_cols", max((len(r) for r in rows), default=0)))
+                            table_metadata["table_detection_method"] = fallback.get("table_detection_method", "caption_layout_fallback")
+                            table_metadata["table_detection_confidence"] = fallback.get("table_detection_confidence", "medium")
+                            table_metadata["caption"] = fallback.get("caption", "")
+                            table_metadata["caption_label"] = fallback.get("caption_label", "")
+                            table_metadata["caption_position"] = "above"
+                            table_metadata["caption_source"] = "table_caption_layout_fallback"
+                            table_metadata["candidate_word_count"] = int(fallback.get("candidate_word_count", 0))
+                            table_metadata.update(spatial_meta)
+
+                            self._logger.info(
+                                "PDF page %s fallback table %s rows=%s cols=%s csv_chars=%s; attempting add_document(table)",
+                                page_num + 1,
+                                next_table_index,
+                                table_metadata["table_rows"],
+                                table_metadata["table_cols"],
+                                len(table_text),
+                            )
+                            table_results = self.add_document(
+                                content=table_text,
+                                metadata=table_metadata,
+                                modality="table",
+                                collection=collection,
+                            )
+                            page_table_results.extend(table_results)
+                            all_table_results.extend(table_results)
+                            detected_table_bboxes.append(bbox)
+                            self._logger.info(
+                                "PDF page %s fallback table %s add_document succeeded; items_added=%s cumulative_tables=%s",
+                                page_num + 1,
+                                next_table_index,
+                                len(table_results),
+                                len(all_table_results),
+                            )
+                            next_table_index += 1
+                        except Exception as e:
+                            error_msg = (
+                                f"Failed to ingest fallback table from page {page_num + 1}: {e}"
+                            )
+                            self._logger.warning(error_msg)
+                            self._logger.warning(traceback.format_exc())
+                            extraction_errors.append(error_msg)
                 except Exception as e:
                     error_msg = f"Failed to extract tables from page {page_num + 1}: {e}"
                     self._logger.warning(error_msg)
@@ -792,8 +1507,7 @@ class MultimodalKnowledgeBase:
         filter: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
-        visual_keywords = ["picture", "image", "photo", "diagram", "figure", "show", "display"]
-        is_visual = any(re.search(r"\b" + kw + r"\b", query, re.IGNORECASE) for kw in visual_keywords)
+        intent = _detect_query_intent(query)
 
         channel_weights: Optional[Dict[str, float]] = None
         if filter is not None:
@@ -803,13 +1517,16 @@ class MultimodalKnowledgeBase:
                 if not filter:
                     filter = None
 
-        if is_visual and channel_weights is None:
-            channel_weights = {"image": 2.0, "text": 0.5}
+        if intent["is_visual"] and channel_weights is None:
+            channel_weights = {"vision": 2.5, "dense": 0.6, "bm25": 0.4, "table": 0.3}
+        elif intent["is_table"] and channel_weights is None:
+            channel_weights = {"table": 2.0, "dense": 0.8, "bm25": 0.6, "vision": 0.3}
 
         store_kwargs: Dict[str, Any] = {
             "query": query,
             "k": n_results,
             "filter": filter,
+            "query_intent": intent,
             **kwargs,
         }
         if channel_weights is not None:

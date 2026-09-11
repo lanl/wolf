@@ -13,6 +13,12 @@ from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnow
 from framework.universes.base_universe import CreateKBRequest
 
 from framework.workflows.base_agent_action import AgentAction
+from framework.workflows.relevance_filtering import (
+    search_direct,
+    search_direct_with_auto_fallback,
+    search_with_rolling_window,
+    search_with_agentic_internal_questions,
+)
 from framework.universes.endpoint_resolver import get_universe_base_url_or_error
 from framework.workflows.agent_actions.formatting_utils import resolve_text_list_source, resolve_text_source
 
@@ -147,6 +153,35 @@ class KBSearchArgs(BaseModel):
     query: str = Field(description="Search query")
     k: int = Field(default=5, description="Number of results to return")
     context_window: int = Field(default=1, description="Context window size for results")
+    search_mode: Literal["direct_search", "rolling_window", "agentic_internal_questions"] = Field(
+        default="direct_search",
+        description="KB search strategy to use"
+    )
+    auto_fallback_to_rolling_window: bool = Field(
+        default=True,
+        description="When search_mode is direct_search, automatically retry with rolling_window if direct-search results are not relevant enough to answer"
+    )
+    batch_size: int = Field(default=10, description="Batch size for rolling-window search")
+    max_batches: int = Field(default=5, description="Maximum number of batches to process for rolling-window search")
+    max_relevant_results: Optional[int] = Field(default=None, description="Optional cap on relevant results returned by advanced search modes")
+    dedupe_by: str = Field(default="id", description="Candidate deduplication key: id, source, or document")
+    require_strict_yes_no: bool = Field(default=True, description="Require strict yes/no answers for relevance checks")
+    include_nonrelevant: bool = Field(default=False, description="Include nonrelevant results metadata for advanced modes")
+    show_steps: bool = Field(default=False, description="Print intermediate advanced-search steps for debugging")
+    max_internal_questions: int = Field(default=3, description="Maximum number of generated internal questions")
+    k_per_internal_question: Optional[int] = Field(default=None, description="Results to retrieve per internal question; defaults to k")
+    require_direct_answer_sufficiency: bool = Field(
+        default=True,
+        description="When auto fallback is enabled for direct_search, require a second-stage sufficiency check before accepting direct-search results"
+    )
+    max_direct_results_for_sufficiency_check: int = Field(
+        default=3,
+        description="Maximum number of top relevant direct-search results to inspect during the direct-answer sufficiency check"
+    )
+    min_relevant_results_for_direct_accept: Optional[int] = Field(
+        default=None,
+        description="Optional minimum number of relevant direct-search results required to accept direct_search without fallback; if unmet, rolling_window is triggered"
+    )
 
 
 class UniverseKBSearchAction(AgentAction):
@@ -160,7 +195,21 @@ class UniverseKBSearchAction(AgentAction):
                               "kb_name": <string>,
                               "query": <string>,
                               "k": <int> (optional, default=5),
-                              "context_window": <int> (optional, default=1)
+                              "context_window": <int> (optional, default=1),
+                              "search_mode": <string> (optional, default="direct_search"),
+                              "auto_fallback_to_rolling_window": <bool> (optional, default=true),
+                              "batch_size": <int> (optional, default=10),
+                              "max_batches": <int> (optional, default=5),
+                              "max_relevant_results": <int|null> (optional),
+                              "dedupe_by": <string> (optional, default="id"),
+                              "require_strict_yes_no": <bool> (optional, default=true),
+                              "include_nonrelevant": <bool> (optional, default=false),
+                              "show_steps": <bool> (optional, default=false),
+                              "max_internal_questions": <int> (optional, default=3),
+                              "k_per_internal_question": <int|null> (optional),
+                              "require_direct_answer_sufficiency": <bool> (optional, default=true),
+                              "max_direct_results_for_sufficiency_check": <int> (optional, default=3),
+                              "min_relevant_results_for_direct_accept": <int|null> (optional)
                               }
                               """
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
@@ -175,19 +224,88 @@ class UniverseKBSearchAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
-            if resolve_error:
-                raise RuntimeError(resolve_error)
-            response = requests.post(
-                f"{univ_base_url}/kbs/{self.payload.kb_name}/search",
-                json={"query": self.payload.query, "k": self.payload.k, "context_window": self.payload.context_window},
-                timeout=DEFAULT_TIMEOUT
-            )
-            response.raise_for_status()
-            result = response.json()
-            if not isinstance(result, list):
-                result = {"error": "Invalid response format, expected list", "action": self.action}
-            result = {"results": result, "count": len(result)}
+#unresolved conflict but we think this is the right branch            
+#<<<<<<< HEAD
+            search_mode = self.payload.search_mode
+            if search_mode == "direct_search":
+                if self.payload.auto_fallback_to_rolling_window:
+                    result = search_direct_with_auto_fallback(
+                        user_input=self.payload.query,
+                        agent=infra.agent,
+                        infra=infra,
+                        universe_name=univ_name,
+                        kb_name=self.payload.kb_name,
+                        k=self.payload.k,
+                        context_window=self.payload.context_window,
+                        batch_size=self.payload.batch_size,
+                        max_batches=self.payload.max_batches,
+                        dedupe_by=self.payload.dedupe_by,
+                        require_strict_yes_no=self.payload.require_strict_yes_no,
+                        include_nonrelevant=self.payload.include_nonrelevant,
+                        max_relevant_results=self.payload.max_relevant_results,
+                        show_steps=self.payload.show_steps,
+                        require_direct_answer_sufficiency=self.payload.require_direct_answer_sufficiency,
+                        max_direct_results_for_sufficiency_check=self.payload.max_direct_results_for_sufficiency_check,
+                        min_relevant_results_for_direct_accept=self.payload.min_relevant_results_for_direct_accept,
+                    )
+                else:
+                    result = search_direct(
+                        infra=infra,
+                        universe_name=univ_name,
+                        kb_name=self.payload.kb_name,
+                        query=self.payload.query,
+                        k=self.payload.k,
+                        context_window=self.payload.context_window,
+                    )
+            elif search_mode == "rolling_window":
+                result = search_with_rolling_window(
+                    user_input=self.payload.query,
+                    agent=infra.agent,
+                    infra=infra,
+                    universe_name=univ_name,
+                    kb_name=self.payload.kb_name,
+                    batch_size=self.payload.batch_size,
+                    max_batches=self.payload.max_batches,
+                    context_window=self.payload.context_window,
+                    dedupe_by=self.payload.dedupe_by,
+                    require_strict_yes_no=self.payload.require_strict_yes_no,
+                    include_nonrelevant=self.payload.include_nonrelevant,
+                    max_relevant_results=self.payload.max_relevant_results,
+                    show_steps=self.payload.show_steps,
+                )
+            elif search_mode == "agentic_internal_questions":
+                result = search_with_agentic_internal_questions(
+                    user_input=self.payload.query,
+                    agent=infra.agent,
+                    infra=infra,
+                    universe_name=univ_name,
+                    kb_name=self.payload.kb_name,
+                    k_per_internal_question=self.payload.k_per_internal_question or self.payload.k,
+                    context_window=self.payload.context_window,
+                    max_internal_questions=self.payload.max_internal_questions,
+                    dedupe_by=self.payload.dedupe_by,
+                    require_strict_yes_no=self.payload.require_strict_yes_no,
+                    include_nonrelevant=self.payload.include_nonrelevant,
+                    max_relevant_results=self.payload.max_relevant_results,
+                    show_steps=self.payload.show_steps,
+                )
+            else:
+                result = {"error": f"Unsupported search_mode: {search_mode}", "action": self.action}
+#=======
+#            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+#            if resolve_error:
+#                raise RuntimeError(resolve_error)
+#            response = requests.post(
+#                f"{univ_base_url}/kbs/{self.payload.kb_name}/search",
+#                json={"query": self.payload.query, "k": self.payload.k, "context_window": self.payload.context_window},
+#                timeout=DEFAULT_TIMEOUT
+#            )
+#            response.raise_for_status()
+#            result = response.json()
+#            if not isinstance(result, list):
+#                result = {"error": "Invalid response format, expected list", "action": self.action}
+#            result = {"results": result, "count": len(result)}
+#>>>>>>> c76ef5eb0b0b31dac30ffca18c1d11112200fb8b
         except requests.exceptions.Timeout:
             result = {"error": "Request timed out", "action": self.action}
         except requests.exceptions.RequestException as e:
