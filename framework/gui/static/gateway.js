@@ -5,6 +5,60 @@
   const STORAGE_KEY = "wolfGatewayStateV3";
   const PRESET_STORAGE_KEY = "wolf.gateway.agentPresets.v1";
   const PRESET_SELECTED_KEY = "wolf.gateway.selectedAgentPreset.v1";
+  const RECENT_GATEWAY_MESSAGE_KEYS = [];
+  const GATEWAY_MESSAGE_DEDUPE_WINDOW_MS = 45000;
+
+  function normalizeGatewayMessageText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim().slice(0, 600);
+  }
+
+  function gatewayMessageDedupeKey(role, content, metadata = {}) {
+    const event = metadata?.gateway_event || {};
+    const type = String(event.type || metadata.type || "").toLowerCase();
+    const action = String(event.action || event.payload?.action || event.normalized?.action || event.result?.action || "").toLowerCase();
+    const step = event.step == null ? "" : String(event.step);
+    const status = String(event.status || "").toLowerCase();
+    const explicitId = event.event_id || event.request_id || event.command_id || "";
+    if (explicitId) return `id|${explicitId}`;
+
+    const stableText = normalizeGatewayMessageText(content);
+    const assistantVisible = String(role || "").toLowerCase() === "assistant" && (
+      type === "agent_response" ||
+      type === "send_message" ||
+      (type === "workflow_result" && action === "send_message")
+    );
+    if (assistantVisible) {
+      // Collapse the two producer paths visible in the screenshot:
+      // workflow_result/send_message and orchestration agent_response carrying
+      // the same assistant-facing content.
+      return ["assistant-visible", stableText].join("|");
+    }
+
+    return [
+      "semantic",
+      String(role || ""),
+      type,
+      action,
+      step,
+      status,
+      stableText,
+    ].join("|");
+  }
+
+  function rememberGatewayMessageKey(key) {
+    if (!key) return;
+    const now = Date.now();
+    RECENT_GATEWAY_MESSAGE_KEYS.push({ key, time: now });
+    const cutoff = now - GATEWAY_MESSAGE_DEDUPE_WINDOW_MS;
+    while (RECENT_GATEWAY_MESSAGE_KEYS.length && (RECENT_GATEWAY_MESSAGE_KEYS.length > 120 || RECENT_GATEWAY_MESSAGE_KEYS[0].time < cutoff)) {
+      RECENT_GATEWAY_MESSAGE_KEYS.shift();
+    }
+  }
+
+  function isDuplicateGatewayMessage(key) {
+    if (!key) return false;
+    return RECENT_GATEWAY_MESSAGE_KEYS.some((item) => item.key === key);
+  }
   const $ = (id) => document.getElementById(id);
 
   const els = {
@@ -61,11 +115,30 @@
     cfgEnableWrite: $("wolfCfgEnableWrite"),
     cfgEnableSyscall: $("wolfCfgEnableSyscall"),
     cfgEnableGuiCapture: $("wolfCfgEnableGuiCapture"),
+    cfgEnableUniverseManagement: $("wolfCfgEnableUniverseManagement"),
+    cfgEnableUniverseToolExecution: $("wolfCfgEnableUniverseToolExecution"),
+    cfgEnableDestructiveKb: $("wolfCfgEnableDestructiveKb"),
+    infraRefresh: $("wolfGatewayInfraRefresh"),
+    deploymentsRefresh: $("wolfGatewayDeploymentsRefresh"),
+    infraMetricUniverses: $("wolfGatewayInfraMetricUniverses"),
+    infraMetricApps: $("wolfGatewayInfraMetricApps"),
+    infraMetricDeployments: $("wolfGatewayInfraMetricDeployments"),
+    infraMetricWarnings: $("wolfGatewayInfraMetricWarnings"),
+    infraMetricEndpointIssues: $("wolfGatewayInfraMetricEndpointIssues"),
+    infraNotice: $("wolfGatewayInfraNotice"),
+    universesTable: $("wolfGatewayUniversesTable"),
+    universeAppsTable: $("wolfGatewayUniverseAppsTable"),
+    universeAppLogs: $("wolfGatewayUniverseAppLogs"),
+    universeAppLogsSummary: $("wolfGatewayUniverseAppLogsSummary"),
+    deploymentsTable: $("wolfGatewayDeploymentsTable"),
+    deploymentLogs: $("wolfGatewayDeploymentLogs"),
+    infraRaw: $("wolfGatewayInfraRaw"),
     cfgSyscallShell: $("wolfCfgSyscallShell"),
     cfgSyscallTimeout: $("wolfCfgSyscallTimeout"),
     cfgCapabilities: $("wolfCfgCapabilities"),
     cfgActionNames: $("wolfCfgActionNames"),
     cfgSyscallAllow: $("wolfCfgSyscallAllow"),
+    cfgSyscallDeny: $("wolfCfgSyscallDeny"),
     cfgSysPrompt: $("wolfCfgSysPrompt"),
     messageForm: $("message-form"),
     messageInput: $("message-input"),
@@ -85,6 +158,45 @@
 
   let ws = null;
   let intentionalClose = false;
+  let reconnectTimer = null;
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 6;
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      try { clearTimeout(reconnectTimer); } catch (_) {}
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnect(reason = "websocket disconnected") {
+    clearReconnectTimer();
+    if (!isAuthed() || !state.sessionId) return false;
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      state.phase = "error";
+      state.lastError = `${reason}; auto reconnect attempts exhausted.`;
+      saveState();
+      render();
+      if (els.feedback) els.feedback.textContent = state.lastError;
+      addMessage("system", state.lastError, { tone: "error", gateway_reconnect_failed: true });
+      return false;
+    }
+    reconnectAttempts += 1;
+    const delay = Math.min(8000, 500 * Math.pow(2, reconnectAttempts - 1));
+    state.phase = "connecting";
+    state.lastError = `${reason}; reconnecting in ${Math.round(delay / 1000)}s…`;
+    saveState();
+    render();
+    if (els.feedback) els.feedback.textContent = state.lastError;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      try { connectSession({ autoReconnect: true }); }
+      catch (error) {
+        scheduleReconnect(error?.message || "auto reconnect failed");
+      }
+    }, delay);
+    return true;
+  }
   const defaultState = {
     phase: "local", // local | authenticated | connecting | connected | error
     gatewayUrl: "http://127.0.0.1:8000",
@@ -105,6 +217,8 @@
   };
   let state = loadState();
   let currentParams = {};
+  let currentInfrastructureSnapshot = null;
+  let currentDeploymentSnapshot = null;
   let currentPolicy = {};
 
   function loadState() {
@@ -158,7 +272,8 @@
       els.cfgOrchestrationEnabled, els.cfgOrchestrationWorkerCount,
       els.cfgOrchestrationMaxActiveTasks, els.cfgOrchestrationMaxTotalTasks,
       els.cfgGuiCommandTimeout, els.cfgCtxWindow, els.cfgActionPolicy, els.cfgEnableWrite, els.cfgEnableSyscall,
-      els.cfgEnableGuiCapture,
+      els.cfgEnableGuiCapture, els.cfgEnableUniverseManagement, els.cfgEnableUniverseToolExecution,
+      els.cfgEnableDestructiveKb,
       els.cfgSyscallShell, els.cfgSyscallTimeout, els.cfgCapabilities, els.cfgActionNames,
       els.cfgSyscallAllow, els.cfgSysPrompt,
     ].filter(Boolean);
@@ -219,8 +334,8 @@
     setValue(els.cfgApiKeyVar, params.api_key_var || "");
     setValue(els.cfgAgentName, params.agent_name || "");
     setValue(els.cfgVerbose, params.verbose ?? "");
-    setValue(els.cfgMode, params.mode || "single_step");
-    setValue(els.cfgMaxSteps, params.max_steps ?? 1);
+    setValue(els.cfgMode, params.mode || "wolf_loop");
+    setValue(els.cfgMaxSteps, params.max_steps ?? 4);
     setValue(els.cfgOrchestrationEnabled, params.orchestration_enabled || false);
     setValue(els.cfgOrchestrationWorkerCount, params.orchestration_worker_count ?? 1);
     setValue(els.cfgOrchestrationMaxActiveTasks, params.orchestration_max_active_tasks ?? 4);
@@ -236,10 +351,14 @@
     "enable_write",
     "enable_syscall",
     "enable_gui_capture",
+    "enable_universe_management",
+    "enable_universe_tool_execution",
+    "enable_destructive_kb",
     "syscall_allow_shell",
     "syscall_max_timeout",
     "action_names",
-    "syscall_allowed_commands"
+    "syscall_allowed_commands",
+    "syscall_deny_patterns"
   ]);
 
   function filterOutPolicyParams(params = {}) {
@@ -288,7 +407,7 @@
     if (els.cfgAgentName?.value.trim()) out.agent_name = els.cfgAgentName.value.trim();
     const verbose = numberOrNull(els.cfgVerbose?.value);
     if (verbose !== null) out.verbose = verbose;
-    out.mode = els.cfgMode?.value || "single_step";
+    out.mode = els.cfgMode?.value || "wolf_loop";
     const maxSteps = numberOrNull(els.cfgMaxSteps?.value);
     if (maxSteps !== null) out.max_steps = maxSteps;
     out.orchestration_enabled = Boolean(els.cfgOrchestrationEnabled?.checked);
@@ -312,11 +431,15 @@
     out.enable_write = Boolean(els.cfgEnableWrite?.checked);
     out.enable_syscall = Boolean(els.cfgEnableSyscall?.checked);
     out.enable_gui_capture = Boolean(els.cfgEnableGuiCapture?.checked);
+    out.enable_universe_management = Boolean(els.cfgEnableUniverseManagement?.checked);
+    out.enable_universe_tool_execution = Boolean(els.cfgEnableUniverseToolExecution?.checked);
+    out.enable_destructive_kb = Boolean(els.cfgEnableDestructiveKb?.checked);
     out.syscall_allow_shell = Boolean(els.cfgSyscallShell?.checked);
     const timeout = numberOrNull(els.cfgSyscallTimeout?.value);
     if (timeout !== null) out.syscall_max_timeout = timeout;
     out.action_names = parseCsv(els.cfgActionNames?.value);
     out.syscall_allowed_commands = parseCsv(els.cfgSyscallAllow?.value);
+    out.syscall_deny_patterns = parseCsv(els.cfgSyscallDeny?.value);
     return sanitizeRedacted(out);
   }
 
@@ -327,10 +450,14 @@
     setValue(els.cfgEnableWrite, params.enable_write || ["write", "dev", "advanced", "master"].includes(actionPolicy));
     setValue(els.cfgEnableSyscall, params.enable_syscall || ["dev", "master"].includes(actionPolicy));
     setValue(els.cfgEnableGuiCapture, params.enable_gui_capture || ["advanced", "master"].includes(actionPolicy));
+    setValue(els.cfgEnableUniverseManagement, params.enable_universe_management || ["master"].includes(actionPolicy));
+    setValue(els.cfgEnableUniverseToolExecution, params.enable_universe_tool_execution || ["master"].includes(actionPolicy));
+    setValue(els.cfgEnableDestructiveKb, params.enable_destructive_kb || ["master"].includes(actionPolicy));
     setValue(els.cfgSyscallShell, params.syscall_allow_shell || false);
     setValue(els.cfgSyscallTimeout, params.syscall_max_timeout ?? 10);
     setValue(els.cfgActionNames, csv(params.action_names));
     setValue(els.cfgSyscallAllow, csv(params.syscall_allowed_commands));
+    setValue(els.cfgSyscallDeny, csv(params.syscall_deny_patterns));
   }
 
   function syncPolicyRawFromForm() {
@@ -370,6 +497,28 @@
         addMessage("system", `Reconnect failed after committing configuration: ${state.lastError}`, { tone: "error" });
       }
     }, 150);
+  }
+
+  function markConfigCommittedNoReconnect(message, result = {}) {
+    const recreated = Boolean(result?.runtime_recreated);
+    const text = recreated
+      ? `${message} Runtime was recreated by the gateway.`
+      : `${message} Runtime was not recreated; keeping the existing websocket open.`;
+    if (els.feedback) els.feedback.textContent = text;
+    addMessage("system", text, { compact: true, gateway_config_commit: true, gateway_result: result });
+    render();
+  }
+
+  function isAuthLikeWebsocketClose(ev, opened = false) {
+    const code = Number(ev?.code || 0);
+    const reason = String(ev?.reason || "").toLowerCase();
+    if ([4001, 4003, 4004, 4401, 4403].includes(code)) return true;
+    if (/unauthori[sz]ed|forbidden|invalid token|auth|session not found|rejected/.test(reason)) return true;
+    // Browsers often report pre-accept FastAPI 403 websocket handshakes as 1006
+    // with no reason. If the socket never opened, do not keep retrying the same
+    // stale in-memory gateway token after a gateway restart.
+    if (!opened && (code === 1006 || code === 0)) return true;
+    return false;
   }
 
   function syncRawFromForm() {
@@ -427,6 +576,7 @@
     }
     renderSessions();
     renderRunControl();
+    renderInfrastructurePanel();
 
     setDisabled(els.refreshSessions, !authed);
     setDisabled(els.createSession, !authed);
@@ -437,6 +587,8 @@
     setDisabled(els.showPolicy, !connected);
     setDisabled(els.savePolicy, !connected);
     setDisabled(els.resetSession, !connected);
+    setDisabled(els.infraRefresh, !connected);
+    setDisabled(els.deploymentsRefresh, !connected);
     formControls().forEach((el) => setDisabled(el, !connected));
     setDisabled(els.paramsEditor, !connected);
     setDisabled(els.policyEditor, !connected);
@@ -548,7 +700,7 @@
     url.search = new URLSearchParams({
       token: state.token,
       participant_id: state.participantId || "gui",
-      participant_role: "user",
+      participant_role: "owner",
       client_type: "gui",
     }).toString();
     return url.toString();
@@ -556,6 +708,9 @@
 
   function addMessage(role, content, metadata = {}) {
     if (!content) return;
+    const dedupeKey = gatewayMessageDedupeKey(role, content, metadata);
+    if (isDuplicateGatewayMessage(dedupeKey)) return;
+    rememberGatewayMessageKey(dedupeKey);
     const msg = {
       id: `gw_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
       role,
@@ -905,6 +1060,26 @@
     return { urls: urls.slice(0, Number(payload.max_panels || 6)), skipped_targets, visual_context: vc };
   }
 
+  function sendGuiCommandResult(event, commandId, action, fields = {}) {
+    const msg = {
+      type: "gui_command_result",
+      command_id: commandId,
+      action,
+      session_id: state.sessionId,
+      task_id: event?.task_id || event?.workflow_event?.task_id || undefined,
+      source: event?.source || event?.workflow_event?.source || undefined,
+      agent_name: event?.agent_name || event?.workflow_event?.agent_name || undefined,
+      timestamp: new Date().toISOString(),
+      ...fields,
+    };
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      addMessage("system", `Cannot return GUI command result for ${action}: Gateway websocket is not open.`, { tone: "error", gateway_event: event, gui_command_result_unsent: msg });
+      return false;
+    }
+    ws.send(JSON.stringify(msg));
+    return true;
+  }
+
   async function executeGatewayGuiCommand(event) {
     const commandId = event?.command_id || `guicmd_${Date.now()}`;
     const action = event?.action;
@@ -1022,11 +1197,57 @@
       } else {
         throw new Error(`Unsupported GUI command action: ${action}`);
       }
-      ws?.send(JSON.stringify({ type: "gui_command_result", command_id: commandId, action, ok: true, result, content: `GUI command completed: ${action}` }));
+      sendGuiCommandResult(event, commandId, action, { ok: true, result, content: `GUI command completed: ${action}` });
       addMessage("system", `GUI command completed: ${action}`, { gateway_event: event, compact: true });
     } catch (err) {
-      ws?.send(JSON.stringify({ type: "gui_command_result", command_id: commandId, action, ok: false, error: String(err?.message || err), content: `GUI command failed: ${action}` }));
+      sendGuiCommandResult(event, commandId, action, { ok: false, error: String(err?.message || err), content: `GUI command failed: ${action}` });
       addMessage("system", `GUI command failed: ${action}: ${String(err?.message || err)}`, { gateway_event: event, tone: "error" });
+    }
+  }
+
+
+  function sendPermissionDecision(decision = {}) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({
+      type: "permission_decision",
+      request_id: decision.request_id || decision.id,
+      kind: decision.kind,
+      action: decision.action,
+      approved: Boolean(decision.approved),
+      approve_for_session: Boolean(decision.approve_for_session),
+      reason: decision.reason || decision.feedback || "",
+      feedback: decision.feedback || decision.reason || "",
+      timestamp: new Date().toISOString(),
+      session_id: state.sessionId,
+      source: "wolf_gui",
+    }));
+    return true;
+  }
+
+  function handlePermissionRequest(event) {
+    const request = { ...(event.request || {}) };
+    const requestId = String(event.request_id || request.id || request.request_id || "");
+    if (!requestId) {
+      addMessage("system", "Gateway permission request missing request_id.", { gateway_event: event, tone: "error" });
+      return;
+    }
+    request.id = requestId;
+    request.request_id = requestId;
+    request.kind = request.kind || event.kind || event.action || "permission";
+    request.action = request.action || event.action || request.kind;
+    request.status = "pending";
+    request.gateway_permission = true;
+    request.gateway_session_id = event.session_id || state.sessionId;
+    request.gateway_event = event;
+
+    if (typeof window.wolfGuiAddApprovalRequest === "function") {
+      window.wolfGuiAddApprovalRequest(request);
+      if (typeof window.wolfGuiRenderApprovals === "function") window.wolfGuiRenderApprovals();
+      if (typeof window.wolfGuiShowToast === "function") window.wolfGuiShowToast(`Permission requested: ${request.kind}`, 5000);
+      if (typeof window.wolfGuiPulsePermissionPanel === "function") window.wolfGuiPulsePermissionPanel("warning");
+      addMessage("system", `Permission requested: ${request.kind}. Use the approval panel to approve or deny.`, { gateway_event: event, compact: true, permission_request: true });
+    } else {
+      addMessage("system", `Permission requested: ${request.kind}, but the approval panel is unavailable.`, { gateway_event: event, tone: "error" });
     }
   }
 
@@ -1056,12 +1277,22 @@
       return addMessage("system", `Workflow: ${content || event.status || "status"}`, { gateway_event: event, compact: true });
     }
     if (type === "policy_resolved") return addMessage("system", `Policy resolved: ${event.action_policy || "limited"}`, { gateway_event: event, compact: true });
+    if (type === "permission_request") { handlePermissionRequest(event); return; }
+    if (type === "permission_decision_ack") {
+      if (event.request_id && typeof window.wolfGuiResolveApprovalRequest === "function") window.wolfGuiResolveApprovalRequest(event.request_id, event);
+      return addMessage("system", event.content || `Permission decision ${event.ok ? "accepted" : "rejected"}.`, { gateway_event: event, compact: true, tone: event.ok ? undefined : "error" });
+    }
+    if (type === "permission_request_timeout") {
+      if (event.request_id && typeof window.wolfGuiResolveApprovalRequest === "function") window.wolfGuiResolveApprovalRequest(event.request_id, event);
+      return addMessage("system", event.content || "Permission request timed out.", { gateway_event: event, compact: true, tone: "error" });
+    }
     if (type === "gui_route_resolved") return addMessage("system", content || `GUI route: ${event.route || "auto"}`, { gateway_event: event, compact: true });
     if (type === "gui_command") { executeGatewayGuiCommand(event); return; }
     if (type === "gui_command_result") return addMessage("system", content || `GUI command result: ${event.ok ? "ok" : "failed"}`, { gateway_event: event, compact: true });
     if (type === "workflow_action") return addMessage("system", content || `Action: ${event.action || event.payload?.action || "action"}`, { gateway_event: event, card: true });
     if (type === "workflow_result") {
-      const resultAction = event.action || event.payload?.action || event.normalized?.action || event.result?.action || "action";
+      const resultAction = workflowResultAction(event) || "action";
+      if (INFRASTRUCTURE_LIFECYCLE_ACTIONS.has(resultAction)) scheduleInfrastructureRefresh(resultAction);
       if (resultAction === "send_message") return addMessage("assistant", content || event.payload?.message || event.payload?.content || event.message || "", { gateway_event: event, force_visible: true });
       return addMessage("system", `Result: ${resultAction} — ${content || "completed"}`, { gateway_event: event, card: true });
     }
@@ -1115,25 +1346,35 @@
     return true;
   }
 
-  function connectSession() {
+  function connectSession(options = {}) {
     if (!isAuthed()) throw new Error("Authenticate first.");
     state.sessionId = String(els.sessionSelect?.value || state.sessionId || "").trim();
     if (!state.sessionId) throw new Error("Select a session or click Create new session.");
 
+    if (!options.autoReconnect) {
+      clearReconnectTimer();
+      reconnectAttempts = 0;
+    }
     const previousWs = ws;
     if (previousWs && previousWs.readyState <= 1) {
+      intentionalClose = true;
       try { previousWs.close(); } catch (_) {}
     }
+    intentionalClose = false;
     state.phase = "connecting";
     saveState();
     render();
     if (els.feedback) els.feedback.textContent = `Opening websocket for ${state.accountId}/${state.sessionId}…`;
 
     const socket = new WebSocket(websocketUrl());
+    let opened = false;
     ws = socket;
     window.wolfGatewaySocket = socket;
     socket.addEventListener("open", () => {
       if (ws !== socket) return;
+      opened = true;
+      reconnectAttempts = 0;
+      clearReconnectTimer();
       state.phase = "connected";
       state.lastError = "";
       saveState();
@@ -1169,13 +1410,29 @@
       try { handleGatewayEvent(JSON.parse(ev.data)); }
       catch { addMessage("system", String(ev.data || ""), { raw_gateway_event: true }); }
     });
-    socket.addEventListener("close", () => {
+    socket.addEventListener("close", (ev) => {
       if (ws !== socket) return;
-      if (!intentionalClose) {
-        state.phase = "error";
-        state.lastError = "Websocket disconnected.";
-        saveState();
-        render();
+      const wasIntentional = intentionalClose;
+      ws = null;
+      window.wolfGatewaySocket = null;
+      intentionalClose = false;
+      const reason = `Websocket disconnected${ev?.code ? ` (${ev.code}${ev.reason ? `: ${ev.reason}` : ""})` : ""}.`;
+      if (!wasIntentional) {
+        const authLike = isAuthLikeWebsocketClose(ev, opened);
+        addMessage("system", authLike ? `${reason} Gateway auth/session was rejected; please re-authenticate.` : reason, { compact: true, tone: authLike ? "error" : "warning", gateway_socket_close: { code: ev?.code, reason: ev?.reason, wasClean: ev?.wasClean, opened, authLike } });
+        if (authLike) {
+          clearReconnectTimer();
+          reconnectAttempts = 0;
+          state = { ...state, token: "", accountId: "", phase: "error", lastError: "Gateway websocket auth/session rejected. Re-authenticate with username/password." };
+          saveState();
+          render();
+          if (els.feedback) els.feedback.textContent = state.lastError;
+        } else if (!scheduleReconnect(reason)) {
+          state.phase = "error";
+          state.lastError = reason;
+          saveState();
+          render();
+        }
       }
     });
     socket.addEventListener("error", () => {
@@ -1249,6 +1506,8 @@
   }
 
   function continueLocal() {
+    clearReconnectTimer();
+    reconnectAttempts = 0;
     intentionalClose = true;
     try { ws?.close(); } catch (_) {}
     state.phase = "local";
@@ -1265,8 +1524,40 @@
     if (body !== undefined) options.body = JSON.stringify(body);
     const response = await fetch(url, options);
     const payload = await response.json().catch(() => ({}));
+    if (response.status === 401 || response.status === 403) {
+      const detail = payload.detail || payload.error || `${response.status} ${response.statusText}`;
+      clearAuth(`Gateway authorization failed (${detail}). Re-authenticate with username/password; gateway auth tokens are reset when the gateway restarts.`);
+      throw new Error(detail);
+    }
     if (!response.ok) throw new Error(payload.detail || payload.error || `${response.status} ${response.statusText}`);
     return payload;
+  }
+
+  const INFRASTRUCTURE_LIFECYCLE_ACTIONS = new Set([
+    "create_universe",
+    "terminate_deployment",
+    "list_deployments",
+    "create_kb",
+    "create_toolbox",
+  ]);
+  let infrastructureRefreshTimer = null;
+
+  function workflowResultAction(event = {}) {
+    return String(event.action || event.payload?.action || event.normalized?.action || event.result?.action || "").toLowerCase();
+  }
+
+  function scheduleInfrastructureRefresh(reason = "infrastructure changed") {
+    if (!state.sessionId || !isAuthed()) return false;
+    if (infrastructureRefreshTimer) {
+      try { clearTimeout(infrastructureRefreshTimer); } catch (_) {}
+    }
+    infrastructureRefreshTimer = setTimeout(() => {
+      infrastructureRefreshTimer = null;
+      refreshInfrastructure().catch((error) => {
+        if (els.feedback) els.feedback.textContent = `Infrastructure refresh skipped/failed after ${reason}: ${error.message || error}`;
+      });
+    }, 550);
+    return true;
   }
 
   let agentPresets = [];
@@ -1356,6 +1647,312 @@
     addMessage("system", "Agent params loaded into Gateway → Agent parameters form.", { compact: true });
   }
 
+  function infraSetText(node, value) {
+    if (node) node.textContent = String(value ?? "");
+  }
+
+  function infraTone(row = {}) {
+    const status = String(row.status || "unknown").toLowerCase();
+    if (status.includes("fail") || status.includes("error") || status.includes("exited")) return "error";
+    if (row.endpoint_mismatch || status.includes("start") || status.includes("unknown")) return "warning";
+    return "info";
+  }
+
+  function infraBadge(text, tone = "info") {
+    return `<span class="wolf-gateway-infra-badge tone-${escapeHtml(tone)}">${escapeHtml(text)}</span>`;
+  }
+
+  function infraEndpointText(row = {}) {
+    return row.url || (row.host && row.port ? `${row.host}:${row.port}` : "no endpoint");
+  }
+
+  function universeAppId(row = {}) {
+    return row.app_id || row.name || row.metadata?.app_id || row.metadata?.id || row.id || "";
+  }
+
+  function universeAppTitle(row = {}) {
+    return row.title || row.display_name || row.metadata?.title || row.metadata?.name || universeAppId(row) || "Universe App";
+  }
+
+  function universeAppUniverse(row = {}) {
+    const ownerTail = String(row.owner_id || "").split(":").filter(Boolean).pop() || "";
+    return row.universe || row.system || row.metadata?.universe || ownerTail;
+  }
+
+  function gatewayUniverseAppPath(row = {}, suffix = "view") {
+    const appId = universeAppId(row);
+    const universe = universeAppUniverse(row);
+    if (!state.sessionId || !state.token || !appId || !universe) return "";
+    return `/sessions/${encodeURIComponent(state.sessionId)}/infrastructure/universes/${encodeURIComponent(universe)}/apps/${encodeURIComponent(appId)}/${suffix}`;
+  }
+
+  function gatewayUniverseAppUrl(row = {}) {
+    const raw = String(row.url || row.view_url || row.proxy_url || row.metadata?.url || row.metadata?.view_url || row.metadata?.proxy_url || "");
+    let suffix = "view";
+    const appId = universeAppId(row);
+    const marker = appId ? `/apps/${appId}/proxy/` : "/proxy/";
+    const proxyIdx = raw.indexOf(marker);
+    if (proxyIdx >= 0) suffix = `proxy/${raw.slice(proxyIdx + marker.length)}`;
+    const path = gatewayUniverseAppPath(row, suffix);
+    if (!path) return "";
+    const sep = path.includes("?") ? "&" : "?";
+    return `${state.gatewayUrl}${path}${sep}token=${encodeURIComponent(state.token)}`;
+  }
+
+  function universeAppUrl(row = {}) {
+    const meta = row.metadata || {};
+    return gatewayUniverseAppUrl(row) || row.url || row.view_url || row.proxy_url || meta.url || meta.view_url || meta.proxy_url || "";
+  }
+
+  function universeAppBaseUrl(row = {}) {
+    const meta = row.metadata || {};
+    return String(row.universe_base_url || row.base_url || meta.universe_base_url || "").replace(/\/+$/, "");
+  }
+
+  function findUniverseAppRow(appId) {
+    const rows = (((currentInfrastructureSnapshot || {}).resources || {}).apps || []);
+    return rows.find((item) => String(universeAppId(item)) === String(appId || "") || String(item.id || "") === String(appId || ""));
+  }
+
+  function universeAppGuiPayload(row = {}) {
+    const url = universeAppUrl(row);
+    return {
+      id: universeAppId(row) || `universe_app_${Date.now()}`,
+      name: universeAppTitle(row),
+      kind: row.app_kind || row.kind || "universe_app",
+      url: url || "about:blank",
+      source: "gateway_infrastructure",
+      universe: row.universe || row.owner_id || row.system || "",
+      status: row.status || "unknown",
+      created_by: "gateway_ui",
+      description: row.description || row.metadata?.description || "",
+      metadata: { ...(row.metadata || {}), universe_app: row, universe_base_url: universeAppBaseUrl(row) },
+      session_id: state.sessionId || undefined,
+      host_status: row.status || "unknown",
+    };
+  }
+
+  async function openUniverseAppInGui(appId) {
+    const row = findUniverseAppRow(appId);
+    if (!row) throw new Error(`Universe app not found in current snapshot: ${appId}`);
+    const payload = universeAppGuiPayload(row);
+    const registered = await postLocalGui("/api/gui/apps/register", payload);
+    const registeredId = registered?.app?.id || payload.id;
+    const opened = await postLocalGui("/api/gui/workspace/open_app", { app_id: registeredId, url: payload.url });
+    if (els.feedback) els.feedback.textContent = `Opened Universe app ${payload.name} in GUI workspace.`;
+    return { registered, opened };
+  }
+
+  async function addUniverseAppToDashboard(appId) {
+    const row = findUniverseAppRow(appId);
+    if (!row) throw new Error(`Universe app not found in current snapshot: ${appId}`);
+    const payload = universeAppGuiPayload(row);
+    const registered = await postLocalGui("/api/gui/apps/register", payload);
+    const panel = await postLocalGui("/api/gui/dashboards/add_panel", {
+      id: `panel_${payload.id}`,
+      name: payload.name,
+      title: payload.name,
+      kind: payload.kind || "html",
+      url: payload.url,
+      source: "gateway_infrastructure",
+      universe: payload.universe,
+      created_by: "gateway_ui",
+      status: payload.status || "ready",
+      metadata: payload.metadata || {},
+      session_id: state.sessionId || undefined,
+      host_status: payload.host_status || payload.status || "unknown",
+      open_after_add: true,
+    });
+    if (els.feedback) els.feedback.textContent = `Added Universe app ${payload.name} to GUI dashboard.`;
+    return { registered, panel };
+  }
+
+  function renderUniverseAppResult(result = {}, op = "logs", cleanId = "") {
+    const app = result.app || result;
+    const fileLogs = result.file_logs || app.file_logs || {};
+    const lifecycleLogs = result.logs || app.logs || [];
+    const status = app.status || result.status || "unknown";
+    const pid = app.pid || result.pid || "";
+    const returncode = app.returncode ?? result.returncode;
+    const bits = [
+      `app=${cleanId || app.app_id || result.app_id || "unknown"}`,
+      `op=${op}`,
+      `status=${status}`,
+    ];
+    if (pid) bits.push(`pid=${pid}`);
+    if (returncode !== undefined && returncode !== null) bits.push(`returncode=${returncode}`);
+    if (result.universe) bits.push(`universe=${result.universe}`);
+    if (result.timestamp) bits.push(`at=${result.timestamp}`);
+    const sections = [];
+    sections.push(`Summary: ${bits.join(" · ")}`);
+    if (Array.isArray(lifecycleLogs) && lifecycleLogs.length) {
+      sections.push("\nLifecycle log:\n" + lifecycleLogs.join("\n"));
+    }
+    for (const label of ["stdout", "stderr"]) {
+      const lines = fileLogs && fileLogs[label];
+      if (Array.isArray(lines) && lines.length) {
+        sections.push(`\n${label.toUpperCase()} tail:\n${lines.join("\n")}`);
+      }
+    }
+    sections.push("\nRaw result:\n" + JSON.stringify(result, null, 2));
+    if (els.universeAppLogsSummary) els.universeAppLogsSummary.textContent = bits.join(" · ");
+    if (els.universeAppLogs) els.universeAppLogs.textContent = sections.join("\n");
+    return { summary: bits.join(" · "), text: sections.join("\n") };
+  }
+
+  async function universeAppLifecycle(appId, op) {
+    const row = findUniverseAppRow(appId);
+    if (!row) throw new Error(`Universe app not found in current snapshot: ${appId}`);
+    const cleanId = universeAppId(row);
+    let method = "POST";
+    let suffix = op;
+    if (op === "delete") {
+      if (!window.confirm(`Delete Universe app ${cleanId}?`)) return { ok: false, cancelled: true };
+      method = "DELETE";
+      suffix = "";
+    } else if (op === "logs") {
+      method = "GET";
+      suffix = "logs?tail=200";
+    }
+    const path = gatewayUniverseAppPath(row, suffix).replace(/\/$/, "");
+    if (!path) throw new Error(`Gateway-routed Universe app path missing for ${cleanId}; reconnect the Gateway session and refresh infrastructure.`);
+    const result = await httpJson(method, path);
+    renderUniverseAppResult(result, op, cleanId);
+    if (els.feedback) els.feedback.textContent = `Universe app ${op} completed for ${cleanId}.`;
+    if (op !== "logs") await refreshInfrastructure().catch(() => {});
+    return result;
+  }
+
+  function universeAppActionButtons(id, canOpen, canLifecycle) {
+    const openButtons = canOpen ? `<button class="wolf-gateway-ghost wolf-gateway-mini" type="button" data-gateway-universe-app-open="${escapeHtml(id)}">Open</button><button class="wolf-gateway-ghost wolf-gateway-mini" type="button" data-gateway-universe-app-dashboard="${escapeHtml(id)}">Dashboard</button>` : "";
+    const lifecycle = canLifecycle ? ["start", "stop", "restart", "logs", "delete"].map((op) => `<button class="wolf-gateway-ghost wolf-gateway-mini ${op === "delete" ? "danger" : ""}" type="button" data-gateway-universe-app-action="${op}" data-gateway-universe-app-id="${escapeHtml(id)}">${op[0].toUpperCase()}${op.slice(1)}</button>`).join("") : "";
+    return openButtons || lifecycle ? `${openButtons}${lifecycle}` : "no URL/base";
+  }
+
+  function renderUniverseAppsTable(snapshot = currentInfrastructureSnapshot) {
+    if (!els.universeAppsTable) return;
+    const rows = (((snapshot || {}).resources || {}).apps || []);
+    if (!rows.length) {
+      els.universeAppsTable.classList.add("wolf-gateway-empty");
+      els.universeAppsTable.textContent = "No Universe apps loaded.";
+      return;
+    }
+    els.universeAppsTable.classList.remove("wolf-gateway-empty");
+    els.universeAppsTable.innerHTML = `<table><thead><tr><th>App</th><th>Status</th><th>Universe</th><th>Kind</th><th>URL / metadata</th><th>Controls</th></tr></thead><tbody>${rows.map((r) => {
+      const id = universeAppId(r);
+      const url = universeAppUrl(r);
+      const canOpen = Boolean(url && !String(url).startsWith("about:"));
+      const canLifecycle = Boolean(universeAppBaseUrl(r) && id);
+      return `<tr class="app-${escapeHtml(infraTone(r))}"><td><code>${escapeHtml(id)}</code><br><small>${escapeHtml(universeAppTitle(r))}</small></td><td>${infraBadge(r.status || "unknown", infraTone(r))}</td><td>${escapeHtml(r.universe || r.owner_id || r.system || "")}</td><td>${escapeHtml(r.app_kind || r.kind || r.backend || "app")}</td><td>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>` : escapeHtml(JSON.stringify(r.metadata || {}).slice(0, 160))}</td><td class="wolf-gateway-infra-actions">${universeAppActionButtons(id, canOpen, canLifecycle)}</td></tr>`;
+    }).join("")}</tbody></table>`;
+    els.universeAppsTable.querySelectorAll("[data-gateway-universe-app-open]").forEach((button) => {
+      button.addEventListener("click", () => openUniverseAppInGui(button.getAttribute("data-gateway-universe-app-open") || "").catch((err) => {
+        if (els.feedback) els.feedback.textContent = `Open app failed: ${err.message || err}`;
+      }));
+    });
+    els.universeAppsTable.querySelectorAll("[data-gateway-universe-app-dashboard]").forEach((button) => {
+      button.addEventListener("click", () => addUniverseAppToDashboard(button.getAttribute("data-gateway-universe-app-dashboard") || "").catch((err) => {
+        if (els.feedback) els.feedback.textContent = `Add app to dashboard failed: ${err.message || err}`;
+      }));
+    });
+    els.universeAppsTable.querySelectorAll("[data-gateway-universe-app-action]").forEach((button) => {
+      button.addEventListener("click", () => universeAppLifecycle(button.getAttribute("data-gateway-universe-app-id") || "", button.getAttribute("data-gateway-universe-app-action") || "logs").catch((err) => {
+        if (els.feedback) els.feedback.textContent = `Universe app action failed: ${err.message || err}`;
+      }));
+    });
+  }
+
+  function renderUniversesTable(snapshot = currentInfrastructureSnapshot) {
+    if (!els.universesTable) return;
+    const rows = (((snapshot || {}).resources || {}).universes || []);
+    if (!rows.length) {
+      els.universesTable.classList.add("wolf-gateway-empty");
+      els.universesTable.textContent = "No Universes loaded.";
+      return;
+    }
+    els.universesTable.classList.remove("wolf-gateway-empty");
+    els.universesTable.innerHTML = `<table><thead><tr><th>Name</th><th>Status</th><th>Locality</th><th>Owner</th><th>Endpoint / metadata</th></tr></thead><tbody>${rows.map((r) => {
+      const meta = r.metadata || {};
+      const endpoint = meta.url || (meta.host && meta.port ? `${meta.host}:${meta.port}` : "");
+      return `<tr><td><code>${escapeHtml(r.name || r.id || "")}</code></td><td>${infraBadge(r.status || "unknown", r.status === "ready" ? "info" : "warning")}</td><td>${escapeHtml(r.locality || "")}</td><td>${escapeHtml(r.owner_type || "")}:${escapeHtml(r.owner_id || "")}</td><td>${escapeHtml(endpoint || JSON.stringify(meta).slice(0, 180))}</td></tr>`;
+    }).join("")}</tbody></table>`;
+  }
+
+  function renderDeploymentsTable(snapshot = currentInfrastructureSnapshot) {
+    if (!els.deploymentsTable) return;
+    const rows = (snapshot || {}).managed_deployments || (currentDeploymentSnapshot || {}).deployments || [];
+    if (!rows.length) {
+      els.deploymentsTable.classList.add("wolf-gateway-empty");
+      els.deploymentsTable.textContent = "No deployments loaded.";
+      return;
+    }
+    els.deploymentsTable.classList.remove("wolf-gateway-empty");
+    els.deploymentsTable.innerHTML = `<table><thead><tr><th>Name</th><th>Backend</th><th>Status</th><th>Endpoint</th><th>Registry</th><th>PID</th><th>Logs</th></tr></thead><tbody>${rows.map((r) => {
+      const id = r.deployment_id || r.name || "";
+      return `<tr class="deployment-${escapeHtml(infraTone(r))}"><td><code>${escapeHtml(id)}</code></td><td>${escapeHtml(r.backend || "unknown")}</td><td>${infraBadge(r.status || "unknown", infraTone(r))}${r.endpoint_mismatch ? ` ${infraBadge("endpoint mismatch", "warning")}` : ""}</td><td>${escapeHtml(infraEndpointText(r))}<br><small>${escapeHtml(r.endpoint_source || "unknown")}</small></td><td>${escapeHtml((r.registry_endpoint || {}).host || "")} ${escapeHtml((r.registry_endpoint || {}).port || "")}</td><td>${escapeHtml(r.pid || "")}</td><td>${r.can_view_logs ? `<button class="wolf-gateway-ghost wolf-gateway-mini" type="button" data-gateway-deployment-logs="${escapeHtml(id)}">Logs</button>` : "no logs"}</td></tr>`;
+    }).join("")}</tbody></table>`;
+    els.deploymentsTable.querySelectorAll("[data-gateway-deployment-logs]").forEach((button) => {
+      button.addEventListener("click", () => fetchDeploymentLogs(button.getAttribute("data-gateway-deployment-logs") || "").catch((err) => {
+        if (els.feedback) els.feedback.textContent = `Deployment logs failed: ${err.message || err}`;
+      }));
+    });
+  }
+
+  function renderInfrastructurePanel() {
+    const snap = currentInfrastructureSnapshot || {};
+    const counts = snap.resource_counts || {};
+    const depCounts = snap.deployment_counts || (currentDeploymentSnapshot || {}).deployment_counts || {};
+    infraSetText(els.infraMetricUniverses, counts.universes || 0);
+    infraSetText(els.infraMetricApps, counts.apps || 0);
+    infraSetText(els.infraMetricDeployments, depCounts.total || 0);
+    infraSetText(els.infraMetricWarnings, (snap.warnings || []).length || 0);
+    infraSetText(els.infraMetricEndpointIssues, depCounts.endpoint_mismatch || 0);
+    if (els.infraNotice) {
+      els.infraNotice.textContent = currentInfrastructureSnapshot
+        ? `Infrastructure snapshot loaded ${snap.timestamp || ""}. Deployments are lifecycle handles; Universes are interaction endpoints.`
+        : "Connect a Gateway session, then refresh infrastructure.";
+      els.infraNotice.className = `wolf-gateway-infra-notice ${depCounts.endpoint_mismatch ? "warning" : ""}`.trim();
+    }
+    renderUniversesTable(snap);
+    renderUniverseAppsTable(snap);
+    renderDeploymentsTable(snap);
+    if (els.infraRaw) els.infraRaw.textContent = currentInfrastructureSnapshot ? JSON.stringify(currentInfrastructureSnapshot, null, 2) : "";
+  }
+
+  async function refreshInfrastructure() {
+    if (!state.sessionId) throw new Error("Select/connect a session first.");
+    currentInfrastructureSnapshot = await httpJson("GET", `/sessions/${encodeURIComponent(state.sessionId)}/infrastructure/snapshot`);
+    currentDeploymentSnapshot = {
+      type: "deployment_snapshot",
+      deployments: currentInfrastructureSnapshot.managed_deployments || [],
+      deployment_counts: currentInfrastructureSnapshot.deployment_counts || {},
+    };
+    renderInfrastructurePanel();
+    if (els.feedback) els.feedback.textContent = "Infrastructure snapshot loaded.";
+    return currentInfrastructureSnapshot;
+  }
+
+  async function refreshDeployments() {
+    if (!state.sessionId) throw new Error("Select/connect a session first.");
+    currentDeploymentSnapshot = await httpJson("GET", `/sessions/${encodeURIComponent(state.sessionId)}/infrastructure/deployments`);
+    if (currentInfrastructureSnapshot) {
+      currentInfrastructureSnapshot.managed_deployments = currentDeploymentSnapshot.deployments || [];
+      currentInfrastructureSnapshot.deployment_counts = currentDeploymentSnapshot.deployment_counts || {};
+    }
+    renderInfrastructurePanel();
+    if (els.feedback) els.feedback.textContent = "Deployment snapshot loaded.";
+    return currentDeploymentSnapshot;
+  }
+
+  async function fetchDeploymentLogs(deploymentId) {
+    if (!state.sessionId) throw new Error("Select/connect a session first.");
+    if (!deploymentId) throw new Error("Missing deployment id.");
+    const logs = await httpJson("GET", `/sessions/${encodeURIComponent(state.sessionId)}/infrastructure/deployments/${encodeURIComponent(deploymentId)}/logs?tail=200`);
+    if (els.deploymentLogs) els.deploymentLogs.textContent = JSON.stringify(logs, null, 2);
+    if (els.feedback) els.feedback.textContent = `Loaded logs for ${deploymentId}.`;
+    return logs;
+  }
+
   async function saveParams() {
     if (!state.sessionId) throw new Error("Select/connect a session first.");
     syncRawFromForm();
@@ -1365,7 +1962,8 @@
     applyParamsToForm(currentParams);
     if (els.paramsEditor) els.paramsEditor.value = JSON.stringify(currentParams, null, 2);
     addMessage("system", `Agent params committed: ${JSON.stringify(result.updated_params || updates)}`, { gateway_result: result, compact: true });
-    reconnectAfterConfig("Agent params committed.");
+    if (result.runtime_recreated) reconnectAfterConfig("Agent params committed.");
+    else markConfigCommittedNoReconnect("Agent params committed.", result);
   }
 
   async function showPolicy() {
@@ -1454,6 +2052,8 @@
   els.agentPresetSelect?.addEventListener("change", () => { try { window.localStorage?.setItem(PRESET_SELECTED_KEY, els.agentPresetSelect.value || ""); } catch (_) {} });
   els.showPolicy?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await showPolicy(); } catch (error) { if (els.feedback) els.feedback.textContent = `Fetch policy params failed: ${error.message}`; } }, true);
   els.savePolicy?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await savePolicy(); } catch (error) { if (els.feedback) els.feedback.textContent = `Commit policy params failed: ${error.message}`; } }, true);
+  els.infraRefresh?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await refreshInfrastructure(); } catch (error) { if (els.feedback) els.feedback.textContent = `Fetch infrastructure failed: ${error.message}`; } }, true);
+  els.deploymentsRefresh?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await refreshDeployments(); } catch (error) { if (els.feedback) els.feedback.textContent = `Fetch deployments failed: ${error.message}`; } }, true);
   els.resetSession?.addEventListener("click", async (ev) => { ev.preventDefault(); try { await resetSession(); } catch (error) { if (els.feedback) els.feedback.textContent = `Reset failed: ${error.message}`; } }, true);
   els.agentPauseRun?.addEventListener("click", (ev) => { ev.preventDefault(); if (!sendGatewayControl("pause_after_step")) addMessage("system", "Gateway websocket is not open. Reconnect the selected session.", { tone: "error" }); }, true);
   els.agentResumeRun?.addEventListener("click", (ev) => { ev.preventDefault(); if (!sendGatewayControl("resume")) addMessage("system", "Gateway websocket is not open. Reconnect the selected session.", { tone: "error" }); }, true);
@@ -1492,7 +2092,7 @@
     }
   }, true);
 
-  window.WolfGatewayUI = { open, close, render, authenticate, refreshSessions, connectSession, showParams, saveParams, showPolicy, savePolicy, resetSession, applyParamsToForm, formToParams, syncRawFromForm, state: () => ({ ...state, token: state.token ? "***redacted***" : "" }), sendChat: sendGatewayChat };
+  window.WolfGatewayUI = { open, close, render, authenticate, refreshSessions, connectSession, showParams, saveParams, showPolicy, savePolicy, resetSession, applyParamsToForm, formToParams, syncRawFromForm, state: () => ({ ...state, token: state.token ? "***redacted***" : "" }), sendChat: sendGatewayChat, sendPermissionDecision, refreshInfrastructure, refreshDeployments, openUniverseAppInGui, addUniverseAppToDashboard, universeAppLifecycle };
   render();
   console.info("[wolf-gateway-ui] standalone TUI-parity gateway client installed");
 })();
@@ -1541,8 +2141,14 @@
     }
     tabs.forEach(function (tab) {
       tab.addEventListener('click', function () {
-        setTab(tab.dataset.gatewayTab || 'connect');
+        const nextTab = tab.dataset.gatewayTab || 'connect';
+        setTab(nextTab);
         refreshLocks();
+        if (nextTab === 'infrastructure' && window.WolfGatewayUI && typeof window.WolfGatewayUI.refreshInfrastructure === 'function') {
+          window.WolfGatewayUI.refreshInfrastructure().catch(function (error) {
+            if (feedback) feedback.textContent = 'Fetch infrastructure failed: ' + (error && error.message ? error.message : error);
+          });
+        }
       });
     });
     if (sessionStep && window.MutationObserver) {

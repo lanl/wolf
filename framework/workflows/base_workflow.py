@@ -1,6 +1,6 @@
 import copy
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from pydantic import TypeAdapter
 import json
 import os
@@ -80,7 +80,11 @@ class BaseWorkflow:
                  WF_VERBOSE: int                     = 0
                  ):
         self.WF_TAG = WF_TAG
+        infra.WF_TAG = WF_TAG
         self.WF_VERBOSE = WF_VERBOSE
+        self.workflow_events: List[Dict[str, Any]] = []
+        self.workflow_event_listeners: List[Callable[[Dict[str, Any]], Any]] = []
+        self.max_workflow_events = int(os.environ.get("WOLF_MAX_WORKFLOW_EVENTS", "500") or 500)
         if session is None: # Starting a completely new session
             console.print(f"[+] STARTING NEW SESSION")
             self.session = BaseSession(
@@ -101,6 +105,90 @@ class BaseWorkflow:
         # Load Session
         self.load_session_state()
         print(f"[+][{self.WF_TAG}]: Session Loaded OK")
+
+    # -----------------------------------------------------------------
+    # Workflow event streaming / observability
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _redact_event_value(value: Any, key: str = "") -> Any:
+        sensitive = ("api_key", "apikey", "token", "password", "secret", "authorization")
+        if any(s in str(key).lower() for s in sensitive):
+            return "***REDACTED***" if value not in (None, "") else value
+        if isinstance(value, dict):
+            return {str(k): BaseWorkflow._redact_event_value(v, str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [BaseWorkflow._redact_event_value(v, key) for v in value]
+        if isinstance(value, tuple):
+            return [BaseWorkflow._redact_event_value(v, key) for v in value]
+        return value
+
+    def add_event_listener(self, listener: Callable[[Dict[str, Any]], Any]) -> None:
+        """Register a workflow-event listener.
+
+        Listeners receive redacted event dictionaries. The default workflow path
+        does not require listeners; this hook is intended for gateway/GUI/TUI,
+        logs, and benchmark recorders. Listener exceptions are swallowed and
+        recorded as local workflow_event_listener_error entries so event
+        streaming cannot break task execution.
+        """
+        if listener not in self.workflow_event_listeners:
+            self.workflow_event_listeners.append(listener)
+
+    def remove_event_listener(self, listener: Callable[[Dict[str, Any]], Any]) -> None:
+        try:
+            self.workflow_event_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def emit_event(self, event_type: str, status: str | None = None, **metadata: Any) -> Dict[str, Any]:
+        """Emit a workflow lifecycle event without mutating chat history.
+
+        This is intentionally separate from ``update_history``: progress events
+        should improve perceived responsiveness without polluting durable chat
+        context, forcing session snapshots, or changing LLM prompt inputs. That
+        makes workflow-event streaming cache-neutral.
+        """
+        event: Dict[str, Any] = {
+            "type": str(event_type or "workflow_event"),
+            "status": status,
+            "workflow": getattr(self, "WF_TAG", type(self).__name__),
+            "timestamp": datetime.now().isoformat(),
+        }
+        try:
+            event["session_dir"] = getattr(getattr(self, "infra", None), "session_dir", None)
+        except Exception:
+            pass
+        event.update(metadata or {})
+        event = self._redact_event_value(event)
+
+        events = getattr(self, "workflow_events", None)
+        if not isinstance(events, list):
+            events = []
+            self.workflow_events = events
+        events.append(event)
+        max_events = max(1, int(getattr(self, "max_workflow_events", 500) or 500))
+        if len(events) > max_events:
+            self.workflow_events = events[-max_events:]
+
+        for listener in list(getattr(self, "workflow_event_listeners", []) or []):
+            try:
+                listener(event)
+            except Exception as exc:
+                # Do not recursively call emit_event here; keep listener failure
+                # reporting local and side-effect-light.
+                self.workflow_events.append({
+                    "type": "workflow_event_listener_error",
+                    "status": "error",
+                    "workflow": getattr(self, "WF_TAG", type(self).__name__),
+                    "timestamp": datetime.now().isoformat(),
+                    "listener": getattr(listener, "__name__", str(listener)),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+        return event
+
+    def get_recent_workflow_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        events = list(getattr(self, "workflow_events", []) or [])
+        return events[-max(1, int(limit or 50)):]
 
     # -----------------------------------------------------------------
     # Session state management (NEW IMPLEMENTATION)
@@ -262,6 +350,7 @@ class BaseWorkflow:
             # Metadata
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'session_dir': self.infra.session_dir,
+            'workflow_events': self.get_recent_workflow_events(limit=200),
             
             # TODO: Add serializable representations of agent/workers/objects
             # For now, store minimal info to identify them
@@ -343,6 +432,10 @@ class BaseWorkflow:
         
         # Extract infrastructure components
         self.infra = infra
+        if not hasattr(self, "workflow_events"):
+            self.workflow_events = []
+        if not hasattr(self, "workflow_event_listeners"):
+            self.workflow_event_listeners = []
         self.agent = infra.agent
         self.workers = infra.workers
         self.objects = infra.objects

@@ -3,21 +3,46 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import os
 from pathlib import Path
+from datetime import datetime, timezone
+import uuid
+import subprocess
+import tempfile
+import shlex
+import asyncio
+from urllib.parse import quote, unquote
 
 import chromadb
+import requests
+import websockets
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field, AliasChoices
 
 from framework.agentic.agentic_tools import NameGenerator
 from framework.knowledgebase.data_models import KnowledgeBaseParams, MultimodalKnowledgeBaseParams
 from framework.knowledgebase.knowledge_base import KnowledgeBase
 from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnowledgeBase
 from framework.universes.data_models import BaseUniverseModel, BaseUniverseParams, base_universe_params_type
+from framework.universes.status_files import write_status_atomic
 from framework.tooling.toolbox import ToolBox
 from framework.tooling.tools import Tool, ToolCard
 from framework.tooling.tool_models import ToolMeta
+from framework.universes.app_templates import list_app_templates as _list_app_templates, get_app_template as _get_app_template, render_app_template
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_app_id(value: str | None = None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raw = f"app_{uuid.uuid4().hex[:10]}"
+    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in raw)
+    cleaned = cleaned.strip("_").lower()
+    return cleaned or f"app_{uuid.uuid4().hex[:10]}"
 
 
 class BaseUniverse:
@@ -40,6 +65,8 @@ class BaseUniverse:
         info, kbs, tbs = self.params.info, self.params.kbs, self.params.tbs
         self.KBs: Dict[str, KnowledgeBase | MultimodalKnowledgeBase] = dict(kbs or {})
         self.TBs: Dict[str, ToolBox] = dict(tbs or {})
+        self.Apps: Dict[str, UniverseAppManifest] = {}
+        self.AppProcesses: Dict[str, subprocess.Popen] = {}
         self.info = info
         self.name = "NAMELESS"
         if info is not None:
@@ -90,6 +117,19 @@ class BaseUniverse:
             # Tool listings
             "get_available_tools",
             "get_toolbox_tools",
+            # Universe app registry/lifecycle ops
+            "list_apps",
+            "register_app",
+            "get_app",
+            "start_app",
+            "stop_app",
+            "restart_app",
+            "delete_app",
+            "app_logs",
+            # Universe app template ops
+            "list_app_templates",
+            "get_app_template",
+            "instantiate_app_template",
         ]
 
     def get_info(self) -> Dict[str, Any]:
@@ -98,6 +138,7 @@ class BaseUniverse:
             "node_info": self.info,
             "kbs": self.list_kbs(),
             "tbs": self.list_tbs(),
+            "apps": self.list_apps(),
             "allowed_actions": self.allowed_actions(),
         }
 
@@ -110,6 +151,7 @@ class BaseUniverse:
             "tbs": tb_stats,
             "num_kbs": len(self.KBs),
             "num_tbs": len(self.TBs),
+            "num_apps": len(self.Apps),
         }
 
     # -----------------------------
@@ -275,6 +317,445 @@ class BaseUniverse:
         return self.get_tb(name).get_stats()
 
     # -----------------------------
+    # Universe app registry / lifecycle helpers
+    # -----------------------------
+    def list_apps(self) -> List[Dict[str, Any]]:
+        for key in list(self.Apps.keys()):
+            self._refresh_app_process_state(key)
+        return [self.Apps[name].model_dump(mode="json", exclude_none=True) for name in sorted(self.Apps)]
+
+    def register_app(self, app: "UniverseAppManifest | Dict[str, Any]") -> Dict[str, Any]:
+        if isinstance(app, dict):
+            data = dict(app)
+            if not data.get("app_id"):
+                data["app_id"] = data.get("id") or data.get("name") or data.get("title")
+            app = UniverseAppManifest.model_validate(data)
+        app.app_id = _safe_app_id(app.app_id)
+        if not app.title:
+            app.title = app.app_id
+        if not app.url:
+            if app.allow_proxy and (app.proxy_url or app.websocket_url or app.internal_port):
+                app.url = f"/apps/{app.app_id}/proxy/"
+            else:
+                app.url = f"/apps/{app.app_id}/view" if app.static_dir else f"/apps/{app.app_id}"
+        now = _utc_now_iso()
+        if not app.created_at:
+            app.created_at = now
+        app.updated_at = now
+        if not app.status:
+            app.status = "registered"
+        self.Apps[app.app_id] = app
+        return app.model_dump(mode="json", exclude_none=True)
+
+    def get_app(self, app_id: str) -> Dict[str, Any]:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        self._refresh_app_process_state(key)
+        return self.Apps[key].model_dump(mode="json", exclude_none=True)
+
+    def _resolve_static_app_file(self, app_id: str, rel_path: str | None = None) -> Path:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        app = self.Apps[key]
+        if not app.static_dir:
+            raise FileNotFoundError(f"Universe app {key} does not define static_dir")
+        root = Path(app.static_dir).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            raise FileNotFoundError(f"Static app directory not found: {root}")
+        requested = rel_path or app.index_file or "index.html"
+        requested = str(requested).lstrip("/") or (app.index_file or "index.html")
+        target = (root / requested).resolve()
+        if target != root and root not in target.parents:
+            raise PermissionError("Static app path escapes app root")
+        if target.is_dir():
+            target = (target / (app.index_file or "index.html")).resolve()
+            if target != root and root not in target.parents:
+                raise PermissionError("Static app path escapes app root")
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError(f"Static app file not found: {requested}")
+        return target
+
+
+    def _app_proxy_base_url(self, app_id: str) -> str:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        app = self.Apps[key]
+        if not app.allow_proxy:
+            raise PermissionError("Universe app proxying is disabled for this app; set allow_proxy=true in the manifest")
+        base = str(app.proxy_url or "").strip()
+        if not base and app.internal_port:
+            base = f"http://127.0.0.1:{int(app.internal_port)}"
+        if not base:
+            raise FileNotFoundError(f"Universe app {key} does not define proxy_url or internal_port")
+        if not (base.startswith("http://") or base.startswith("https://")):
+            raise ValueError("proxy_url must start with http:// or https://")
+        return base.rstrip("/")
+
+    def _safe_proxy_rel_path(self, rel_path: str | None) -> str:
+        """Return a URL-encoded relative proxy path that cannot escape proxy_url's base path."""
+        raw = str(rel_path or "").replace("\\", "/").lstrip("/")
+        safe_segments: List[str] = []
+        for segment in raw.split("/"):
+            decoded = unquote(segment)
+            if decoded in {"", "."}:
+                continue
+            if decoded == "..":
+                raise PermissionError("Proxy path may not contain parent-directory segments")
+            safe_segments.append(quote(decoded, safe="!$&'()*+,;=:@"))
+        return "/".join(safe_segments)
+
+    def _app_websocket_base_url(self, app_id: str) -> str:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        app = self.Apps[key]
+        if not app.allow_proxy:
+            raise PermissionError("Universe app proxying is disabled for this app; set allow_proxy=true in the manifest")
+        base = str(app.websocket_url or "").strip()
+        if not base:
+            base = self._app_proxy_base_url(key)
+        if base.startswith("http://"):
+            base = "ws://" + base[len("http://"):]
+        elif base.startswith("https://"):
+            base = "wss://" + base[len("https://"):]
+        elif not (base.startswith("ws://") or base.startswith("wss://")):
+            raise ValueError("websocket_url must start with ws://, wss://, http://, or https://")
+        return base.rstrip("/")
+
+    def _app_websocket_target_url(self, app_id: str, rel_path: str | None = None, query_string: str = "") -> str:
+        base = self._app_websocket_base_url(app_id)
+        safe_path = self._safe_proxy_rel_path(rel_path)
+        target = f"{base}/" + safe_path
+        if query_string:
+            target = f"{target}?{query_string}"
+        return target
+
+    @staticmethod
+    def _websocket_forward_headers(websocket: WebSocket) -> List[tuple[str, str]]:
+        hop_by_hop = {
+            "host",
+            "connection",
+            "upgrade",
+            "sec-websocket-key",
+            "sec-websocket-version",
+            "sec-websocket-extensions",
+            "sec-websocket-protocol",
+            "content-length",
+            "proxy-authorization",
+            "proxy-authenticate",
+        }
+        return [(k, v) for k, v in websocket.headers.items() if k.lower() not in hop_by_hop]
+
+    @staticmethod
+    def _websocket_requested_subprotocols(websocket: WebSocket) -> List[str]:
+        raw = str(websocket.headers.get("sec-websocket-protocol") or "")
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    async def proxy_app_websocket(self, app_id: str, rel_path: str, websocket: WebSocket, *, query_string: Optional[str] = None) -> None:
+        """Bidirectionally proxy one client WebSocket to a Universe app target.
+
+        This is the HTTP-proxy companion needed by Trame/wslink-style apps. The
+        app must opt in with allow_proxy=true and provide websocket_url, proxy_url,
+        or internal_port. Gateway callers can pass a sanitized query_string so
+        Gateway auth tokens are not forwarded to the app.
+        """
+        target_url = self._app_websocket_target_url(
+            app_id,
+            rel_path,
+            websocket.url.query if query_string is None else query_string,
+        )
+        requested_subprotocols = self._websocket_requested_subprotocols(websocket)
+        try:
+            async with websockets.connect(
+                target_url,
+                additional_headers=self._websocket_forward_headers(websocket),
+                proxy=None,
+                max_size=None,
+                subprotocols=requested_subprotocols or None,
+            ) as upstream:
+                await websocket.accept(subprotocol=getattr(upstream, "subprotocol", None))
+                async def client_to_upstream() -> None:
+                    while True:
+                        message = await websocket.receive()
+                        if message.get("type") == "websocket.disconnect":
+                            await upstream.close()
+                            return
+                        if message.get("bytes") is not None:
+                            await upstream.send(message["bytes"])
+                        elif message.get("text") is not None:
+                            await upstream.send(message["text"])
+
+                async def upstream_to_client() -> None:
+                    async for message in upstream:
+                        if isinstance(message, bytes):
+                            await websocket.send_bytes(message)
+                        else:
+                            await websocket.send_text(message)
+
+                tasks = {
+                    asyncio.create_task(client_to_upstream()),
+                    asyncio.create_task(upstream_to_client()),
+                }
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    exc = task.exception()
+                    if exc and not isinstance(exc, WebSocketDisconnect):
+                        raise exc
+        except WebSocketDisconnect:
+            return
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+    def proxy_app_http(self, app_id: str, rel_path: str, method: str, *, query_string: str = "", body: bytes = b"", headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        base = self._app_proxy_base_url(app_id)
+        safe_path = self._safe_proxy_rel_path(rel_path)
+        target = f"{base}/" + safe_path
+        if query_string:
+            target = f"{target}?{query_string}"
+        forward_headers = {}
+        for key, value in (headers or {}).items():
+            lk = key.lower()
+            if lk in {"host", "content-length", "connection", "transfer-encoding", "upgrade", "proxy-authorization", "proxy-authenticate"}:
+                continue
+            forward_headers[key] = value
+        resp = requests.request(
+            method=str(method or "GET").upper(),
+            url=target,
+            data=body if body else None,
+            headers=forward_headers,
+            timeout=30,
+            allow_redirects=False,
+        )
+        response_headers = {}
+        for key, value in resp.headers.items():
+            lk = key.lower()
+            if lk in {"content-length", "transfer-encoding", "connection", "content-encoding"}:
+                continue
+            response_headers[key] = value
+        return {
+            "status_code": resp.status_code,
+            "content": resp.content,
+            "headers": response_headers,
+            "media_type": resp.headers.get("content-type"),
+            "target_url": target,
+        }
+
+
+    def _managed_app_argv(self, app: "UniverseAppManifest") -> Optional[List[str]]:
+        if app.command_args:
+            return [str(x) for x in app.command_args]
+        if app.entrypoint:
+            return shlex.split(str(app.entrypoint))
+        return None
+
+    def _app_log_dir(self) -> Path:
+        root = Path(tempfile.gettempdir()) / "wolf_universe_apps" / _safe_app_id(getattr(self.info, "name", "universe"))
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _refresh_app_process_state(self, key: str) -> None:
+        app = self.Apps.get(key)
+        proc = self.AppProcesses.get(key)
+        if app is None or proc is None:
+            return
+        rc = proc.poll()
+        app.pid = proc.pid
+        app.returncode = rc
+        if rc is not None and app.status in {"running", "starting", "restarting"}:
+            app.status = "exited" if rc == 0 else "failed"
+            app.updated_at = _utc_now_iso()
+            app.logs.append(f"{app.updated_at} process exited returncode={rc}")
+            app.logs = app.logs[-200:]
+            self.AppProcesses.pop(key, None)
+
+    def start_app(self, app_id: str) -> Dict[str, Any]:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        self._refresh_app_process_state(key)
+        app = self.Apps[key]
+        existing = self.AppProcesses.get(key)
+        if existing is not None and existing.poll() is None:
+            app.status = "running"
+            app.pid = existing.pid
+            app.returncode = None
+            app.updated_at = _utc_now_iso()
+            return app.model_dump(mode="json", exclude_none=True)
+
+        argv = self._managed_app_argv(app)
+        if not argv:
+            return self.set_app_status(key, "running")
+
+        log_dir = self._app_log_dir()
+        stdout_path = log_dir / f"{key}.stdout.log"
+        stderr_path = log_dir / f"{key}.stderr.log"
+        env = os.environ.copy()
+        env.update({str(k): str(v) for k, v in (app.env or {}).items()})
+        stdout_f = open(stdout_path, "ab")
+        stderr_f = open(stderr_path, "ab")
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=app.cwd or None,
+                env=env,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                stdin=subprocess.DEVNULL,
+                shell=False,
+                start_new_session=True,
+            )
+        except Exception:
+            stdout_f.close()
+            stderr_f.close()
+            raise
+        stdout_f.close()
+        stderr_f.close()
+        self.AppProcesses[key] = proc
+        app.pid = proc.pid
+        app.returncode = None
+        app.stdout_log = str(stdout_path)
+        app.stderr_log = str(stderr_path)
+        app.status = "running"
+        app.updated_at = _utc_now_iso()
+        app.logs.append(f"{app.updated_at} started pid={proc.pid} argv={argv!r}")
+        app.logs = app.logs[-200:]
+        return app.model_dump(mode="json", exclude_none=True)
+
+    def stop_app(self, app_id: str, timeout: float = 5.0) -> Dict[str, Any]:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        app = self.Apps[key]
+        proc = self.AppProcesses.get(key)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=max(0.1, float(timeout or 5.0)))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            app.returncode = proc.returncode
+            app.logs.append(f"{_utc_now_iso()} stopped pid={proc.pid} returncode={proc.returncode}")
+            self.AppProcesses.pop(key, None)
+        app.pid = None
+        app.status = "stopped"
+        app.updated_at = _utc_now_iso()
+        app.logs.append(f"{app.updated_at} status=stopped")
+        app.logs = app.logs[-200:]
+        return app.model_dump(mode="json", exclude_none=True)
+
+    def restart_app(self, app_id: str) -> Dict[str, Any]:
+        key = _safe_app_id(app_id)
+        self.stop_app(key)
+        app = self.Apps[key]
+        app.status = "restarting"
+        app.updated_at = _utc_now_iso()
+        app.logs.append(f"{app.updated_at} status=restarting")
+        return self.start_app(key)
+
+    def set_app_status(self, app_id: str, status: str) -> Dict[str, Any]:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        self._refresh_app_process_state(key)
+        app = self.Apps[key]
+        app.status = str(status or "unknown")
+        app.updated_at = _utc_now_iso()
+        app.logs.append(f"{app.updated_at} status={app.status}")
+        app.logs = app.logs[-200:]
+        return app.model_dump(mode="json", exclude_none=True)
+
+    def delete_app(self, app_id: str) -> bool:
+        key = _safe_app_id(app_id)
+        if key in self.Apps:
+            try:
+                self.stop_app(key)
+            except Exception:
+                pass
+        self.AppProcesses.pop(key, None)
+        return self.Apps.pop(key, None) is not None
+
+    def app_logs(self, app_id: str, tail: int = 200) -> Dict[str, Any]:
+        key = _safe_app_id(app_id)
+        if key not in self.Apps:
+            raise KeyError(f"Unknown Universe app: {app_id}")
+        self._refresh_app_process_state(key)
+        app = self.Apps[key]
+        limit = max(1, int(tail or 200))
+        lines = list(app.logs or [])
+        file_logs: Dict[str, List[str]] = {}
+        for label, path_s in (("stdout", app.stdout_log), ("stderr", app.stderr_log)):
+            if path_s and Path(path_s).exists():
+                try:
+                    file_lines = Path(path_s).read_text(errors="replace").splitlines()
+                except Exception as exc:
+                    file_lines = [f"<error reading {label} log: {exc}>"]
+                file_logs[label] = file_lines[-limit:]
+        return {
+            "app_id": key,
+            "logs": lines[-limit:],
+            "file_logs": file_logs,
+            "managed_process": bool(self._managed_app_argv(app)),
+            "pid": app.pid,
+            "returncode": app.returncode,
+            "status": app.status,
+        }
+
+    def list_app_templates(self) -> List[Dict[str, Any]]:
+        return _list_app_templates()
+
+    def get_app_template(self, template_id: str) -> Dict[str, Any]:
+        return _get_app_template(template_id).model_dump(mode="json")
+
+    def instantiate_app_template(
+        self,
+        template_id: str,
+        *,
+        app_id: str | None = None,
+        title: str | None = None,
+        output_dir: str,
+        context: Optional[Dict[str, Any]] = None,
+        auto_register: bool = True,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        safe_id = _safe_app_id(app_id or title or template_id)
+        rendered = render_app_template(
+            template_id,
+            output_dir=output_dir,
+            app_id=safe_id,
+            title=title,
+            context=context or {},
+            overwrite=overwrite,
+        )
+        manifest = dict(rendered["manifest"])
+        manifest["app_id"] = safe_id
+        result: Dict[str, Any] = {
+            "ok": True,
+            "template_id": template_id,
+            "app_id": safe_id,
+            "files": rendered["files"],
+            "manifest": manifest,
+            "registered": False,
+        }
+        if auto_register:
+            app = self.register_app(manifest)
+            result["registered"] = True
+            result["app"] = app
+            result["view_url"] = app.get("url")
+            result["asset_base_url"] = f"/apps/{safe_id}/files/"
+        return result
+
+
+
+    # -----------------------------
     # Tool listing helpers
     # -----------------------------
     def get_available_tools(self) -> List[Dict[str, Any]]:
@@ -300,6 +781,51 @@ class BaseUniverse:
 # --------------------
 # FastAPI models
 # --------------------
+class UniverseAppManifest(BaseModel):
+    app_id: str = Field(default="", description="Stable app id unique within this Universe")
+    title: str = Field(default="", description="Human-readable app title")
+    kind: str = Field(default="custom", description="App kind, e.g. plot, table, mesh, cad, trame_mesh, video, audio, report")
+    backend: str = Field(default="url", description="App backend/type, e.g. url, static, process, trame, proxy")
+    status: str = Field(default="registered", description="App lifecycle status")
+    url: str = Field(default="", description="App URL. Relative URLs are resolved against the Universe base URL by clients/actions")
+    description: str = ""
+    artifacts: List[str] = Field(default_factory=list)
+    preferred_panel: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Phase 2 managed-process metadata. command_args is preferred because it is
+    # executed with shell=False. entrypoint is split with shlex for compatibility.
+    command_args: Optional[List[str]] = Field(default=None, description="Managed-process argv executed with shell=False")
+    entrypoint: Optional[str] = Field(default=None, description="Compatibility command string, split with shlex and executed with shell=False")
+    cwd: Optional[str] = Field(default=None, description="Optional working directory for managed process apps")
+    env: Dict[str, str] = Field(default_factory=dict, description="Optional environment overrides for managed process apps")
+    internal_port: Optional[int] = Field(default=None, description="Internal app port, if known")
+    static_dir: Optional[str] = Field(default=None, description="Directory containing static app files served under /apps/{app_id}/files")
+    index_file: str = Field(default="index.html", description="Static app index file served by /apps/{app_id}/view")
+    proxy_url: Optional[str] = Field(default=None, description="Base URL for HTTP proxy-backed apps")
+    websocket_url: Optional[str] = Field(default=None, description="Optional explicit ws:// or wss:// base URL for WebSocket proxy-backed apps")
+    allow_proxy: bool = Field(default=False, description="Explicit opt-in required to proxy HTTP requests to proxy_url/internal_port")
+    pid: Optional[int] = Field(default=None, description="Running managed-process PID, if any")
+    returncode: Optional[int] = Field(default=None, description="Last managed-process return code")
+    stdout_log: Optional[str] = Field(default=None, description="Path to stdout log for managed process apps")
+    stderr_log: Optional[str] = Field(default=None, description="Path to stderr log for managed process apps")
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    logs: List[str] = Field(default_factory=list)
+
+
+class UniverseAppStatusRequest(BaseModel):
+    status: Optional[str] = Field(default=None, description="Optional explicit status override")
+
+
+class InstantiateAppTemplateRequest(BaseModel):
+    app_id: Optional[str] = Field(default=None, description="Stable app id; normalized by the Universe")
+    title: Optional[str] = Field(default=None, description="Optional generated app title")
+    output_dir: str = Field(..., description="Target directory for generated static app files")
+    context: Dict[str, Any] = Field(default_factory=dict, description="Template variable values")
+    auto_register: bool = Field(default=True, validation_alias=AliasChoices("auto_register", "register"), description="Register the rendered app manifest with this Universe")
+    overwrite: bool = Field(default=False, description="Allow replacing existing generated files")
+
+
 class CreateKBRequest(BaseModel):
     kb_params: KnowledgeBaseParams | MultimodalKnowledgeBaseParams = Field(..., description="Parameters of the KB")
     type: str = Field("text", description="Type of KB: 'text' for text-only or 'multimodal' for multimodal KB")
@@ -385,7 +911,7 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
     # -------- Discovery & actions --------
     @app.get("/health")
     def health():
-        return {"status": "ok", "kbs": universe.list_kbs(), "tbs": universe.list_tbs()}
+        return {"status": "ok", "kbs": universe.list_kbs(), "tbs": universe.list_tbs(), "apps": universe.list_apps()}
 
     @app.get("/actions")
     def get_allowed_actions():
@@ -402,6 +928,163 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
     @app.get("/tools")
     def all_tools():
         return universe.get_available_tools()
+
+    # --------------- Universe app template endpoints ---------------
+    @app.get("/app-templates")
+    def list_app_templates_route():
+        templates = universe.list_app_templates()
+        return {"ok": True, "templates": templates, "count": len(templates)}
+
+    @app.get("/app-templates/{template_id}")
+    def get_app_template_route(template_id: str):
+        try:
+            return {"ok": True, "template": universe.get_app_template(template_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.post("/app-templates/{template_id}/instantiate")
+    def instantiate_app_template_route(template_id: str, req: InstantiateAppTemplateRequest):
+        try:
+            return universe.instantiate_app_template(
+                template_id,
+                app_id=req.app_id,
+                title=req.title,
+                output_dir=req.output_dir,
+                context=req.context,
+                auto_register=req.auto_register,
+                overwrite=req.overwrite,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except (ValueError, PermissionError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    # --------------- Universe app endpoints ---------------
+    @app.get("/apps")
+    def list_apps():
+        apps = universe.list_apps()
+        return {"ok": True, "apps": apps, "count": len(apps)}
+
+    @app.post("/apps")
+    def register_app(req: UniverseAppManifest):
+        return {"ok": True, "app": universe.register_app(req)}
+
+    @app.post("/apps/register")
+    def register_app_alias(req: UniverseAppManifest):
+        return {"ok": True, "app": universe.register_app(req)}
+
+    @app.get("/apps/{app_id}")
+    def get_app(app_id: str):
+        try:
+            return {"ok": True, "app": universe.get_app(app_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/apps/{app_id}/manifest")
+    def get_app_manifest(app_id: str):
+        try:
+            return universe.get_app(app_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/apps/{app_id}/view")
+    def view_static_app(app_id: str):
+        try:
+            return FileResponse(universe._resolve_static_app_file(app_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/apps/{app_id}/files/{asset_path:path}")
+    def static_app_file(app_id: str, asset_path: str):
+        try:
+            return FileResponse(universe._resolve_static_app_file(app_id, asset_path))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.api_route("/apps/{app_id}/proxy/{proxy_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def proxy_app_http(app_id: str, proxy_path: str, request: Request):
+        try:
+            result = universe.proxy_app_http(
+                app_id,
+                proxy_path,
+                request.method,
+                query_string=request.url.query,
+                body=await request.body(),
+                headers=dict(request.headers),
+            )
+            return Response(
+                content=result["content"],
+                status_code=result["status_code"],
+                media_type=result.get("media_type"),
+                headers=result.get("headers") or {},
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Proxy request failed: {exc}")
+
+    @app.websocket("/apps/{app_id}/proxy/{proxy_path:path}")
+    async def proxy_app_websocket(app_id: str, proxy_path: str, websocket: WebSocket):
+        try:
+            await universe.proxy_app_websocket(app_id, proxy_path, websocket)
+        except KeyError:
+            await websocket.close(code=1008, reason="Unknown app")
+        except PermissionError:
+            await websocket.close(code=1008, reason="Permission denied")
+        except (FileNotFoundError, ValueError):
+            await websocket.close(code=1008, reason="Invalid app proxy target")
+        except Exception:
+            await websocket.close(code=1011, reason="WebSocket proxy failed")
+
+    @app.post("/apps/{app_id}/start")
+    def start_app(app_id: str, req: UniverseAppStatusRequest | None = None):
+        try:
+            return {"ok": True, "app": universe.set_app_status(app_id, req.status) if req and req.status else universe.start_app(app_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.post("/apps/{app_id}/stop")
+    def stop_app(app_id: str, req: UniverseAppStatusRequest | None = None):
+        try:
+            return {"ok": True, "app": universe.set_app_status(app_id, req.status) if req and req.status else universe.stop_app(app_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.post("/apps/{app_id}/restart")
+    def restart_app(app_id: str):
+        try:
+            return {"ok": True, "app": universe.restart_app(app_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.delete("/apps/{app_id}")
+    def delete_app(app_id: str):
+        if not universe.delete_app(app_id):
+            raise HTTPException(status_code=404, detail="App not found")
+        return {"ok": True, "app_id": app_id}
+
+    @app.get("/apps/{app_id}/logs")
+    def app_logs(app_id: str, tail: int = 200):
+        try:
+            return {"ok": True, **universe.app_logs(app_id, tail=tail)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
 
     # --------------- KB endpoints ---------------
     @app.get("/kbs")
@@ -733,6 +1416,7 @@ def run_app(
 ) -> None:
     import json
     from pathlib import Path
+    from datetime import datetime, timezone
     
     host = host.strip()
 
@@ -770,12 +1454,17 @@ def run_app(
     if status_file:
         try:
             status_data = {
+                "schema_version": 1,
                 "status": "ready",
+                "name": getattr(_params.info, "name", None),
+                "scheme": "http",
                 "host": host,
                 "port": actual_port,
-                "url": base_url
+                "url": base_url,
+                "pid": os.getpid(),
+                "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
-            Path(status_file).write_text(json.dumps(status_data), encoding="utf-8")
+            write_status_atomic(status_file, status_data)
         except Exception as e:
             print(f"Warning: Failed to write status file: {e}")
 

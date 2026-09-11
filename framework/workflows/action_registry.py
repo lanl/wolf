@@ -159,9 +159,9 @@ def extract_payload_model(action_cls: type[AgentAction]) -> type[BaseModel] | No
 
 
 def infer_risk_level(name: str) -> str:
-    if name in {"run_syscall", "create_universe", "terminate_deployment"}:
+    if name in {"run_syscall", "create_universe", "terminate_deployment", "universe_tb_execute", "universe_kb_purge"}:
         return "high"
-    if name in {"write_file", "clear_memory_category", "forget_memory", "batch_forget_memory", "truncate_context_window"}:
+    if name in {"write_file", "clear_memory_category", "forget_memory", "batch_forget_memory", "rename_memory_category", "truncate_context_window", "create_kb", "create_toolbox", "universe_kb_append_texts", "universe_kb_add_url", "universe_kb_add_urls", "universe_kb_add_document", "universe_tb_append_docs", "universe_app_register", "universe_app_start", "universe_app_stop", "universe_app_restart", "universe_app_delete"}:
         return "medium"
     return "normal"
 
@@ -172,7 +172,9 @@ def infer_tags(name: str) -> tuple[str, ...]:
         tags.append("gui")
     if name.startswith("universe_"):
         tags.append("universe")
-    if name in {"write_file", "run_syscall"}:
+    if name.startswith("universe_app_"):
+        tags.append("app")
+    if name in {"write_file", "run_syscall", "create_universe", "terminate_deployment", "universe_tb_execute", "universe_kb_purge"}:
         tags.append("local_side_effect")
     if infer_risk_level(name) != "normal":
         tags.append("risky")

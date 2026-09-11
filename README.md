@@ -30,18 +30,19 @@ Much of the repository still uses **WOLF** terminology in code, prompts, configu
 8. [Running the Application](#running-the-application)
 9. [Interactive CLI Usage](#interactive-cli-usage)
 10. [Gateway / TUI Workflow Runtime](#gateway--tui-workflow-runtime)
-11. [Architecture Overview](#architecture-overview)
-12. [Structured Actions](#structured-actions)
-13. [Infrastructure Layer](#infrastructure-layer)
-14. [Memory and Context Management](#memory-and-context-management)
-15. [Universes / ActionBoxes](#universes--actionboxes)
-16. [Knowledgebases, Toolboxes, and Vector Stores](#knowledgebases-toolboxes-and-vector-stores)
-17. [Sessions, Persistence, and Resume](#sessions-persistence-and-resume)
-18. [Configuration](#configuration)
-19. [Prompt, Rules, and Behavior Files](#prompt-rules-and-behavior-files)
-20. [Developer Notes](#developer-notes)
-21. [Living Documentation](#living-documentation)
-22. [License](#license)
+11. [Frames / Dashboard Webapps](#frames--dashboard-webapps)
+12. [Architecture Overview](#architecture-overview)
+13. [Structured Actions](#structured-actions)
+14. [Infrastructure Layer](#infrastructure-layer)
+15. [Memory and Context Management](#memory-and-context-management)
+16. [Universes / ActionBoxes](#universes--actionboxes)
+17. [Knowledgebases, Toolboxes, and Vector Stores](#knowledgebases-toolboxes-and-vector-stores)
+18. [Sessions, Persistence, and Resume](#sessions-persistence-and-resume)
+19. [Configuration](#configuration)
+20. [Prompt, Rules, and Behavior Files](#prompt-rules-and-behavior-files)
+21. [Developer Notes](#developer-notes)
+22. [Living Documentation](#living-documentation)
+23. [License](#license)
 
 ---
 
@@ -283,6 +284,7 @@ config/defaults/inference_engine.py        # Default LLM/provider configuration
 config/session/default/params/inputs.py    # Default session parameters
 framework/cli/                             # Real ./wolf CLI application implementation
 framework/utils/config_tools.py            # Session construction and resume helpers
+framework/utils/frame_dashboard.py         # FRAME dashboard run/deploy utility used by ./wolf frame
 framework/infrastructure/                  # Runtime infrastructure, chat, memory, context
 framework/workflows/                       # Workflow base classes, action models, active workflows
 framework/workflows/custom_workflows/gateway_action_workflow.py  # Async websocket workflow/action runtime
@@ -295,6 +297,7 @@ framework/universes/                       # Universe / ActionBox support
 framework/gateway/                         # Gateway client/server/TUI support
 framework/ui/                              # UI-related clients
 framework/gui/                             # Wolf GUI / VUI shared visual workspace
+FRAMEs/dashboards/                         # Local FRAME webapps for GUI dashboard panels
 framework/orchestration/                   # Adjacent or evolving orchestration subsystem
 sessions/                                  # Example launch/session configs
 wf_workspace/                              # Runtime session directories, snapshots, stores
@@ -529,15 +532,15 @@ The preferred entrypoint is the root `./wolf` executable.
 ./wolf
 ```
 
-Plain `./wolf` preserves the traditional behavior: launch an interactive CLI session using `TurnBasedWorkflow`.
+Plain `./wolf` launches an interactive CLI session using `FastTurnBasedWorkflow` by default. The legacy `TurnBasedWorkflow` remains available via `--workflow TurnBasedWorkflow`.
 
 You can also use the newer CLI command tree:
 
 ```bash
 ./wolf --help
 ./wolf cli --dry-run --explain
-./wolf cli --workflow TurnBasedWorkflow
 ./wolf cli --workflow FastTurnBasedWorkflow
+./wolf cli --workflow TurnBasedWorkflow
 ./wolf cli --resume last
 ./wolf cli --config sessions/example_cli_session.json
 ./wolf workflows list
@@ -546,6 +549,8 @@ You can also use the newer CLI command tree:
 ./wolf sessions inspect last
 ./wolf config print --config sessions/example_cli_session.json
 ./wolf config validate --config sessions/example_cli_session.json
+./wolf frame run --host 127.0.0.1 --port 8012
+./wolf frame deploy ./FRAMEs/dashboards/view_files --copy ./FRAMEs/dashboards/dashboard2 --host 127.0.0.1 --port 8013
 ./wolf doctor
 ```
 
@@ -716,6 +721,143 @@ python scripts/gateway_smoke.py \
   --message "What is the current working directory? Use run_syscall with command pwd, shell false, timeout 5."
 ```
 
+---
+
+## Frames / Dashboard Webapps
+
+**Frames** are local webapps/backends that can be launched as display surfaces for WOLF GUI dashboard panels. They provide a lightweight alternative to using a full Universe / ActionBox when the goal is primarily to render, stream, or control visual content in the GUI workspace.
+
+In practical terms, a Frame is usually a self-contained web application under `FRAMEs/` that exposes an HTTP UI and control API. The Wolf GUI can open the Frame URL in a dashboard panel, while agents or scripts can update the Frame by calling its backend endpoints.
+
+Frames are useful when you want to display or control content such as:
+
+- images, overlays, plots, and screenshots;
+- Markdown notes rendered as HTML;
+- audio, video, PDFs, text, and tables;
+- lightweight custom visualizations;
+- task-specific status pages or dashboards.
+
+Frames complement, but do not replace, Universes / ActionBoxes:
+
+| Capability | Frame | Universe / ActionBox |
+| --- | --- | --- |
+| Primary role | Display or webapp surface for GUI dashboard panels | Sandboxed environment hosting KBs, TBs, tools, APIs, and actions |
+| Typical scope | Lightweight local backend/web UI | Rich executable environment with discovery and remote interaction |
+| Best for | Rendering content, dashboards, visual context, panel apps | Tool execution, isolated runtimes, remote/local sandboxes, KB/TB hosting |
+| GUI usage | Open the Frame URL directly in a dashboard panel | Register/open a Universe app or interact through Universe actions |
+
+### Default media dashboard Frame
+
+The repository includes a reusable media dashboard template at:
+
+```text
+FRAMEs/dashboards/view_files/
+```
+
+It is a FastAPI app that can display images, Markdown, audio, video, PDFs, CSV/TSV tables, text, and other browser-supported media. It also includes a small controller script for updating the dashboard payload and display settings:
+
+```text
+FRAMEs/dashboards/view_files/update_dash.py
+```
+
+Example update commands after the Frame is running:
+
+```bash
+FRAMEs/dashboards/view_files/update_dash.py --host 127.0.0.1 --port 8012 --payload /path/to/overlay.png
+FRAMEs/dashboards/view_files/update_dash.py --host 127.0.0.1 --port 8012 --payload /path/to/notes.md --mime-type text/markdown
+FRAMEs/dashboards/view_files/update_dash.py --host 127.0.0.1 --port 8012 --background black --zoom 1.25
+FRAMEs/dashboards/view_files/update_dash.py --host 127.0.0.1 --port 8012 --control loop
+```
+
+### Running Frames with `./wolf frame`
+
+The root `./wolf` command includes a `frame` command group, with `frames` as an alias:
+
+```bash
+./wolf frame --help
+./wolf frames --help
+```
+
+Run the default dashboard Frame inline:
+
+```bash
+./wolf frame run --host 127.0.0.1 --port 8012
+```
+
+Run a specific Frame inline:
+
+```bash
+./wolf frame run ./FRAMEs/dashboards/view_files --host 127.0.0.1 --port 8012
+```
+
+The default runner uses the project `uv` environment:
+
+```text
+uv run uvicorn main:app --app-dir <APP_DIR> --host <HOST> --port <PORT>
+```
+
+Alternative runner modes are available:
+
+```bash
+./wolf frame run --runner uv --host 127.0.0.1 --port 8012       # default
+./wolf frame run --runner python --host 127.0.0.1 --port 8012
+./wolf frame run --runner uvicorn --host 127.0.0.1 --port 8012
+```
+
+### Deploying Frame replicas
+
+`wolf frame deploy` can copy a Frame template and then launch the copied app. This is useful when several GUI dashboard panels need independent backend state.
+
+Run an existing Frame inline:
+
+```bash
+./wolf frame deploy ./FRAMEs/dashboards/view_files --host 127.0.0.1 --port 8012
+```
+
+Copy the default dashboard template and run the copy inline:
+
+```bash
+./wolf frame deploy ./FRAMEs/dashboards/view_files \
+  --copy ./FRAMEs/dashboards/dashboard2 \
+  --host 127.0.0.1 --port 8013
+```
+
+If `--sname` is provided, the Frame launches in a detached GNU screen session:
+
+```bash
+./wolf frame deploy ./FRAMEs/dashboards/view_files \
+  --copy ./FRAMEs/dashboards/dashboard2 \
+  --host 127.0.0.1 --port 8013 \
+  --sname dash2
+```
+
+If `--sname` is omitted, deploy runs inline and blocks the terminal, just like `wolf frame run`.
+
+Useful screen commands for detached Frame deployments:
+
+```bash
+screen -ls
+screen -r dash2
+screen -S dash2 -X quit
+```
+
+Useful deploy options:
+
+```bash
+--force-copy    # replace an existing copy destination
+--replace       # replace an existing screen session with the same --sname
+--reload        # pass --reload to uvicorn
+```
+
+Implementation files:
+
+```text
+framework/utils/frame_dashboard.py          # shared run/deploy implementation
+framework/cli/wolf_app.py                   # registers wolf frame / wolf frames
+FRAMEs/dashboards/view_files/main.py        # default media dashboard backend
+FRAMEs/dashboards/view_files/update_dash.py # default media dashboard controller
+```
+
 ## Architecture Overview
 
 ### Startup path
@@ -729,7 +871,7 @@ The current interactive startup path is:
   -> framework/utils/config_tools.py
   -> CliSession.create_session(...)
   -> setup_cli_session(...)
-  -> TurnBasedWorkflow.run(...)
+  -> FastTurnBasedWorkflow.run(...)
 ```
 
 The traditional runner follows a similar path:
@@ -772,7 +914,7 @@ A new CLI session typically creates:
 - `MemoryManager`.
 - `ContextManager`.
 - `BaseInfrastructure`.
-- Active workflow, usually `TurnBasedWorkflow`.
+- Active workflow, usually `FastTurnBasedWorkflow`.
 
 A session dictionary contains roughly:
 

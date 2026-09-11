@@ -11,7 +11,7 @@ def launch_cli(config: Dict[str, Any], *, dry_run: bool = False, explain: bool =
     from framework.utils.config_tools import CliSession
     from framework.workflows.workflow_space import get_workflow_class
 
-    workflow_name = config.get("workflow") or "TurnBasedWorkflow"
+    workflow_name = config.get("workflow") or "FastTurnBasedWorkflow"
     workflow_cls = get_workflow_class(workflow_name)
     user_name = config.get("user_name") or "user"
     resume_session = config.get("resume_session")

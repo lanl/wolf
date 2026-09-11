@@ -7,6 +7,7 @@ It handles secure connection, file transfer, remote process management, and stat
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import tempfile
 import time
@@ -67,7 +68,7 @@ class RemoteUniverseHandle:
         """
         try:
             stdin, stdout, stderr = self.ssh_client.exec_command(
-                f"ps -p {self.remote_pid} -o pid="
+                f"ps -p {int(self.remote_pid)} -o pid="
             )
             exit_status = stdout.channel.recv_exit_status()
             
@@ -81,14 +82,14 @@ class RemoteUniverseHandle:
     def terminate(self) -> None:
         """Send SIGTERM to remote process."""
         try:
-            self.ssh_client.exec_command(f"kill {self.remote_pid}")
+            self.ssh_client.exec_command(f"kill {int(self.remote_pid)}")
         except Exception:
             pass
     
     def kill(self) -> None:
         """Send SIGKILL to remote process."""
         try:
-            self.ssh_client.exec_command(f"kill -9 {self.remote_pid}")
+            self.ssh_client.exec_command(f"kill -9 {int(self.remote_pid)}")
         except Exception:
             pass
     
@@ -160,7 +161,7 @@ class RemoteDeploymentManager:
         timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
         work_dir = f"{base_dir}/wolf_universe_{timestamp}"
         
-        stdin, stdout, stderr = ssh_client.exec_command(f"mkdir -p {work_dir}")
+        stdin, stdout, stderr = ssh_client.exec_command(f"mkdir -p {shlex.quote(work_dir)}")
         exit_status = stdout.channel.recv_exit_status()
         
         if exit_status != 0:
@@ -236,9 +237,11 @@ class RemoteDeploymentManager:
         if cors:
             cmd_parts.extend(["--cors", cors])
         
-        # Launch in background with nohup
-        cmd = " ".join(cmd_parts)
-        launch_cmd = f"cd {remote_work_dir} && nohup {cmd} > stdout.log 2> stderr.log & echo $!"
+        # Launch in background with nohup. Quote every shell token because this
+        # command must cross an SSH shell boundary. Keep redirection targets
+        # fixed rather than user-provided.
+        cmd = " ".join(shlex.quote(str(part)) for part in cmd_parts)
+        launch_cmd = f"cd {shlex.quote(remote_work_dir)} && nohup {cmd} > stdout.log 2> stderr.log & echo $!"
         
         stdin, stdout, stderr = ssh_client.exec_command(launch_cmd)
         exit_status = stdout.channel.recv_exit_status()
@@ -271,7 +274,7 @@ class RemoteDeploymentManager:
         while time.time() - start_time < timeout:
             try:
                 stdin, stdout, stderr = ssh_client.exec_command(
-                    f"cat {remote_status_file}"
+                    f"cat {shlex.quote(remote_status_file)}"
                 )
                 exit_status = stdout.channel.recv_exit_status()
                 
@@ -279,7 +282,7 @@ class RemoteDeploymentManager:
                     content = stdout.read().decode()
                     status = json.loads(content)
                     
-                    if status.get("status") == "running":
+                    if str(status.get("status") or "").lower() in {"ready", "running"}:
                         return status
             except (json.JSONDecodeError, KeyError):
                 pass

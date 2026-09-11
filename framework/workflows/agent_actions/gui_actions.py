@@ -190,6 +190,23 @@ class GuiOpenDashboardPayload(GuiBasePayload):
     dashboard_id: Optional[str] = Field(default=None, description="Dashboard id to open. If omitted, open the active/latest dashboard")
 
 
+class GuiDashboardPanelZoomPayload(GuiBasePayload):
+    panel_id: str = Field(..., description="Dashboard panel id to zoom")
+    zoom: Optional[float] = Field(default=None, description="Absolute zoom value, e.g. 1.0 for 100%, 1.25 for 125%")
+    delta: Optional[float] = Field(default=None, description="Relative zoom delta, e.g. 0.1 to zoom in or -0.1 to zoom out")
+    source: str = Field(default="agent", description="Source label recorded in GUI chat history")
+
+
+class GuiRemoveDashboardPanelPayload(GuiBasePayload):
+    panel_id: str = Field(..., description="Dashboard panel id to close/remove")
+    source: str = Field(default="agent", description="Source label recorded in GUI chat history")
+
+
+class GuiRemoveDashboardPayload(GuiBasePayload):
+    dashboard_id: Optional[str] = Field(default=None, description="Dashboard id to close/remove. If omitted, close the active/latest dashboard")
+    source: str = Field(default="agent", description="Source label recorded in GUI chat history")
+
+
 class GuiPublishDashboardPayload(GuiBasePayload):
     model_config = ConfigDict(json_schema_extra={"examples": [{"name": "Dashboard", "panels": [{"title": "Panel", "kind": "html", "content_html_lines": ["<h1>Hello</h1>"]}], "open": True}]})
 
@@ -250,6 +267,54 @@ class GuiGetVisualContextPayload(GuiBasePayload):
     include_dom_excerpt: bool = Field(default=True, description="Include same-origin/inline DOM or text excerpts when available")
     include_layout: bool = Field(default=True, description="Include viewport, panel bounds, and visible-surface layout metadata")
     include_annotations: bool = Field(default=True, description="Include current workspace annotations")
+
+
+class GuiSetChatScaleAction(AgentAction):
+    action: Literal["gui_set_chat_scale"] = "gui_set_chat_scale"
+    description: Literal["Set the Agent Chat panel content/readability size"] = "Set the Agent Chat panel content/readability size"
+    payload: GuiChatScalePayload
+    payload_schema: str = '{"scale": 1.15}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        data.pop("delta", None)
+        result = _post_gui("/api/gui/chat_scale", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
+
+
+class GuiAdjustChatScaleAction(AgentAction):
+    action: Literal["gui_adjust_chat_scale"] = "gui_adjust_chat_scale"
+    description: Literal["Increase or decrease the Agent Chat panel content/readability size"] = "Increase or decrease the Agent Chat panel content/readability size"
+    payload: GuiChatScalePayload
+    payload_schema: str = '{"delta": 0.1}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        if "delta" not in data:
+            data["delta"] = 0.1
+        data.pop("scale", None)
+        result = _post_gui("/api/gui/chat_scale_delta", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
+
+
+class GuiResetChatScaleAction(AgentAction):
+    action: Literal["gui_reset_chat_scale"] = "gui_reset_chat_scale"
+    description: Literal["Reset the Agent Chat panel content/readability size to 100%"] = "Reset the Agent Chat panel content/readability size to 100%"
+    payload: GuiChatScalePayload
+    payload_schema: str = '{}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        data.pop("scale", None)
+        data.pop("delta", None)
+        result = _post_gui("/api/gui/chat_scale_reset", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
 
 
 class GuiGetVisualContextAction(AgentAction):
@@ -346,6 +411,82 @@ class GuiOpenDashboardAction(AgentAction):
         data = self.payload.model_dump(exclude_none=True)
         gui_url = data.pop("gui_url", None)
         result = _post_gui("/api/gui/dashboards/open", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
+
+
+class GuiSetDashboardPanelZoomAction(AgentAction):
+    action: Literal["gui_set_dashboard_panel_zoom"] = "gui_set_dashboard_panel_zoom"
+    description: Literal["Set the zoom level of a GUI dashboard panel"] = "Set the zoom level of a GUI dashboard panel"
+    payload: GuiDashboardPanelZoomPayload
+    payload_schema: str = '{"panel_id": "panel_...", "zoom": 1.25}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        data.pop("delta", None)
+        result = _post_gui("/api/gui/dashboards/panel_zoom", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
+
+
+class GuiAdjustDashboardPanelZoomAction(AgentAction):
+    action: Literal["gui_adjust_dashboard_panel_zoom"] = "gui_adjust_dashboard_panel_zoom"
+    description: Literal["Zoom a GUI dashboard panel in or out by a delta"] = "Zoom a GUI dashboard panel in or out by a delta"
+    payload: GuiDashboardPanelZoomPayload
+    payload_schema: str = '{"panel_id": "panel_...", "delta": 0.1}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        if "delta" not in data:
+            data["delta"] = 0.1
+        data.pop("zoom", None)
+        result = _post_gui("/api/gui/dashboards/panel_zoom_delta", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
+
+
+class GuiResetDashboardPanelZoomAction(AgentAction):
+    action: Literal["gui_reset_dashboard_panel_zoom"] = "gui_reset_dashboard_panel_zoom"
+    description: Literal["Reset a GUI dashboard panel zoom level to 100%"] = "Reset a GUI dashboard panel zoom level to 100%"
+    payload: GuiDashboardPanelZoomPayload
+    payload_schema: str = '{"panel_id": "panel_..."}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        data.pop("zoom", None)
+        data.pop("delta", None)
+        result = _post_gui("/api/gui/dashboards/panel_zoom_reset", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
+
+
+class GuiRemoveDashboardPanelAction(AgentAction):
+    action: Literal["gui_remove_dashboard_panel"] = "gui_remove_dashboard_panel"
+    description: Literal["Close/remove a panel from a GUI dashboard"] = "Close/remove a panel from a GUI dashboard"
+    payload: GuiRemoveDashboardPanelPayload
+    payload_schema: str = '{"panel_id": "panel_..."}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        result = _post_gui("/api/gui/dashboards/remove_panel", data, gui_url)
+        _append_gui_result(infra, self.action, result)
+        return result
+
+
+class GuiRemoveDashboardAction(AgentAction):
+    action: Literal["gui_remove_dashboard"] = "gui_remove_dashboard"
+    description: Literal["Close/remove a GUI dashboard"] = "Close/remove a GUI dashboard"
+    payload: GuiRemoveDashboardPayload
+    payload_schema: str = '{"dashboard_id": "optional dashboard id"}'
+
+    def execute(self, infra: Any = None) -> Dict[str, Any]:
+        data = self.payload.model_dump(exclude_none=True)
+        gui_url = data.pop("gui_url", None)
+        result = _post_gui("/api/gui/dashboards/remove", data, gui_url)
         _append_gui_result(infra, self.action, result)
         return result
 

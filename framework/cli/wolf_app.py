@@ -12,6 +12,7 @@ from framework.cli.config_loader import build_launch_config, print_launch_config
 from framework.cli.discovery import get_actions, get_workflows
 from framework.cli.launchers import launch_api, launch_cli, launch_gateway, launch_gui, launch_tui, launch_join_session
 from framework.cli.session_commands import inspect_session, list_sessions
+from framework.utils.frame_dashboard import add_frame_parser
 
 
 MODES = {"cli", "tui", "gui", "api", "gateway"}
@@ -377,7 +378,7 @@ def command_config_validate(args: argparse.Namespace) -> int:
         errors.append(f"Unsupported mode: {cfg.get('mode')}")
     try:
         from framework.workflows.workflow_space import get_workflow_class
-        get_workflow_class(cfg.get("workflow") or "TurnBasedWorkflow")
+        get_workflow_class(cfg.get("workflow") or "FastTurnBasedWorkflow")
     except Exception as exc:
         errors.append(f"Workflow not discoverable: {exc}")
     llms = cfg.get("session", {}).get("LLMs", {})
@@ -448,6 +449,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wolf", description="WOLF application launcher")
     parser.add_argument("--version", action="version", version="wolf launcher prototype")
     sub = parser.add_subparsers(dest="command")
+
+    add_frame_parser(sub)
 
     for mode in ["cli", "tui", "gui"]:
         p = sub.add_parser(mode, help=f"Launch {mode.upper()} mode")

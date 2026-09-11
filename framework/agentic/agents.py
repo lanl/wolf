@@ -248,8 +248,25 @@ class OpenAIAgent:
         )
         return self._extract_response(raw_response, resp_choice_idx)
 
-    def stream_chat_response(self, user_prompt: Union[str, Message, List[Message], 
-                             List[Dict[str, Any]]], model: Optional[str] = None) -> str:
+    def stream_chat_response(
+        self,
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
+        model: Optional[str] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
+        print_deltas: Optional[bool] = None,
+    ) -> str:
+        """Stream a chat response and return the complete accumulated text.
+
+        Backward compatibility: callers that pass only ``user_prompt`` and
+        optional ``model`` still get the same return value.  New staged/CLI
+        workflows can pass ``on_delta`` to render chunks through a non-durable
+        terminal stream without relying on ``verbose > 0``.
+
+        ``print_deltas`` controls legacy direct printing:
+        - None: preserve old behavior by printing only when ``verbose > 0``;
+        - True: print chunks regardless of verbose;
+        - False: do not print here; useful when ``on_delta`` renders chunks.
+        """
 
         model = model or self.model
         CTX = self._make_ctx(user_prompt)
@@ -264,13 +281,31 @@ class OpenAIAgent:
         )
         response = ""
         for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            self.console_log(delta, end="")
+            try:
+                delta = chunk.choices[0].delta.content or ""
+            except Exception:
+                delta = ""
+            if not delta:
+                continue
+            if on_delta is not None:
+                on_delta(delta)
+            if print_deltas is True:
+                if callable(self.console):
+                    self.console(delta, end="")
+                else:
+                    self.console.print(delta, end="")
+            elif print_deltas is None:
+                self.console_log(delta, end="")
             response += delta
         return response
 
-    async def stream_chat_response_async(self, user_prompt: Union[str, Message, List[Message], 
-                                         List[Dict[str, Any]]], model: Optional[str] = None) -> str:
+    async def stream_chat_response_async(
+        self,
+        user_prompt: Union[str, Message, List[Message], List[Dict[str, Any]]],
+        model: Optional[str] = None,
+        on_delta: Optional[Callable[[str], Any]] = None,
+        print_deltas: Optional[bool] = None,
+    ) -> str:
 
         model = model or self.model
         response = ""
@@ -284,8 +319,23 @@ class OpenAIAgent:
             operation="async stream chat completion",
         ) as stream:
             async for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
-                self.console_log(delta, end="")
+                try:
+                    delta = chunk.choices[0].delta.content or ""
+                except Exception:
+                    delta = ""
+                if not delta:
+                    continue
+                if on_delta is not None:
+                    maybe = on_delta(delta)
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+                if print_deltas is True:
+                    if callable(self.console):
+                        self.console(delta, end="")
+                    else:
+                        self.console.print(delta, end="")
+                elif print_deltas is None:
+                    self.console_log(delta, end="")
                 response += delta
         return response
 
@@ -353,12 +403,26 @@ class OpenAIAgent:
                 )
                 return self._extract_response(completion, resp_choice_idx, structured=True)
             except Exception as e:
-                self.console_log(f"[5][!][get_json_structured_output_async][FORMAT WARN]: Problem with Assistant output: {e}")
-                if isinstance(user_prompt, str):
-                    try:
-                        return jsonfy(user_prompt)
-                    except Exception as e1:
-                        return f"[6][!][FORMAT ERROR]: Problem with Assistant output: {e1}"
+                self.console_log(f"[5][!][get_json_structured_output_async][FORMAT WARN]: Structured parse failed; falling back to normal chat JSON parsing: {e}")
+                try:
+                    raw = await self.get_chat_response_async(
+                        user_prompt=user_prompt,
+                        model=model,
+                        resp_choice_idx=resp_choice_idx,
+                    )
+                    parsed = robust_jsonfy(raw)
+                    if isinstance(parsed, dict) and "parsed" in parsed:
+                        return parsed["parsed"]
+                    return {
+                        "structured_output_error": str(e),
+                        "fallback_parse_error": (parsed or {}).get("jsonify_error") if isinstance(parsed, dict) else str(parsed),
+                        "raw_preview": str(raw)[:1000],
+                    }
+                except Exception as e1:
+                    return {
+                        "structured_output_error": str(e),
+                        "fallback_error": f"{type(e1).__name__}: {e1}",
+                    }
         else:
             try:
                 completion = await self.async_llm.beta.chat.completions.parse(temperature=temperature, 

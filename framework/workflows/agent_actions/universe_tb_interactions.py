@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import requests
 from framework.workflows.base_agent_action import AgentAction
+from framework.universes.endpoint_resolver import get_universe_base_url_or_error
 from framework.workflows.agent_actions.formatting_utils import coerce_bool, coerce_float, resolve_text_list_source, resolve_text_source
 
 # Default timeout for all HTTP requests
@@ -77,6 +79,7 @@ class UniverseTBSearchToolsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -85,7 +88,9 @@ class UniverseTBSearchToolsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/tbs/{self.payload.tb_name}/search",
                 json={"query": self.payload.query, "k": self.payload.k},
@@ -167,6 +172,7 @@ class UniverseTBExecuteAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -175,12 +181,57 @@ class UniverseTBExecuteAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             # Use model_dump to exclude None values and non-API fields
             payload_dict = self.payload.model_dump(
                 exclude_none=True,
                 exclude={'universe_url', 'tb_name'}
             )
+
+            if hasattr(infra, "request_permission"):
+                approval_request = {
+                    "action": self.action,
+                    "payload": self.payload.model_dump(mode="json", exclude_none=True),
+                    "payload_summary": f"Execute tool '{self.payload.tool_name}' in toolbox '{self.payload.tb_name}' on universe '{univ_name}'",
+                    "operation": "universe_tool_execution",
+                    "command_display": self.payload.tool_name,
+                    "timeout": int(self.payload.timeout or DEFAULT_TIMEOUT),
+                    "cwd": self.payload.cwd or os.getcwd(),
+                    "purpose": self.purpose,
+                    "expectations": self.expectations,
+                    "risk_hints": [
+                        "executes a toolbox tool inside a universe/actionbox",
+                        "may run command/script/binary depending on tool implementation",
+                        "remote or sandbox side effects possible",
+                    ],
+                    "metadata": {
+                        "universe": univ_name,
+                        "universe_url": univ_base_url,
+                        "tb_name": self.payload.tb_name,
+                        "tool_name": self.payload.tool_name,
+                    },
+                }
+                approval = infra.request_permission("universe_tb_execute", approval_request)
+                if not approval.get("approved", False):
+                    result = {
+                        "ok": False,
+                        "approved": False,
+                        "action": self.action,
+                        "universe": univ_name,
+                        "tb_name": self.payload.tb_name,
+                        "tool_name": self.payload.tool_name,
+                        "error": approval.get("reason") or "universe_tb_execute was denied by user approval policy",
+                        "approval": approval,
+                    }
+                    infra.append_chat_history(
+                        actor="system",
+                        content=f"[UniverseTBExecuteAction][denied]: {result}",
+                        action={"action": "system_info"},
+                        log_console=True,
+                    )
+                    return result
             
             response = requests.post(
                 f"{univ_base_url}/tbs/{self.payload.tb_name}/execute",
@@ -222,6 +273,7 @@ class UniverseTBToolInfoAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -230,7 +282,9 @@ class UniverseTBToolInfoAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(
                 f"{univ_base_url}/tbs/{self.payload.tb_name}/tools/{self.payload.tool_name}/info",
                 timeout=DEFAULT_TIMEOUT
@@ -269,6 +323,7 @@ class UniverseTBListToolsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -277,7 +332,9 @@ class UniverseTBListToolsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(
                 f"{univ_base_url}/tbs/{self.payload.tb_name}/tools",
                 timeout=DEFAULT_TIMEOUT
@@ -326,6 +383,7 @@ class UniverseTBSearchDocsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -334,7 +392,9 @@ class UniverseTBSearchDocsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/tbs/{self.payload.tb_name}/tools/{self.payload.tool_name}/search_docs",
                 json={"query": self.payload.query, "k": self.payload.k, "context_window": self.payload.context_window},
@@ -369,6 +429,7 @@ class UniverseTBStatsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -377,7 +438,9 @@ class UniverseTBStatsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(
                 f"{univ_base_url}/tbs/{self.payload.tb_name}/stats",
                 timeout=DEFAULT_TIMEOUT
@@ -435,6 +498,7 @@ class UniverseTBAppendDocsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -443,7 +507,9 @@ class UniverseTBAppendDocsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/tbs/{self.payload.tb_name}/tools/{self.payload.tool_name}/append_texts",
                 json={"texts": self.payload.texts, "doc_source": self.payload.doc_source},

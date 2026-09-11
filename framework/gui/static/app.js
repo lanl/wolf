@@ -3,7 +3,9 @@ const state = {
   dockMode: 'float',
   annotations: [],
   messages: [],
+  approvals: [],
   showSystemMessages: true,
+  chatScale: 1.0,
   hiddenSystemAlertSignature: '',
   hiddenSystemAlertInitialized: false,
   workflows: {},
@@ -55,6 +57,10 @@ const els = {
   refreshState: $('refresh-state'),
   messages: $('messages'),
   toggleSystemMessages: $('toggle-system-messages'),
+  chatScaleDown: $('chat-scale-down'),
+  chatScaleUp: $('chat-scale-up'),
+  chatScaleLabel: $('chat-scale-label'),
+  chatScaleReset: $('chat-scale-reset'),
   messageForm: $('message-form'),
   messageInput: $('message-input'),
   includeVisualContext: $('include-visual-context'),
@@ -64,6 +70,11 @@ const els = {
   workflowCount: $('workflow-count'),
   sessionCount: $('session-count'),
   toast: $('toast'),
+  approvalPanel: $('approval-panel'),
+  approvalList: $('approval-list'),
+  approvalEmpty: $('approval-empty'),
+  approvalCount: $('approval-count'),
+  approvalRefresh: $('approval-refresh'),
 };
 
 const UI_PREFS_KEY = 'wolf.gui.uiPrefs.v2';
@@ -97,10 +108,102 @@ state.dashboardLayouts = state.uiPrefs.dashboardLayouts || {};
 state.dashboardFloatById = state.uiPrefs.dashboardFloatById || {};
 state.dashboardActivity = state.uiPrefs.dashboardActivity || {};
 state.showSystemMessages = state.uiPrefs.showSystemMessages !== false;
+state.chatScale = Number.isFinite(Number(state.uiPrefs.chatScale)) ? Number(state.uiPrefs.chatScale) : 1.0;
 
 state.attachWorkspaceView = state.uiPrefs.attachWorkspaceView !== undefined ? Boolean(state.uiPrefs.attachWorkspaceView) : true;
 state.allowAgentInspect = Boolean(state.uiPrefs.allowAgentInspect);
 state.allowAgentCapture = Boolean(state.uiPrefs.allowAgentCapture);
+
+
+function clampChatScale(value) {
+  const scale = Number(value);
+  if (!Number.isFinite(scale)) return 1.0;
+  return Math.max(0.75, Math.min(1.6, Math.round(scale * 1000) / 1000));
+}
+
+function chatScaleLabel(scale = state.chatScale) {
+  return `${Math.round(clampChatScale(scale) * 100)}%`;
+}
+
+function applyChatScale(scale = state.chatScale, options = {}) {
+  const next = clampChatScale(scale);
+  state.chatScale = next;
+  const target = els.panel || document.documentElement;
+  const setPx = (name, value) => target.style.setProperty(name, `${Math.round(value * 10) / 10}px`);
+  target.style.setProperty('--chat-scale', String(next));
+  setPx('--chat-font-size', 13 * next);
+  setPx('--chat-compact-font-size', 12 * next);
+  setPx('--chat-meta-font-size', 11 * next);
+  setPx('--chat-detail-font-size', 11 * next);
+  setPx('--chat-bubble-pad-y', 10 * next);
+  setPx('--chat-bubble-pad-x', 12 * next);
+  setPx('--chat-compact-pad-y', 7 * next);
+  setPx('--chat-compact-pad-x', 10 * next);
+  setPx('--chat-message-gap', 10 * next);
+  setPx('--chat-message-padding-y', 14 * next);
+  setPx('--chat-message-padding-x', 12 * next);
+  setPx('--chat-composer-font-size', 13 * next);
+  setPx('--chat-composer-padding', 10 * next);
+  setPx('--chat-toolbar-font-size', 11 * next);
+  if (els.chatScaleLabel) {
+    els.chatScaleLabel.textContent = chatScaleLabel(next);
+    els.chatScaleLabel.title = `Chat content size ${chatScaleLabel(next)} — click to reset`;
+  }
+  if (options.persist !== false) updateUiPrefs({ chatScale: next });
+  return next;
+}
+
+async function setChatScale(scale, options = {}) {
+  const next = clampChatScale(scale);
+  if (options.localOnly) {
+    applyChatScale(next);
+    return { chat_scale: next };
+  }
+  const data = await api('/api/gui/chat_scale', {
+    method: 'POST',
+    body: JSON.stringify({ scale: next, source: options.source || 'user' }),
+  });
+  applyChatScale(data?.chat_scale ?? data?.result?.chat_scale ?? next);
+  showToast(`Chat size ${chatScaleLabel()}`, 1500);
+  return data;
+}
+
+async function adjustChatScale(delta, options = {}) {
+  const amount = Number.isFinite(Number(delta)) ? Number(delta) : 0.1;
+  try {
+    const data = await api('/api/gui/chat_scale_delta', {
+      method: 'POST',
+      body: JSON.stringify({ delta: amount, source: options.source || 'user' }),
+    });
+    applyChatScale(data?.chat_scale ?? data?.result?.chat_scale ?? (state.chatScale + amount));
+    showToast(`Chat size ${chatScaleLabel()}`, 1500);
+    return data;
+  } catch (error) {
+    applyChatScale(state.chatScale + amount);
+    showToast(`Chat size ${chatScaleLabel()} (local)`, 1500);
+    return { ok: false, error: error.message, chat_scale: state.chatScale };
+  }
+}
+
+async function resetChatScale(options = {}) {
+  try {
+    const data = await api('/api/gui/chat_scale_reset', {
+      method: 'POST',
+      body: JSON.stringify({ source: options.source || 'user' }),
+    });
+    applyChatScale(data?.chat_scale ?? data?.result?.chat_scale ?? 1.0);
+    showToast('Chat size reset to 100%', 1500);
+    return data;
+  } catch (error) {
+    applyChatScale(1.0);
+    showToast('Chat size reset locally', 1500);
+    return { ok: false, error: error.message, chat_scale: state.chatScale };
+  }
+}
+
+window.wolfGuiSetChatScale = (scale) => setChatScale(scale, { source: 'script' });
+window.wolfGuiAdjustChatScale = (delta) => adjustChatScale(delta, { source: 'script' });
+window.wolfGuiResetChatScale = () => resetChatScale({ source: 'script' });
 
 function syncComposerContextControls(options = {}) {
   const attach = Boolean(state.attachWorkspaceView);
@@ -264,6 +367,172 @@ function showToast(message, ms = 2200) {
   showToast.timer = setTimeout(() => {
     els.toast.hidden = true;
   }, ms);
+}
+
+
+function requestDisplayValue(request, key) {
+  const value = request?.[key];
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+  }
+  return String(value);
+}
+
+
+function addApprovalRequest(request = {}) {
+  const req = { ...(request || {}) };
+  const requestId = String(req.id || req.request_id || '');
+  if (!requestId) return null;
+  req.id = requestId;
+  req.request_id = requestId;
+  req.status = req.status || 'pending';
+  state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== requestId);
+  state.approvals.unshift(req);
+  renderApprovals();
+  return req;
+}
+
+function resolveApprovalRequest(requestId, patch = {}) {
+  const id = String(requestId || '');
+  if (!id) return;
+  state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== id);
+  renderApprovals();
+}
+
+function renderApprovals() {
+  const panel = els.approvalPanel;
+  const list = els.approvalList;
+  if (!panel || !list) return;
+  const pending = (state.approvals || []).filter((r) => String(r.status || 'pending') === 'pending');
+  panel.hidden = pending.length === 0;
+  list.innerHTML = '';
+  if (els.approvalCount) els.approvalCount.textContent = `${pending.length} pending`;
+  if (els.approvalEmpty) els.approvalEmpty.hidden = pending.length !== 0;
+
+  pending.forEach((request) => {
+    const card = document.createElement('article');
+    card.className = 'approval-card';
+    const title = document.createElement('div');
+    title.className = 'approval-card-title';
+    title.textContent = `${request.kind || request.action || 'permission'} · ${request.id || request.request_id || ''}`;
+    const details = document.createElement('pre');
+    details.className = 'approval-card-details';
+    const summary = {
+      action: request.action,
+      kind: request.kind,
+      command: request.command_display,
+      target_path: request.target_path,
+      operation: request.operation,
+      shell: request.shell,
+      timeout: request.timeout,
+      cwd: request.cwd,
+      purpose: request.purpose,
+      expectations: request.expectations,
+      risk_hints: request.risk_hints,
+      payload_summary: request.payload_summary,
+      payload: request.payload,
+    };
+    try { details.textContent = JSON.stringify(summary, null, 2); }
+    catch (_) { details.textContent = String(summary); }
+
+    const reason = document.createElement('input');
+    reason.type = 'text';
+    reason.className = 'approval-reason';
+    reason.placeholder = 'Optional reason/feedback';
+
+    const actions = document.createElement('div');
+    actions.className = 'approval-card-actions';
+    const once = document.createElement('button');
+    once.type = 'button';
+    once.textContent = 'Approve once';
+    const session = document.createElement('button');
+    session.type = 'button';
+    session.textContent = 'Approve session';
+    const deny = document.createElement('button');
+    deny.type = 'button';
+    deny.className = 'danger';
+    deny.textContent = 'Deny';
+    const requestId = String(request.id || request.request_id || '');
+    once.addEventListener('click', () => decideApproval(requestId, true, false, reason.value || 'approved once from Wolf GUI'));
+    session.addEventListener('click', () => decideApproval(requestId, true, true, reason.value || 'approved for session from Wolf GUI'));
+    deny.addEventListener('click', () => decideApproval(requestId, false, false, reason.value || 'denied from Wolf GUI'));
+    actions.appendChild(once);
+    actions.appendChild(session);
+    actions.appendChild(deny);
+
+    card.appendChild(title);
+    card.appendChild(details);
+    card.appendChild(reason);
+    card.appendChild(actions);
+    list.appendChild(card);
+  });
+}
+
+async function refreshApprovals() {
+  try {
+    const data = await api('/api/gui/approvals');
+    const serverRequests = Array.isArray(data?.requests) ? data.requests : [];
+
+    // Local WOLF GUI can also receive Gateway websocket permission requests.
+    // Those requests are not owned by the local /api/gui/approvals HTTP queue,
+    // so a periodic HTTP refresh must not replace/drop them.  Dropping them
+    // made the permission card flash briefly, disappear, and leave the agent
+    // blocked waiting for a decision that the user could no longer submit.
+    const gatewayPending = (state.approvals || []).filter((r) => {
+      const status = String(r?.status || 'pending');
+      return Boolean(r?.gateway_permission) && status === 'pending';
+    });
+    const seen = new Set(serverRequests.map((r) => String(r?.id || r?.request_id || '')));
+    const mergedGateway = gatewayPending.filter((r) => !seen.has(String(r?.id || r?.request_id || '')));
+    state.approvals = [...mergedGateway, ...serverRequests];
+    renderApprovals();
+  } catch (_) {
+    // Older/minimal GUI runtimes may not expose approval endpoints.
+  }
+}
+
+async function decideApproval(requestId, approved, approveForSession = false, reason = '') {
+  if (!requestId) return;
+  const id = String(requestId);
+  const existing = (state.approvals || []).find((r) => String(r.id || r.request_id) === id) || {};
+
+  // Gateway websocket permission requests are not owned by the local GUI HTTP
+  // approval queue. Send the decision back over the gateway websocket so the
+  // worker-thread PermissionManager future can unblock immediately.
+  if (existing.gateway_permission) {
+    const sent = Boolean(window.WolfGatewayUI?.sendPermissionDecision?.({
+      request_id: id,
+      kind: existing.kind,
+      action: existing.action,
+      approved: Boolean(approved),
+      approve_for_session: Boolean(approveForSession),
+      reason,
+      feedback: reason,
+    }));
+    if (sent) {
+      resolveApprovalRequest(id);
+      showToast(`Gateway permission ${approved ? 'approved' : 'denied'}`, 1800);
+    } else {
+      showToast('Gateway websocket is not open; reconnect the selected session.', 4200);
+    }
+    return;
+  }
+
+  try {
+    const data = await api(`/api/gui/approvals/${encodeURIComponent(id)}/decision`, {
+      method: 'POST',
+      body: JSON.stringify({ approved: Boolean(approved), approve_for_session: Boolean(approveForSession), reason, feedback: reason }),
+    });
+    const request = data?.request;
+    if (request?.id) {
+      state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== String(request.id || request.request_id));
+    }
+    renderApprovals();
+    showToast(`Permission ${approved ? 'approved' : 'denied'}`, 1800);
+  } catch (error) {
+    showToast(error.message || 'Failed to decide permission request', 4200);
+  }
 }
 
 function pulseHiddenSystemNotice(severity = 'warning') {
@@ -446,6 +715,73 @@ function panelSource(panel) {
   return panel.url || 'about:blank';
 }
 
+
+function panelZoom(panel) {
+  const value = Number(panel?.zoom);
+  const min = Number(panel?.min_zoom || 0.25);
+  const max = Number(panel?.max_zoom || 3.0);
+  const zoom = Number.isFinite(value) && value > 0 ? value : 1.0;
+  return Math.max(min, Math.min(max, zoom));
+}
+
+function panelZoomLabel(panel) {
+  return `${Math.round(panelZoom(panel) * 100)}%`;
+}
+
+function upsertDashboardFromPayload(payload) {
+  if (payload?.dashboard) upsertDashboard(payload.dashboard);
+  if (payload?.workspace) state.workspace = payload.workspace;
+  renderWorkspace();
+  renderDiscovery();
+}
+
+async function adjustDashboardPanelZoom(panel, delta) {
+  const data = await api('/api/gui/dashboards/panel_zoom_delta', {
+    method: 'POST',
+    body: JSON.stringify({ panel_id: panel.id, delta, source: 'user' }),
+  });
+  upsertDashboardFromPayload(data);
+  showToast(`Panel zoom ${Math.round((data.zoom || data.panel?.zoom || 1) * 100)}%`, 1500);
+}
+
+async function resetDashboardPanelZoom(panel) {
+  const data = await api('/api/gui/dashboards/panel_zoom_reset', {
+    method: 'POST',
+    body: JSON.stringify({ panel_id: panel.id, source: 'user' }),
+  });
+  upsertDashboardFromPayload(data);
+  showToast('Panel zoom reset to 100%', 1500);
+}
+
+async function closeDashboardPanel(panel) {
+  if (!panel?.id) return;
+  if (!window.confirm(`Close panel "${panel.title || panel.name || panel.id}"?`)) return;
+  const data = await api('/api/gui/dashboards/remove_panel', {
+    method: 'POST',
+    body: JSON.stringify({ panel_id: panel.id, source: 'user' }),
+  });
+  upsertDashboardFromPayload(data);
+  showToast('Dashboard panel closed', 1800);
+}
+
+async function closeDashboard(dashboard) {
+  const target = dashboard || activeDashboard();
+  if (!target?.id) return;
+  if (!window.confirm(`Close dashboard "${target.name || target.id}"?`)) return;
+  const data = await api('/api/gui/dashboards/remove', {
+    method: 'POST',
+    body: JSON.stringify({ dashboard_id: target.id, source: 'user' }),
+  });
+  if (data?.dashboard_id) {
+    state.dashboards = (state.dashboards || []).filter((d) => d.id !== data.dashboard_id);
+  }
+  if (data?.next_dashboard) upsertDashboard(data.next_dashboard);
+  if (data?.workspace) state.workspace = data.workspace;
+  renderWorkspace();
+  renderDiscovery();
+  showToast('Dashboard closed', 1800);
+}
+
 function updateDashboardToolbar() {
   const root = $('app');
   const dashboard = activeDashboard();
@@ -487,6 +823,31 @@ function renderDashboard() {
   clearDashboardActivity(dashboard.id);
   renderDashboardSwitcher();
   updateDashboardToolbar();
+  const header = document.createElement('header');
+  header.className = 'dashboard-header glass dashboard-header-compact';
+  const headerText = document.createElement('div');
+  const headerTitle = document.createElement('strong');
+  headerTitle.textContent = dashboard.name || 'Dashboard';
+  const headerMeta = document.createElement('span');
+  headerMeta.textContent = `${dashboard.panels?.length || 0} panel${(dashboard.panels?.length || 0) === 1 ? '' : 's'} · ${dashboard.layout || 'grid'}`;
+  headerText.appendChild(headerTitle);
+  headerText.appendChild(headerMeta);
+  const headerActions = document.createElement('div');
+  headerActions.className = 'dashboard-actions';
+  const closeDashboardButton = document.createElement('button');
+  closeDashboardButton.type = 'button';
+  closeDashboardButton.className = 'dashboard-close-button';
+  closeDashboardButton.textContent = 'Close dashboard';
+  closeDashboardButton.title = 'Close this dashboard and notify the agent';
+  closeDashboardButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    closeDashboard(dashboard).catch((error) => showToast(error.message || 'Failed to close dashboard', 3000));
+  });
+  headerActions.appendChild(closeDashboardButton);
+  header.appendChild(headerText);
+  header.appendChild(headerActions);
+  els.dashboard.appendChild(header);
+
   const panels = dashboard.panels || [];
   const grid = document.createElement('div');
   grid.className = `dashboard-grid layout-${dashboard.layout || 'grid'}${state.dashboardFloat ? ' is-floating' : ''}`;
@@ -523,11 +884,22 @@ function renderDashboard() {
     titleGroup.appendChild(name);
     titleGroup.appendChild(meta);
 
+    const zoom = panelZoom(panel);
+    const viewport = document.createElement('div');
+    viewport.className = 'dashboard-panel-viewport';
+    viewport.dataset.zoom = String(zoom);
+    const zoomSurface = document.createElement('div');
+    zoomSurface.className = 'dashboard-panel-zoom-surface';
+    zoomSurface.style.transform = `scale(${zoom})`;
+    zoomSurface.style.transformOrigin = 'top left';
+
     const frame = document.createElement('iframe');
     frame.className = 'dashboard-panel-frame';
     frame.title = panel.title || panel.name || 'Dashboard panel';
     frame.sandbox = 'allow-same-origin allow-scripts allow-forms allow-popups allow-downloads';
     frame.src = panelSource(panel);
+    zoomSurface.appendChild(frame);
+    viewport.appendChild(zoomSurface);
 
     const controls = document.createElement('div');
     controls.className = 'dashboard-panel-nav';
@@ -550,10 +922,62 @@ function renderDashboard() {
       controls.appendChild(button);
     });
 
+    const zoomControls = document.createElement('div');
+    zoomControls.className = 'dashboard-panel-zoom-controls';
+    const zoomOut = document.createElement('button');
+    zoomOut.type = 'button';
+    zoomOut.textContent = '−';
+    zoomOut.title = 'Zoom panel out';
+    zoomOut.addEventListener('click', (event) => {
+      event.stopPropagation();
+      adjustDashboardPanelZoom(panel, -(Number(panel.zoom_step || 0.1))).catch((error) => showToast(error.message || 'Failed to zoom panel', 3000));
+    });
+    const zoomLabel = document.createElement('button');
+    zoomLabel.type = 'button';
+    zoomLabel.className = 'dashboard-panel-zoom-label';
+    zoomLabel.textContent = panelZoomLabel(panel);
+    zoomLabel.title = 'Reset panel zoom to 100%';
+    zoomLabel.addEventListener('click', (event) => {
+      event.stopPropagation();
+      resetDashboardPanelZoom(panel).catch((error) => showToast(error.message || 'Failed to reset zoom', 3000));
+    });
+    const zoomIn = document.createElement('button');
+    zoomIn.type = 'button';
+    zoomIn.textContent = '+';
+    zoomIn.title = 'Zoom panel in';
+    zoomIn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      adjustDashboardPanelZoom(panel, Number(panel.zoom_step || 0.1)).catch((error) => showToast(error.message || 'Failed to zoom panel', 3000));
+    });
+    const zoomReset = document.createElement('button');
+    zoomReset.type = 'button';
+    zoomReset.textContent = '100';
+    zoomReset.title = 'Reset panel zoom';
+    zoomReset.addEventListener('click', (event) => {
+      event.stopPropagation();
+      resetDashboardPanelZoom(panel).catch((error) => showToast(error.message || 'Failed to reset zoom', 3000));
+    });
+    zoomControls.appendChild(zoomOut);
+    zoomControls.appendChild(zoomLabel);
+    zoomControls.appendChild(zoomIn);
+    zoomControls.appendChild(zoomReset);
+    controls.appendChild(zoomControls);
+
+    const closePanelButton = document.createElement('button');
+    closePanelButton.type = 'button';
+    closePanelButton.className = 'dashboard-panel-close';
+    closePanelButton.textContent = '×';
+    closePanelButton.title = 'Close this panel and notify the agent';
+    closePanelButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeDashboardPanel(panel).catch((error) => showToast(error.message || 'Failed to close panel', 3000));
+    });
+    controls.appendChild(closePanelButton);
+
     bar.appendChild(titleGroup);
     bar.appendChild(controls);
     card.appendChild(bar);
-    card.appendChild(frame);
+    card.appendChild(viewport);
     const resize = document.createElement('div');
     resize.className = 'dashboard-panel-resize';
     resize.title = state.dashboardFloat ? 'Resize floating dashboard panel' : 'Resize dashboard panel';
@@ -675,6 +1099,8 @@ function renderMessages() {
 
   const systemNoticeSeverity = (message) => {
     const metadata = message?.metadata || {};
+
+
     const tokens = [
       metadata.severity, metadata.level, metadata.tone, metadata.status, metadata.type,
       metadata.gateway_event?.severity, metadata.gateway_event?.level, metadata.gateway_event?.status, metadata.gateway_event?.type,
@@ -874,6 +1300,11 @@ function renderMessages() {
 }
 
 window.wolfGuiRenderMessages = renderMessages;
+window.wolfGuiAddApprovalRequest = addApprovalRequest;
+window.wolfGuiResolveApprovalRequest = resolveApprovalRequest;
+window.wolfGuiRenderApprovals = renderApprovals;
+window.wolfGuiShowToast = showToast;
+window.wolfGuiPulsePermissionPanel = pulseHiddenSystemNotice;
 
 function renderDiscovery() {
   const workflowCount = state.workflows && !state.workflows.error ? Object.keys(state.workflows).length : 0;
@@ -923,7 +1354,9 @@ function renderAll() {
   renderWorkspace();
   renderAnnotations();
   renderMessages();
+  renderApprovals();
   renderDiscovery();
+  applyChatScale(state.chatScale, { persist: false });
 }
 
 function setAnnotationMode(mode) {
@@ -939,6 +1372,7 @@ async function bootstrap() {
   state.workspace = data.workspace || state.workspace;
   state.annotations = data.annotations || [];
   state.messages = data.messages || [];
+  state.approvals = data.approvals || state.approvals || [];
   state.apps = data.apps || [];
   state.dashboards = data.dashboards || [];
   state.workflows = data.workflows || {};
@@ -1331,6 +1765,10 @@ function installWorkspaceHandlers() {
     updateUiPrefs({ showSystemMessages: state.showSystemMessages });
     renderMessages();
   });
+  els.chatScaleDown?.addEventListener('click', () => adjustChatScale(-0.1));
+  els.chatScaleUp?.addEventListener('click', () => adjustChatScale(0.1));
+  els.chatScaleLabel?.addEventListener('click', () => resetChatScale());
+  els.chatScaleReset?.addEventListener('click', () => resetChatScale());
   els.toggleRect.addEventListener('click', () => setAnnotationMode('rect'));
 
   els.clearAnnotations.addEventListener('click', async () => {
@@ -1513,6 +1951,7 @@ function installPanelHandlers() {
     els.panelTab.hidden = true;
   });
   els.refreshState.addEventListener('click', bootstrap);
+  els.approvalRefresh?.addEventListener('click', refreshApprovals);
   els.includeVisualContext?.addEventListener('change', () => {
     state.attachWorkspaceView = Boolean(els.includeVisualContext.checked);
     updateUiPrefs({ attachWorkspaceView: state.attachWorkspaceView });
@@ -1657,13 +2096,31 @@ function applyEvent(event) {
     return;
   }
 
-  if (t === 'dashboard_panel_added' || t === 'dashboard_panel_updated') {
+  if (t === 'dashboard_panel_added' || t === 'dashboard_panel_updated' || t === 'dashboard_panel_zoom_changed') {
     if (payload?.dashboard) {
       upsertDashboard(payload.dashboard);
       markDashboardActivity(payload.dashboard.id);
     }
     renderDiscovery();
     if (state.workspace?.mode === 'dashboard') renderWorkspace();
+    return;
+  }
+
+  if (t === 'dashboard_panel_removed') {
+    if (payload?.dashboard) upsertDashboard(payload.dashboard);
+    renderDiscovery();
+    if (state.workspace?.mode === 'dashboard') renderWorkspace();
+    showToast(`Dashboard panel closed: ${payload?.panel?.title || payload?.panel?.name || 'panel'}`, 2200);
+    return;
+  }
+
+  if (t === 'dashboard_removed') {
+    if (payload?.dashboard_id) state.dashboards = (state.dashboards || []).filter((d) => d.id !== payload.dashboard_id);
+    if (payload?.next_dashboard) upsertDashboard(payload.next_dashboard);
+    if (payload?.workspace) state.workspace = payload.workspace;
+    renderWorkspace();
+    renderDiscovery();
+    showToast(`Dashboard closed: ${payload?.dashboard?.name || 'dashboard'}`, 2200);
     return;
   }
 
@@ -1715,9 +2172,36 @@ function applyEvent(event) {
     return;
   }
 
+  if (t === 'chat_scale_changed') {
+    applyChatScale(payload?.chat_scale ?? state.chatScale);
+    showToast(`Chat size ${chatScaleLabel()}`, 1500);
+    return;
+  }
+
   if (t === 'agent_status') {
     const msg = payload?.message || 'Agent updated workspace';
     showToast(msg, 2200);
+    return;
+  }
+
+  if (t === 'approval_requested') {
+    const request = payload?.request || payload;
+    if (request?.id) {
+      state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== String(request.id || request.request_id));
+      state.approvals.unshift(request);
+      renderApprovals();
+      showToast(`Permission requested: ${request.kind || request.action || 'agent action'}`, 4000);
+    }
+    return;
+  }
+
+  if (t === 'approval_decided') {
+    const request = payload?.request || {};
+    const id = request.id || request.request_id || payload?.request_id;
+    if (id) {
+      state.approvals = (state.approvals || []).filter((r) => String(r.id || r.request_id) !== String(id));
+      renderApprovals();
+    }
     return;
   }
 
@@ -1748,8 +2232,10 @@ installToolbarGroupHandlers();
 installPanelHandlers();
 installDashboardPanelHandlers();
 restoreAgentPanelPrefs();
+applyChatScale(state.chatScale, { persist: false });
 syncComposerContextControls();
 renderDashboardSwitcher();
 bootstrap().catch((error) => showToast(error.message, 5000));
 setInterval(refreshHealth, 5000);
+setInterval(() => refreshApprovals().catch(() => {}), 2500);
 pollEvents();

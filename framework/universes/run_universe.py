@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from framework.universes.data_models import BaseUniverseParams
 from framework.universes.base_universe import run_app
+from framework.universes.status_files import write_status_atomic
 
 def main():
     parser = argparse.ArgumentParser(description="Run a universe from parameters JSON file")
@@ -26,7 +27,7 @@ def main():
     # Write initial status if a status file is provided
     if args.status_file:
         try:
-            Path(args.status_file).write_text(json.dumps({"status": "starting"}), encoding="utf-8")
+            write_status_atomic(args.status_file, {"status": "starting", "pid": __import__("os").getpid()})
         except Exception:
             pass
 

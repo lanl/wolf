@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -153,11 +154,50 @@ class WriteFileAction(AgentAction):
     Provide exactly one of content, content_lines, or content_base64.
     """
 
-    def execute(self, infra: Any = None) -> Path:
+    def execute(self, infra: Any = None) -> Path | str | dict[str, Any] | None:
         try:
+            content = self.payload.resolved_content()
+
+            if infra is not None and hasattr(infra, "request_write_file_approval"):
+                approval_request = {
+                    "action": self.action,
+                    "payload": self.payload.model_dump(mode="json", exclude_none=True),
+                    "payload_summary": (
+                        f"{'Append to' if self.payload.append else 'Write'} {self.payload.file_path} "
+                        f"({len(content)} chars)"
+                    ),
+                    "target_path": self.payload.file_path,
+                    "operation": "append" if self.payload.append else "write",
+                    "cwd": os.getcwd(),
+                    "purpose": self.purpose,
+                    "expectations": self.expectations,
+                    "risk_hints": [
+                        "local file modification",
+                        "append" if self.payload.append else "overwrite/create",
+                    ],
+                }
+                approval = infra.request_write_file_approval(approval_request)
+                if not approval.get("approved", False):
+                    result = {
+                        "ok": False,
+                        "approved": False,
+                        "target_path": self.payload.file_path,
+                        "operation": approval_request["operation"],
+                        "error": approval.get("reason") or "write_file was denied by user approval policy",
+                        "approval": approval,
+                    }
+                    if infra is not None:
+                        infra.append_chat_history(
+                            actor="system",
+                            content=f"[WriteFileAction][denied]: {result}",
+                            action={"action": "system_info"},
+                            log_console=True,
+                        )
+                    return result
+
             result = write_file(
                 file_path=self.payload.file_path,
-                content=self.payload.resolved_content(),
+                content=content,
                 append=self.payload.append,
             )
         except Exception as action_err:
@@ -166,10 +206,11 @@ class WriteFileAction(AgentAction):
                 f"error message: {action_err}"
             )
         ctx_msg = f"{result}"
-        infra.append_chat_history(
-            actor="system",
-            content=ctx_msg,
-            action={"action": "system_info"},
-            log_console=True,
-        )
-        return
+        if infra is not None:
+            infra.append_chat_history(
+                actor="system",
+                content=ctx_msg,
+                action={"action": "system_info"},
+                log_console=True,
+            )
+        return result

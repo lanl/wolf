@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Wolf GUI</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=gui-agent-clean-layout-v1" />
   </head>
   <body>
     <div id="app" class="wolf-shell">
@@ -110,7 +110,27 @@
             <button id="agent-resume-run" type="button" disabled>Resume</button>
             <button id="agent-stop-run" type="button" disabled>Stop after step</button>
           </section>
+          <section id="approval-panel" class="approval-panel" aria-label="Pending permission requests" hidden>
+            <div class="approval-panel-header">
+              <div>
+                <span class="tiny muted">Local approvals</span>
+                <strong id="approval-panel-title">Permission requests</strong>
+              </div>
+              <div class="approval-panel-actions">
+                <span id="approval-count" class="approval-count" aria-live="polite">0 pending</span>
+                <button id="approval-refresh" type="button" title="Refresh pending approvals" aria-label="Refresh pending approvals">↻</button>
+              </div>
+            </div>
+            <div id="approval-list" class="approval-list" aria-live="polite"></div>
+            <p id="approval-empty" class="approval-empty muted tiny">No permission requests are waiting.</p>
+          </section>
           <div class="message-toolbar" aria-label="Message display controls">
+            <div class="chat-scale-controls" role="group" aria-label="Chat content size controls">
+              <button id="chat-scale-down" class="message-filter-pill" type="button" title="Decrease chat content size" aria-label="Decrease chat content size">A−</button>
+              <button id="chat-scale-label" class="message-filter-pill chat-scale-label" type="button" title="Reset chat content size" aria-label="Reset chat content size">100%</button>
+              <button id="chat-scale-up" class="message-filter-pill" type="button" title="Increase chat content size" aria-label="Increase chat content size">A+</button>
+              <button id="chat-scale-reset" class="message-filter-pill" type="button" title="Reset chat content size to 100%" aria-label="Reset chat content size to 100%">Reset</button>
+            </div>
             <button id="toggle-system-messages" class="message-filter-pill is-active" type="button" aria-pressed="true" title="Show or hide compact system and gateway notices">System notices on</button>
           </div>
           <div id="messages" class="messages"></div>
@@ -154,7 +174,7 @@
   <div class="wolf-gateway-modal" role="dialog" aria-modal="true" aria-labelledby="wolfGatewayTitle">
     <div class="wolf-gateway-header">
       <div>
-        <p class="wolf-gateway-kicker">Wolf / Cerberus</p>
+        <p class="wolf-gateway-kicker">Wolf</p>
         <h2 id="wolfGatewayTitle">Connect to gateway</h2>
       </div>
       <button id="wolfGatewayCloseButton" class="wolf-gateway-icon" type="button" aria-label="Close gateway dialog" onclick="window.WolfGatewayUI ? window.WolfGatewayUI.close() : (document.getElementById('wolfGatewayOverlay')?.classList.add('wolf-gateway-hidden'))">×</button>
@@ -164,6 +184,7 @@
       <button class='wolf-gateway-tab' type='button' data-gateway-tab='agent' aria-selected='false'><span aria-hidden='true'>🧠</span><span>Agent</span></button>
       <button class='wolf-gateway-tab' type='button' data-gateway-tab='policy' aria-selected='false'><span aria-hidden='true'>🛡️</span><span>Policy</span></button>
       <button class='wolf-gateway-tab' type='button' data-gateway-tab='kanban' aria-selected='false'><span aria-hidden='true'>▦</span><span>Kanban</span></button>
+      <button class='wolf-gateway-tab' type='button' data-gateway-tab='infrastructure' aria-selected='false'><span aria-hidden='true'>🛰️</span><span>Infrastructure</span></button>
     </nav>
     <form id='wolfGatewayForm' class='wolf-gateway-form'>
       <div class='wolf-gateway-page-stack'>
@@ -173,7 +194,7 @@
               <p class='wolf-gateway-section-kicker'>Step 1</p>
               <h3>Authenticate and choose a session</h3>
             </div>
-            <p>Connect to a Cerberus gateway, then select or create the Wolf session that will drive this workspace.</p>
+            <p>Connect to a WOLF gateway, then select or create the WOLF session that will drive this workspace.</p>
           </div>
           <div class='wolf-gateway-card-grid'>
             <label class='wolf-gateway-config-wide'>Gateway URL
@@ -213,7 +234,7 @@
           </section>
         </section>
 
-        <section class='wolf-gateway-page' data-gateway-panel='agent' hidden>
+        <section class='wolf-gateway-page wolf-gateway-agent-page' data-gateway-panel='agent' hidden>
           <div class='wolf-gateway-page-head'>
             <div>
               <p class='wolf-gateway-section-kicker'>Step 2</p>
@@ -336,6 +357,9 @@
               <label class='wolf-gateway-check'><input id='wolfCfgEnableWrite' type='checkbox' /> Enable write_file</label>
               <label class='wolf-gateway-check'><input id='wolfCfgEnableSyscall' type='checkbox' /> Enable run_syscall</label>
               <label class='wolf-gateway-check'><input id='wolfCfgEnableGuiCapture' type='checkbox' /> Enable GUI screenshot capture</label>
+              <label class='wolf-gateway-check'><input id='wolfCfgEnableUniverseManagement' type='checkbox' /> Enable universe management</label>
+              <label class='wolf-gateway-check'><input id='wolfCfgEnableUniverseToolExecution' type='checkbox' /> Enable universe tool execution</label>
+              <label class='wolf-gateway-check'><input id='wolfCfgEnableDestructiveKb' type='checkbox' /> Enable destructive KB actions</label>
               <label class='wolf-gateway-check'><input id='wolfCfgSyscallShell' type='checkbox' /> Allow syscall shell</label>
               <label>Syscall timeout
                 <input id='wolfCfgSyscallTimeout' type='number' min='1' max='120' step='1' />
@@ -343,8 +367,11 @@
               <label class='wolf-gateway-config-wide'>Allowed actions (comma separated; blank = policy default)
                 <input id='wolfCfgActionNames' type='text' placeholder='send_message, read_file' autocomplete='off' />
               </label>
-              <label class='wolf-gateway-config-wide'>Syscall allowlist (comma separated)
-                <input id='wolfCfgSyscallAllow' type='text' placeholder='pwd, ls, cat, grep' autocomplete='off' />
+              <label class='wolf-gateway-config-wide'>Allowed syscalls / commands (comma separated; auto-run)
+                <input id='wolfCfgSyscallAllow' type='text' placeholder='pwd, ls, cat, grep, python3, du' autocomplete='off' />
+              </label>
+              <label class='wolf-gateway-config-wide'>Denied syscalls / commands (comma separated; always block)
+                <input id='wolfCfgSyscallDeny' type='text' placeholder='rm, sudo, curl, wget, ssh' autocomplete='off' />
               </label>
             </div>
             <details class='wolf-gateway-raw-panel'>
@@ -412,6 +439,51 @@
             </aside>
           </section>
         </section>
+
+        <section class='wolf-gateway-page wolf-gateway-infra-page' data-gateway-panel='infrastructure' hidden>
+          <div class='wolf-gateway-page-head'>
+            <div>
+              <p class='wolf-gateway-section-kicker'>Infrastructure</p>
+              <h3>Universes and managed deployments</h3>
+            </div>
+            <p>Read-only view of known Universes from infra.UNIVs and lifecycle handles from infra.managed_deployments.</p>
+          </div>
+          <section class='wolf-gateway-infra-shell' aria-label='Gateway infrastructure snapshot'>
+            <div class='wolf-gateway-actions-inline'>
+              <button id='wolfGatewayInfraRefresh' class='wolf-gateway-ghost' type='button'>Refresh infrastructure</button>
+              <button id='wolfGatewayDeploymentsRefresh' class='wolf-gateway-ghost' type='button'>Refresh deployments</button>
+            </div>
+            <div class='wolf-gateway-infra-metrics'>
+              <div class='wolf-gateway-infra-metric'><span>Universes</span><strong id='wolfGatewayInfraMetricUniverses'>0</strong></div>
+              <div class='wolf-gateway-infra-metric'><span>Apps</span><strong id='wolfGatewayInfraMetricApps'>0</strong></div>
+              <div class='wolf-gateway-infra-metric'><span>Deployments</span><strong id='wolfGatewayInfraMetricDeployments'>0</strong></div>
+              <div class='wolf-gateway-infra-metric'><span>Warnings</span><strong id='wolfGatewayInfraMetricWarnings'>0</strong></div>
+              <div class='wolf-gateway-infra-metric'><span>Endpoint issues</span><strong id='wolfGatewayInfraMetricEndpointIssues'>0</strong></div>
+            </div>
+            <div id='wolfGatewayInfraNotice' class='wolf-gateway-infra-notice'>Connect a Gateway session, then refresh infrastructure.</div>
+            <section class='wolf-gateway-infra-section'>
+              <h4>Known Universes <small>interaction registry</small></h4>
+              <div id='wolfGatewayUniversesTable' class='wolf-gateway-infra-table wolf-gateway-empty'>No Universes loaded.</div>
+            </section>
+            <section class='wolf-gateway-infra-section'>
+              <h4>Universe apps <small>visual surfaces and app lifecycles</small></h4>
+              <div id='wolfGatewayUniverseAppsTable' class='wolf-gateway-infra-table wolf-gateway-empty'>No Universe apps loaded.</div>
+              <details class='wolf-gateway-infra-details'><summary>Universe app logs / action result</summary><div id='wolfGatewayUniverseAppLogsSummary' class='wolf-gateway-infra-log-summary'>No Universe app action loaded.</div><pre id='wolfGatewayUniverseAppLogs' class='wolf-gateway-infra-pre'></pre></details>
+            </section>
+            <section class='wolf-gateway-infra-section'>
+              <h4>Managed deployments <small>lifecycle registry</small></h4>
+              <div id='wolfGatewayDeploymentsTable' class='wolf-gateway-infra-table wolf-gateway-empty'>No deployments loaded.</div>
+            </section>
+            <details class='wolf-gateway-raw-panel'>
+              <summary>Deployment logs</summary>
+              <pre id='wolfGatewayDeploymentLogs' class='wolf-gateway-infra-pre'></pre>
+            </details>
+            <details class='wolf-gateway-raw-panel'>
+              <summary>Raw infrastructure snapshot JSON</summary>
+              <pre id='wolfGatewayInfraRaw' class='wolf-gateway-infra-pre'></pre>
+            </details>
+          </section>
+        </section>
       </div>
 
       <div class='wolf-gateway-footer'>
@@ -425,6 +497,6 @@
   </div>
 </div>
 
-    <script src="/static/gateway.js?v=gateway-visual-context-v1"></script>
+    <script src="/static/gateway.js?v=gateway-permission-v3"></script>
   </body>
 </html>

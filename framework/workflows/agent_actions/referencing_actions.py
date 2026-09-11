@@ -12,13 +12,29 @@ class _ReferenceBase(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def accept_path_alias(cls, data: Any):
-        """Accept legacy/model-facing path/url aliases for reference.
+        """Accept convenient reference shapes before validation.
 
-        Several prompts and GUI/capture paths advertise reference payloads as
-        {name, path}, while the canonical Pydantic model field is {name,
-        reference}.  Normalize before validation so send_message can attach GUI
-        capture files without failing when the model emits path.
+        Canonical reference payloads are objects shaped like:
+
+            {"name": "capture.png", "reference": "path/to/capture.png"}
+
+        In practice, agents often emit shorter or legacy forms, especially after
+        GUI/capture workflows, such as:
+
+            "path/to/capture.png"
+            {"name": "capture.png", "path": "path/to/capture.png"}
+            {"url": "https://example.test/file.png"}
+
+        Normalize these forms so otherwise-correct send_message responses do not
+        fail payload validation just because a reference list contains a string.
         """
+        if isinstance(data, str):
+            reference = data.strip()
+            return {
+                "reference": reference,
+                "name": reference.rstrip("/").split("/")[-1] or reference,
+            }
+
         if isinstance(data, dict):
             data = dict(data)
             if "reference" not in data:

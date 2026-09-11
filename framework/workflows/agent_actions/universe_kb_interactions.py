@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import requests
@@ -12,6 +13,7 @@ from framework.knowledgebase.base_multimodal_knowledgebase import MultimodalKnow
 from framework.universes.base_universe import CreateKBRequest
 
 from framework.workflows.base_agent_action import AgentAction
+from framework.universes.endpoint_resolver import get_universe_base_url_or_error
 from framework.workflows.agent_actions.formatting_utils import resolve_text_list_source, resolve_text_source
 
 
@@ -43,6 +45,7 @@ class CreateKBAction(AgentAction):
 
     def execute(self, infra) -> None:
         univ_name = self.payload.univ_name.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         kb_type = self.payload.type.lower()
         
         # Check if universe exists in managed deployments
@@ -55,7 +58,9 @@ class CreateKBAction(AgentAction):
         
         try:
             univ = infra.UNIVs[univ_name]
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             
             # Prepare KB creation request
             kb_params = self.payload.kb_params
@@ -161,6 +166,7 @@ class UniverseKBSearchAction(AgentAction):
     yield_motion_to: Optional[str] = Field(default=None, description="Entity who's turn is next")
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -169,7 +175,9 @@ class UniverseKBSearchAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/search",
                 json={"query": self.payload.query, "k": self.payload.k, "context_window": self.payload.context_window},
@@ -229,6 +237,7 @@ class UniverseKBAppendTextsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -237,7 +246,9 @@ class UniverseKBAppendTextsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/append_texts",
                 json={"texts": self.payload.texts, "doc_source": self.payload.doc_source},
@@ -279,6 +290,7 @@ class UniverseKBAddURLAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -287,7 +299,9 @@ class UniverseKBAddURLAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/add_url",
                 json={"url": self.payload.url},
@@ -328,6 +342,7 @@ class UniverseKBAddURLsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -335,7 +350,9 @@ class UniverseKBAddURLsAction(AgentAction):
                        f"  {info_err}")
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/add_urls",
                 json={"urls": self.payload.urls},
@@ -392,6 +409,7 @@ class UniverseKBAddDocumentAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -400,7 +418,9 @@ class UniverseKBAddDocumentAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.post(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/add_document",
                 json={
@@ -444,6 +464,7 @@ class UniverseKBStatsAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -452,7 +473,9 @@ class UniverseKBStatsAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/kbs/{self.payload.kb_name}/stats", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -482,6 +505,7 @@ class UniverseKBSourcesAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -490,7 +514,9 @@ class UniverseKBSourcesAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(f"{univ_base_url}/kbs/{self.payload.kb_name}/sources", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -520,6 +546,7 @@ class UniverseKBPurgeAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -528,7 +555,48 @@ class UniverseKBPurgeAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
+            if hasattr(infra, "request_permission"):
+                approval_request = {
+                    "action": self.action,
+                    "payload": self.payload.model_dump(mode="json"),
+                    "payload_summary": f"Purge all content from KB '{self.payload.kb_name}' in universe '{univ_name}'",
+                    "operation": "universe_kb_purge",
+                    "target_path": f"{univ_name}/{self.payload.kb_name}",
+                    "cwd": os.getcwd(),
+                    "purpose": self.purpose,
+                    "expectations": self.expectations,
+                    "risk_hints": [
+                        "destructive knowledgebase operation",
+                        "removes all KB content",
+                        "remote or sandbox state mutation",
+                    ],
+                    "metadata": {
+                        "universe": univ_name,
+                        "universe_url": univ_base_url,
+                        "kb_name": self.payload.kb_name,
+                    },
+                }
+                approval = infra.request_permission("universe_kb_purge", approval_request)
+                if not approval.get("approved", False):
+                    result = {
+                        "ok": False,
+                        "approved": False,
+                        "action": self.action,
+                        "universe": univ_name,
+                        "kb_name": self.payload.kb_name,
+                        "error": approval.get("reason") or "universe_kb_purge was denied by user approval policy",
+                        "approval": approval,
+                    }
+                    infra.append_chat_history(
+                        actor="system",
+                        content=f"[UniverseKBPurgeAction][denied]: {result}",
+                        action={"action": "system_info"},
+                        log_console=True,
+                    )
+                    return result
             response = requests.post(f"{univ_base_url}/kbs/{self.payload.kb_name}/purge", timeout=DEFAULT_TIMEOUT)
             response.raise_for_status()
             result = response.json()
@@ -566,6 +634,7 @@ class UniverseKBGetDocumentAction(AgentAction):
 
     def execute(self, infra) -> Dict[str, Any]:
         univ_name = self.payload.universe.strip()
+        univ_base_url = f"<unresolved:{univ_name}>"
         try:
             univ = infra.UNIVs[univ_name]
         except Exception as info_err:
@@ -574,7 +643,9 @@ class UniverseKBGetDocumentAction(AgentAction):
             infra.append_chat_history(actor="system", content=ctx_msg, action={"action": "system_info"}, log_console=True,)
             return
         try:
-            univ_base_url = univ.get_base_url()
+            univ_base_url, resolve_error, _resolution = get_universe_base_url_or_error(infra, univ_name)
+            if resolve_error:
+                raise RuntimeError(resolve_error)
             response = requests.get(
                 f"{univ_base_url}/kbs/{self.payload.kb_name}/document/{self.payload.document_id}",
                 timeout=DEFAULT_TIMEOUT

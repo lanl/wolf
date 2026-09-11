@@ -39,7 +39,7 @@ from framework.infrastructure.base_memory_manager import MemoryManager
 from framework.infrastructure.base_context_manager import ContextManager
 from framework.infrastructure.base_infrastructure import BaseInfrastructure 
 #from framework.workflows.base_workflow import BaseWorkflow
-from framework.workflows.custom_workflows.turn_based_workflow import TurnBasedWorkflow
+from framework.workflows.custom_workflows.fast_workflow import FastTurnBasedWorkflow
 from framework.workflows.base_workflow import BaseWorkflow
 
 
@@ -154,7 +154,7 @@ def build_list_universes(session_params):
     return UNIVs
 
 
-def load_existing_session(session_identifier: str, session_params: dict, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow) -> dict:
+def load_existing_session(session_identifier: str, session_params: dict, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = FastTurnBasedWorkflow) -> dict:
     """Load an existing session from snapshots.
     
     Args:
@@ -305,7 +305,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     }
 
 
-def setup_cli_session(session_params, resume_session: Optional[str] = None, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow):
+def setup_cli_session(session_params, resume_session: Optional[str] = None, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = FastTurnBasedWorkflow):
     """Setup CLI session - either new or resumed.
     
     Args:
@@ -443,7 +443,7 @@ class BaseSession:
 class CliSession(BaseSession):
     def __init__(self, session_params, db_client: Optional[chromadb.Client] = None):
         super().__init__(session_params=session_params, db_client=db_client)
-    def create_session(self, resume_session: Optional[str] = None, db_client=None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow):
+    def create_session(self, resume_session: Optional[str] = None, db_client=None, workflow_cls: Type[BaseWorkflow] = FastTurnBasedWorkflow):
         if db_client is None: db_client = self.db_client
         self.session = setup_cli_session(session_params=self.session_params,
                                          resume_session=resume_session,

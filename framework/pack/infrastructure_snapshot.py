@@ -4,7 +4,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import dataclasses
+import json
 import time
+from urllib.parse import urljoin
 
 SECRET_KEY_PARTS = (
     'api_key', 'apikey', 'token', 'secret', 'password', 'authorization',
@@ -197,6 +199,108 @@ def _tool_resource(name: str, tool: Any, *, owner_type: str, owner_id: str, loca
     }
 
 
+def _absolute_app_url(base_url: str | None, raw_url: Any) -> str:
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    base = str(base_url or "").strip()
+    if not base:
+        return raw
+    return urljoin(base.rstrip("/") + "/", raw.lstrip("/"))
+
+
+def _absolute_app_websocket_url(base_url: str | None, raw_url: Any) -> str:
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("ws://") or raw.startswith("wss://"):
+        return raw
+    if raw.startswith("http://"):
+        return "ws://" + raw[len("http://"):]
+    if raw.startswith("https://"):
+        return "wss://" + raw[len("https://"):]
+    base = str(base_url or "").strip()
+    if not base:
+        return raw
+    absolute = urljoin(base.rstrip("/") + "/", raw.lstrip("/"))
+    if absolute.startswith("http://"):
+        return "ws://" + absolute[len("http://"):]
+    if absolute.startswith("https://"):
+        return "wss://" + absolute[len("https://"):]
+    return absolute
+
+
+def _universe_base_url(universe_obj: Any) -> str:
+    target = _safe_getattr(universe_obj, 'info') or universe_obj
+    host = _safe_getattr(target, 'host')
+    port = _safe_getattr(target, 'port')
+    if not host:
+        return ""
+    host_s = str(host).rstrip("/")
+    if host_s.startswith("http://") or host_s.startswith("https://"):
+        if port and str(port) not in {"0", "None"} and ":" not in host_s.rsplit("/", 1)[-1]:
+            return f"{host_s}:{int(port)}"
+        return host_s
+    if port and str(port) not in {"0", "None"}:
+        return f"http://{host_s}:{int(port)}"
+    return f"http://{host_s}"
+
+
+def _app_resource(name: str, app: Any, *, owner_type: str, owner_id: str, locality: str, source: str, universe_name: Optional[str] = None, universe_base_url: Optional[str] = None) -> Dict[str, Any]:
+    metadata = redact_value(app, max_depth=4)
+    if not isinstance(metadata, dict):
+        metadata = {'value': metadata}
+    app_id = str(metadata.get('app_id') or metadata.get('id') or name)
+    title = str(metadata.get('title') or metadata.get('name') or app_id)
+    status = str(metadata.get('status') or 'unknown')
+    base_url = str(universe_base_url or metadata.get('universe_base_url') or '').rstrip('/')
+    url = _absolute_app_url(base_url, metadata.get('url'))
+    view_url = _absolute_app_url(base_url, metadata.get('view_url') or metadata.get('url'))
+    proxy_url = _absolute_app_url(base_url, metadata.get('proxy_url'))
+    websocket_url = _absolute_app_websocket_url(base_url, metadata.get('websocket_url'))
+    lifecycle_endpoints = {}
+    if base_url:
+        quoted = str(app_id)
+        lifecycle_endpoints = {
+            'manifest': f'{base_url}/apps/{quoted}/manifest',
+            'start': f'{base_url}/apps/{quoted}/start',
+            'stop': f'{base_url}/apps/{quoted}/stop',
+            'restart': f'{base_url}/apps/{quoted}/restart',
+            'delete': f'{base_url}/apps/{quoted}',
+            'logs': f'{base_url}/apps/{quoted}/logs',
+            'websocket_proxy': f'{base_url}/apps/{quoted}/proxy',
+        }
+    return {
+        'id': f'app:{owner_type}:{owner_id}:{universe_name or "universe"}:{app_id}',
+        'name': app_id,
+        'app_id': app_id,
+        'title': title,
+        'display_name': title,
+        'kind': 'app',
+        'app_kind': metadata.get('kind') or 'custom',
+        'backend': metadata.get('backend') or metadata.get('app_backend') or 'url',
+        'url': url,
+        'view_url': view_url,
+        'proxy_url': proxy_url,
+        'websocket_url': websocket_url,
+        'universe': str(universe_name or metadata.get('universe') or ''),
+        'universe_base_url': base_url,
+        'lifecycle_endpoints': lifecycle_endpoints,
+        'locality': locality,
+        'owner_type': owner_type,
+        'owner_id': str(owner_id),
+        'source': source,
+        'status': status,
+        'shared': locality in {'gateway_session', 'shared_client', 'remote_universe', 'local_universe', 'main_workflow'},
+        'persistent': False,
+        'write_capable': bool(lifecycle_endpoints),
+        'destructive_capable': bool(lifecycle_endpoints),
+        'metadata': metadata,
+    }
+
+
 def _toolbox_tool_items(tb: Any) -> List[Any]:
     direct = _safe_getattr(tb, 'tools')
     if isinstance(direct, dict):
@@ -246,6 +350,7 @@ def _resource(kind: str, name: str, obj: Any, owner_type: str, owner_id: str, lo
     if kind == 'universe':
         metadata['kb_count'] = _len(_safe_getattr(obj, 'KBs'))
         metadata['tb_count'] = _len(_safe_getattr(obj, 'TBs'))
+        metadata['app_count'] = _len(_safe_getattr(obj, 'Apps'))
         allowed = _safe_getattr(obj, 'allowed_actions')
         if callable(allowed):
             try:
@@ -272,7 +377,7 @@ def _resource(kind: str, name: str, obj: Any, owner_type: str, owner_id: str, lo
 
 
 def summarize_resources_from_infra(infra: Any, *, owner_type: str, owner_id: str, locality: str, source: str) -> Dict[str, List[Dict[str, Any]]]:
-    resources = {'kbs': [], 'tbs': [], 'tools': [], 'universes': []}
+    resources = {'kbs': [], 'tbs': [], 'tools': [], 'universes': [], 'apps': []}
     if infra is None:
         return resources
     for name, obj in (_safe_getattr(infra, 'KBs', {}) or {}).items():
@@ -284,6 +389,33 @@ def summarize_resources_from_infra(infra: Any, *, owner_type: str, owner_id: str
     for name, obj in (_safe_getattr(infra, 'UNIVs', {}) or {}).items():
         resources['universes'].append(_resource('universe', name, obj, owner_type, owner_id, locality, source))
         nested_locality = 'local_universe' if locality not in {'remote_universe', 'actionbox'} else locality
+        universe_base_url = _universe_base_url(obj)
+        apps = []
+        list_apps = _safe_getattr(obj, 'list_apps')
+        if callable(list_apps):
+            try:
+                apps = list_apps() or []
+            except Exception:
+                apps = []
+        elif isinstance(_safe_getattr(obj, 'Apps'), dict):
+            apps = list((_safe_getattr(obj, 'Apps') or {}).values())
+        for idx, app_item in enumerate(list(apps)[:250]):
+            if isinstance(app_item, dict):
+                app_name = str(app_item.get('app_id') or app_item.get('id') or idx)
+            else:
+                app_name = str(_safe_getattr(app_item, 'app_id', idx))
+            resources.setdefault('apps', []).append(
+                _app_resource(
+                    app_name,
+                    app_item,
+                    owner_type='universe',
+                    owner_id=f'{owner_id}:{name}',
+                    locality=nested_locality,
+                    source='universe_app_registry',
+                    universe_name=str(name),
+                    universe_base_url=universe_base_url,
+                )
+            )
         nested = summarize_resources_from_infra(obj, owner_type='universe', owner_id=f'{owner_id}:{name}', locality=nested_locality, source='universe_registry')
         for key, values in nested.items():
             resources.setdefault(key, []).extend(values)
@@ -438,7 +570,7 @@ def _extend_resource_inventory_from_task_infras(resources: Dict[str, List[Dict[s
 
 def _extend_resource_inventory_from_worker(resources: Dict[str, List[Dict[str, Any]]], worker: Dict[str, Any]) -> None:
     infra_summary = worker.get('infrastructure') or {}
-    for key in ('kbs', 'tbs', 'universes'):
+    for key in ('kbs', 'tbs', 'universes', 'apps'):
         resources.setdefault(key, []).extend((infra_summary.get('resources') or {}).get(key) or [])
     for vstore in ((infra_summary.get('memory') or {}).get('vstores') or []):
         resources['vstores'].append(_vstore_resource(vstore, owner_type='worker', owner_id=worker.get('id') or worker.get('task_id') or 'unknown', locality='task_local', source='worker_session'))
@@ -577,6 +709,14 @@ def build_warnings(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
                     warnings.append({'severity': 'info', 'code': 'worker_vstore_namespace_unconfirmed', 'owner': f'worker:{wid}', 'collection_name': name, 'message': 'Worker memory vector store collection name does not show the expected orchestration namespace prefix.'})
             if vstore.get('rebuild_vstore') is True:
                 warnings.append({'severity': 'error', 'code': 'worker_vstore_rebuild_enabled', 'owner': f'worker:{wid}', 'message': 'Worker memory vector store has rebuild_vstore enabled while using orchestration worker sessions.'})
+    for deployment in snapshot.get('managed_deployments', []) or []:
+        did = deployment.get('deployment_id') or deployment.get('name') or 'unknown'
+        if deployment.get('endpoint_mismatch'):
+            warnings.append({'severity': 'warning', 'code': 'deployment_endpoint_mismatch', 'owner': f'deployment:{did}', 'message': 'Managed deployment endpoint differs from infra.UNIVs registry; repair endpoint may be needed.', 'deployment_id': did})
+        if deployment.get('kind') == 'universe' and not deployment.get('endpoint'):
+            warnings.append({'severity': 'warning', 'code': 'deployment_endpoint_missing', 'owner': f'deployment:{did}', 'message': 'Managed Universe deployment has no usable endpoint metadata.', 'deployment_id': did})
+        if str(deployment.get('status') or '').lower() in {'failed', 'error'}:
+            warnings.append({'severity': 'error', 'code': 'deployment_failed', 'owner': f'deployment:{did}', 'message': 'Managed deployment reports failed/error status.', 'deployment_id': did})
     return warnings
 
 
@@ -600,7 +740,7 @@ def build_locality_edges(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
             for name in _collection_names(vstore) or [vstore.get('name') or 'vstore']:
                 edges.append({'from': wid, 'to': f'vstore:{name}', 'kind': 'uses', 'label': 'worker uses task-local memory collection'})
     resource_map = snapshot.get('resources') or {}
-    for group in ('kbs', 'tbs', 'tools', 'universes'):
+    for group in ('kbs', 'tbs', 'tools', 'universes', 'apps'):
         for resource in resource_map.get(group) or []:
             if resource.get('owner_type') == 'task' and resource.get('owner_id'):
                 edges.append({'from': f'task:{resource.get("owner_id")}', 'to': resource.get('id'), 'kind': 'uses', 'label': f'task uses {resource.get("kind")} resource'})
@@ -624,6 +764,193 @@ def _resource_counts(resources: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
     return {k: len(v or []) for k, v in resources.items()}
 
 
+def _positive_int(value: Any) -> int | None:
+    try:
+        ivalue = int(value)
+    except Exception:
+        return None
+    return ivalue if ivalue > 0 else None
+
+
+def _read_json_file(path: Any) -> Dict[str, Any] | None:
+    if not path:
+        return None
+    try:
+        target = Path(str(path))
+        if not target.exists():
+            return None
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _safe_poll(handle: Any) -> Any:
+    poll = getattr(handle, "poll", None)
+    if callable(poll):
+        try:
+            return poll()
+        except Exception:
+            return "poll_error"
+    return None
+
+
+def _deployment_endpoint_from_entry(entry: Dict[str, Any], status_data: Dict[str, Any] | None = None) -> tuple[Dict[str, Any] | None, str]:
+    """Resolve best known endpoint from status file, backend metadata, or entry metadata."""
+    if isinstance(status_data, dict):
+        state = str(status_data.get("status") or "").strip().lower()
+        port = _positive_int(status_data.get("port"))
+        if state in {"ready", "running"} and port:
+            host = str(status_data.get("host") or "127.0.0.1")
+            scheme = str(status_data.get("scheme") or "http")
+            url = str(status_data.get("url") or f"{scheme}://{host}:{port}")
+            return {"scheme": scheme, "host": host, "port": port, "url": url}, "status_file"
+
+    for source, container in (("deployment_endpoint", entry.get("endpoint")), ("deployment_metadata", entry.get("meta_data"))):
+        if isinstance(container, dict):
+            port = _positive_int(container.get("port") or container.get("actual_port"))
+            if port:
+                host = str(container.get("host") or container.get("remote_host") or "127.0.0.1")
+                scheme = str(container.get("scheme") or "http")
+                url = str(container.get("url") or f"{scheme}://{host}:{port}")
+                return {"scheme": scheme, "host": host, "port": port, "url": url}, source
+
+    backend_handle = entry.get("backend_handle")
+    endpoint = getattr(backend_handle, "endpoint", None)
+    port = _positive_int(getattr(endpoint, "port", None))
+    host = getattr(endpoint, "host", None)
+    if endpoint is not None and host and port:
+        scheme = str(getattr(endpoint, "scheme", None) or "http")
+        url = str(getattr(endpoint, "url", None) or f"{scheme}://{host}:{port}")
+        return {"scheme": scheme, "host": str(host), "port": port, "url": url}, "backend_handle"
+
+    return None, "unknown"
+
+
+def _deployment_log_paths(entry: Dict[str, Any]) -> Dict[str, Any]:
+    paths: Dict[str, Any] = {}
+    for canonical, aliases in {
+        "stdout": ("stdout_file", "stdout_log"),
+        "stderr": ("stderr_file", "stderr_log"),
+        "status": ("status_file",),
+        "params": ("params_file",),
+    }.items():
+        for alias in aliases:
+            if entry.get(alias):
+                paths[canonical] = entry.get(alias)
+                break
+    return paths
+
+
+def summarize_managed_deployments(infra: Any) -> List[Dict[str, Any]]:
+    """Return redacted lifecycle rows from infra.managed_deployments.
+
+    This is deliberately separate from resources.universes.  resources.universes
+    describes the interaction registry (infra.UNIVs); managed_deployments
+    describes lifecycle handles, status files, PIDs, logs, and backend metadata.
+    """
+    deployments = _safe_getattr(infra, "managed_deployments", {}) or {}
+    univs = _safe_getattr(infra, "UNIVs", {}) or {}
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(deployments, dict):
+        return rows
+
+    for name, entry in sorted(deployments.items(), key=lambda item: str(item[0])):
+        if not isinstance(entry, dict):
+            rows.append({
+                "deployment_id": str(name),
+                "name": str(name),
+                "kind": "unknown",
+                "backend": "unknown",
+                "status": "unknown",
+                "metadata": redact_value(entry),
+            })
+            continue
+
+        meta = entry.get("meta_data") if isinstance(entry.get("meta_data"), dict) else {}
+        backend_handle = entry.get("backend_handle")
+        handle = entry.get("handle")
+        backend = str(entry.get("backend") or getattr(backend_handle, "backend", None) or meta.get("backend") or meta.get("deployment_type") or "unknown")
+        kind = str(meta.get("type") or "universe")
+        status = str(meta.get("status") or getattr(backend_handle, "state", None) or "unknown")
+
+        rc = _safe_poll(handle)
+        if rc is None and callable(getattr(handle, "poll", None)):
+            status = "running"
+        elif rc not in (None, "poll_error"):
+            status = f"exited({rc})"
+
+        status_data = _read_json_file(entry.get("status_file"))
+        if isinstance(status_data, dict) and status_data.get("status"):
+            status = str(status_data.get("status"))
+
+        endpoint, endpoint_source = _deployment_endpoint_from_entry(entry, status_data=status_data)
+        pid = meta.get("subprocess_pid") or getattr(handle, "pid", None) or getattr(getattr(backend_handle, "process", None), "pid", None)
+        log_paths = _deployment_log_paths(entry)
+
+        univ = univs.get(name) if isinstance(univs, dict) else None
+        univ_info = _safe_getattr(univ, "info")
+        registry_host = _safe_getattr(univ_info, "host")
+        registry_port = _positive_int(_safe_getattr(univ_info, "port"))
+        endpoint_port = _positive_int((endpoint or {}).get("port"))
+        endpoint_mismatch = bool(
+            endpoint_port and (
+                registry_port is None or
+                registry_port != endpoint_port or
+                (registry_host and endpoint and str(registry_host) != str(endpoint.get("host")))
+            )
+        )
+
+        row = {
+            "deployment_id": str(name),
+            "name": str(name),
+            "kind": kind,
+            "backend": backend,
+            "status": status,
+            "pid": pid,
+            "endpoint": endpoint,
+            "endpoint_source": endpoint_source,
+            "url": (endpoint or {}).get("url"),
+            "host": (endpoint or {}).get("host"),
+            "port": (endpoint or {}).get("port"),
+            "registry_endpoint": {
+                "host": registry_host,
+                "port": registry_port,
+            } if univ_info is not None else None,
+            "endpoint_mismatch": endpoint_mismatch,
+            "files": redact_value(log_paths),
+            "status_file_state": redact_value(status_data, max_depth=3),
+            "created_at": meta.get("created_at") or getattr(backend_handle, "created_at", None),
+            "updated_at": meta.get("updated_at") or getattr(backend_handle, "updated_at", None) or (status_data or {}).get("updated_at"),
+            "can_probe": bool(endpoint and endpoint.get("url")),
+            "can_view_logs": bool(log_paths.get("stdout") or log_paths.get("stderr")),
+            "can_repair_endpoint": bool(endpoint and endpoint_mismatch),
+            "can_terminate": True,
+            "metadata": redact_value(meta, max_depth=4),
+        }
+        rows.append(row)
+    return rows
+
+
+def deployment_counts(deployments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_status: Dict[str, int] = {}
+    by_backend: Dict[str, int] = {}
+    endpoint_mismatch = 0
+    for row in deployments or []:
+        status = str(row.get("status") or "unknown")
+        backend = str(row.get("backend") or "unknown")
+        by_status[status] = by_status.get(status, 0) + 1
+        by_backend[backend] = by_backend.get(backend, 0) + 1
+        if row.get("endpoint_mismatch"):
+            endpoint_mismatch += 1
+    return {
+        "total": len(deployments or []),
+        "by_status": dict(sorted(by_status.items())),
+        "by_backend": dict(sorted(by_backend.items())),
+        "endpoint_mismatch": endpoint_mismatch,
+    }
+
+
 async def build_infrastructure_snapshot(*, session_id: str, runtime: Optional[Dict[str, Any]], orch: Any = None) -> Dict[str, Any]:
     runtime = runtime or {}
     wf = runtime.get('wf')
@@ -642,7 +969,7 @@ async def build_infrastructure_snapshot(*, session_id: str, runtime: Optional[Di
         except Exception as exc:
             worker_sessions = [{'error': f'{type(exc).__name__}: {exc}'}]
     main_infra = summarize_base_infra(infra, owner_type='session', owner_id=session_id, locality='main_workflow', source='main_infra')
-    resources = {'kbs': [], 'tbs': [], 'tools': [], 'universes': [], 'vstores': [], 'artifacts': []}
+    resources = {'kbs': [], 'tbs': [], 'tools': [], 'universes': [], 'apps': [], 'vstores': [], 'artifacts': []}
     for key, values in (main_infra.get('resources') or {}).items():
         resources.setdefault(key, []).extend(values)
     for vstore in ((main_infra.get('memory') or {}).get('vstores') or []):
@@ -654,6 +981,7 @@ async def build_infrastructure_snapshot(*, session_id: str, runtime: Optional[Di
     _extend_resource_inventory_from_artifacts(resources, orch_snapshot)
     _extend_resource_inventory_from_nested_vstores(resources)
     tasks = list(orch_snapshot.get('tasks') or []) if isinstance(orch_snapshot, dict) else []
+    managed_deployments = summarize_managed_deployments(infra)
     snapshot = {
         'type': 'infrastructure_snapshot',
         'session_id': session_id,
@@ -683,6 +1011,8 @@ async def build_infrastructure_snapshot(*, session_id: str, runtime: Optional[Di
         'worker_sessions': worker_sessions,
         'resources': resources,
         'resource_counts': _resource_counts(resources),
+        'managed_deployments': managed_deployments,
+        'deployment_counts': deployment_counts(managed_deployments),
         'locality_edges': [],
         'warnings': [],
         'audit_summary': {},

@@ -8,6 +8,8 @@ locks. WOLF orchestration lives in GatewayActionWorkflow.
 from __future__ import annotations
 
 import asyncio
+import ast
+import concurrent.futures
 import base64
 import binascii
 import copy
@@ -19,16 +21,16 @@ import secrets
 import traceback
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 import uuid
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
@@ -47,21 +49,30 @@ from framework.gui.capture_worker import capture_url_async
 from framework.gui.capture_policy import CapturePolicy
 from framework.gui.capture_storage import CaptureStorage
 from framework.pack.orchestration_session import GatewayOrchestrationSession
-from framework.pack.infrastructure_snapshot import build_infrastructure_snapshot
+from framework.pack.infrastructure_snapshot import build_infrastructure_snapshot, summarize_managed_deployments, deployment_counts, redact_value
+from framework.permissions import PermissionRequest
 
 
-GATEWAY_DEFAULT_MODE = "single_step"
-GATEWAY_DEFAULT_MAX_STEPS = 1
+GATEWAY_DEFAULT_MODE = "wolf_loop"
+GATEWAY_DEFAULT_MAX_STEPS = 4
 GATEWAY_SAFE_ACTIONS = DEFAULT_GATEWAY_SAFE_ACTIONS
 GATEWAY_GUI_ACTIONS = [
     "gui_notify",
     "gui_get_visual_context",
+    "gui_set_chat_scale",
+    "gui_adjust_chat_scale",
+    "gui_reset_chat_scale",
     "gui_capture_url",
     "gui_capture_workspace",
     "gui_create_dashboard",
     "gui_add_dashboard_panel",
     "gui_update_dashboard_panel",
     "gui_open_dashboard",
+    "gui_set_dashboard_panel_zoom",
+    "gui_adjust_dashboard_panel_zoom",
+    "gui_reset_dashboard_panel_zoom",
+    "gui_remove_dashboard_panel",
+    "gui_remove_dashboard",
     "gui_publish_dashboard",
     "gui_register_app",
     "gui_open_app",
@@ -69,7 +80,19 @@ GATEWAY_GUI_ACTIONS = [
 GATEWAY_READ_ACTIONS = ["read_file"]
 GATEWAY_WRITE_ACTIONS = GATEWAY_SAFE_ACTIONS + GATEWAY_GUI_ACTIONS + ["write_file"]
 GATEWAY_DEV_ACTIONS = GATEWAY_WRITE_ACTIONS + ["run_syscall"]
-GATEWAY_SYSCALL_DEFAULT_ALLOWLIST = ["pwd", "ls", "cat", "head", "tail", "grep", "find", "wc", "echo"]
+GATEWAY_SYSCALL_DEFAULT_ALLOWLIST = ["pwd", "ls", "cat", "head", "tail", "grep", "find", "wc", "echo", "git", "python", "python3"]
+GATEWAY_SYSCALL_DEFAULT_DENY_PATTERNS = ["rm", "sudo", "su", "chmod", "chown", "mkfs", "dd", "shutdown", "reboot", "kill", "pkill", "curl", "wget", "ssh", "scp", "nc", "pip", "uv"]
+GATEWAY_SYSCALL_DEFAULT_CREDENTIAL_EXFILTRATION_PATTERNS = ["aws_secret_access_key", "aws_access_key_id", "github_token", "ghp_", "authorization:", "bearer ", "id_rsa", "id_dsa", "id_ed25519", "private_key", "BEGIN OPENSSH PRIVATE KEY", "BEGIN RSA PRIVATE KEY"]
+GATEWAY_HIGH_RISK_ACTIONS = [
+    "create_universe",
+    "terminate_deployment",
+    "universe_tb_execute",
+    "universe_kb_purge",
+]
+GATEWAY_UNIVERSE_MANAGEMENT_ACTIONS = ["create_universe", "terminate_deployment"]
+INFRASTRUCTURE_LIFECYCLE_ACTIONS = {"create_universe", "terminate_deployment", "list_deployments", "create_kb", "create_toolbox"}
+GATEWAY_UNIVERSE_TOOL_ACTIONS = ["universe_tb_execute"]
+GATEWAY_DESTRUCTIVE_KB_ACTIONS = ["universe_kb_purge"]
 
 GATEWAY_ORCHESTRATION_ACTIONS = {"create_subtasks", "wait_for_tasks", "complete_task", "publish_progress", "fail_task"}
 GATEWAY_PRIVILEGE_PARAM_KEYS = {
@@ -77,9 +100,15 @@ GATEWAY_PRIVILEGE_PARAM_KEYS = {
     "enable_write",
     "enable_syscall",
     "enable_gui_capture",
+    "enable_universe_management",
+    "enable_universe_tool_execution",
+    "enable_destructive_kb",
     "syscall_allowed_commands",
     "syscall_max_timeout",
     "syscall_allow_shell",
+    "syscall_request_approval_for_shell",
+    "syscall_deny_patterns",
+    "syscall_credential_exfiltration_patterns",
     "action_names",
 }
 
@@ -131,9 +160,15 @@ class AgentConfig(BaseModel):
     enable_write: bool = False
     enable_syscall: bool = False
     enable_gui_capture: bool = False
+    enable_universe_management: bool = False
+    enable_universe_tool_execution: bool = False
+    enable_destructive_kb: bool = False
     syscall_allowed_commands: Optional[List[str]] = None
-    syscall_max_timeout: int = 10
+    syscall_max_timeout: int = 900
     syscall_allow_shell: bool = False
+    syscall_request_approval_for_shell: bool = True
+    syscall_deny_patterns: Optional[List[str]] = None
+    syscall_credential_exfiltration_patterns: Optional[List[str]] = None
     gui_command_timeout_seconds: int = 60
 
 
@@ -293,6 +328,18 @@ COLLABORATION_REST_CAPABILITY_RULES = [
     ("GET", re.compile(r"^/sessions/[^/]+/join-requests$"), "can_approve_join_requests"),
     ("POST", re.compile(r"^/sessions/[^/]+/join-requests/[^/]+/(approve|reject)$"), "can_approve_join_requests"),
     ("GET", re.compile(r"^/sessions/[^/]+/infrastructure/snapshot$"), "can_view_infrastructure_snapshot"),
+    ("GET", re.compile(r"^/sessions/[^/]+/infrastructure/universes$"), "can_view_universes"),
+    ("GET", re.compile(r"^/sessions/[^/]+/infrastructure/apps$"), "can_view_universes"),
+    ("GET", re.compile(r"^/sessions/[^/]+/infrastructure/universes/[^/]+/apps/[^/]+(/(manifest|logs|view|files/.+|proxy/.*))?$"), "can_view_universes"),
+    ("POST", re.compile(r"^/sessions/[^/]+/infrastructure/universes/[^/]+/apps/[^/]+/(start|stop|restart)$"), "can_execute_agent_control"),
+    ("DELETE", re.compile(r"^/sessions/[^/]+/infrastructure/universes/[^/]+/apps/[^/]+$"), "can_execute_agent_control"),
+    ("POST", re.compile(r"^/sessions/[^/]+/infrastructure/universes/[^/]+/apps/[^/]+/proxy/.*$"), "can_execute_agent_control"),
+    ("PUT", re.compile(r"^/sessions/[^/]+/infrastructure/universes/[^/]+/apps/[^/]+/proxy/.*$"), "can_execute_agent_control"),
+    ("PATCH", re.compile(r"^/sessions/[^/]+/infrastructure/universes/[^/]+/apps/[^/]+/proxy/.*$"), "can_execute_agent_control"),
+    ("DELETE", re.compile(r"^/sessions/[^/]+/infrastructure/universes/[^/]+/apps/[^/]+/proxy/.*$"), "can_execute_agent_control"),
+    ("GET", re.compile(r"^/sessions/[^/]+/infrastructure/deployments$"), "can_view_deployments"),
+    ("GET", re.compile(r"^/sessions/[^/]+/infrastructure/deployments/[^/]+$"), "can_view_deployments"),
+    ("GET", re.compile(r"^/sessions/[^/]+/infrastructure/deployments/[^/]+/logs$"), "can_view_deployment_logs"),
     ("GET", re.compile(r"^/sessions/[^/]+/orchestration/snapshot$"), "can_request_orchestration_snapshot"),
     ("GET", re.compile(r"^/sessions/[^/]+/orchestration/agent_pool$"), "can_manage_agent_pool"),
     ("PATCH", re.compile(r"^/sessions/[^/]+/orchestration/agent_pool/mix$"), "can_manage_agent_pool"),
@@ -329,6 +376,7 @@ class ConnectionManager:
         self.orchestration_resolve_execution_policy = None
         self.orchestration_gui_command_from_workflow_event = None
         self.orchestration_should_auto_continue_gui_command = None
+        self.orchestration_permission_provider_factory = None
         self.default_agent_config = self._merged_default_agent_config(default_agent_config)
 
     def _load_collaboration_state(self) -> None:
@@ -520,7 +568,15 @@ class ConnectionManager:
             "can_send_chat_to_agent": role in {"owner", "controller", "human", "gateway_web", "tui_client"},
             "can_request_orchestration_snapshot": role in {"owner", "controller", "human", "gateway_web", "tui_client"},
             "can_view_infrastructure_snapshot": role in {"owner", "controller"},
-            "can_execute_agent_control": role in {"owner", "controller", "gateway_web"},
+            "can_view_universes": role in {"owner", "controller", "gateway_web"},
+            "can_view_deployments": role in {"owner", "controller", "gateway_web"},
+            "can_probe_universes": role in {"owner", "controller", "gateway_web"},
+            "can_view_deployment_logs": role in {"owner", "controller", "gateway_web"},
+            "can_repair_universe_endpoints": role in {"owner", "controller", "gateway_web"},
+            "can_manage_deployments": role in {"owner", "controller", "gateway_web"},
+            "can_create_universes": role in {"owner", "controller", "gateway_web"},
+            "can_terminate_deployments": role in {"owner", "controller", "gateway_web"},
+            "can_execute_agent_control": role in {"owner", "controller", "human", "user", "gui_client", "gateway_web", "tui_client"},
             "can_manage_orchestration": role in {"owner", "controller", "gateway_web"},
             "can_manage_agent_pool": role in {"owner", "controller", "gateway_web"},
             "can_manage_session_params": role in {"owner", "controller"},
@@ -528,6 +584,7 @@ class ConnectionManager:
             "can_manage_invites": role in {"owner", "controller"},
             "can_approve_join_requests": role in {"owner", "controller"},
             "can_upload_gui_results": role in {"owner", "controller", "gui_client", "gateway_web"},
+            "can_approve_agent_permissions": role in {"owner", "controller", "human", "user", "gateway_web", "tui_client"},
         }
         if role == "observer":
             perms.update({"can_send_participant_message": False, "can_send_direct_message": False, "can_send_chat_to_agent": False})
@@ -1212,6 +1269,8 @@ class ConnectionManager:
                 "infra": infra,
                 "managers": session["managers"],
                 "config": config,
+                "permission_provider_factory": self.orchestration_permission_provider_factory,
+                "event_loop": None,
                 "gui_route": {
                     "route": config.get("gui_action_route") or "auto",
                     "gui_url": config.get("gui_url"),
@@ -1238,6 +1297,7 @@ class ConnectionManager:
                     resolve_execution_policy=self.orchestration_resolve_execution_policy,
                     gui_command_from_workflow_event=self.orchestration_gui_command_from_workflow_event,
                     should_auto_continue_gui_command=self.orchestration_should_auto_continue_gui_command,
+                    permission_provider_factory=self.orchestration_permission_provider_factory,
                 )
                 runtime["orchestration"] = orchestration
             self.session_runtimes[session_id] = runtime
@@ -1290,18 +1350,25 @@ class ConnectionManager:
                 return pid == sender_participant or role in {"owner", "controller"}
             return True
 
+        session_seen = False
+        attempted = False
         for _, sessions in self.account_sessions.items():
             if session_id in sessions:
+                session_seen = True
                 for participant_id, websocket in list(sessions[session_id].items()):
                     if not _should_deliver(participant_id):
                         continue
+                    attempted = True
                     try:
                         await websocket.send_json(message)
                         delivered = True
                     except Exception as e:
                         console.print(f"[!] Error sending to session {session_id}/{participant_id}: {e}")
         if not delivered:
-            console.print(f"[!] Session {session_id} not found for sending message")
+            if session_seen:
+                console.print(f"[!] No active websocket recipients for session {session_id} message type={message.get('type')} visibility={visibility} attempted={attempted}")
+            else:
+                console.print(f"[!] Session {session_id} not found for sending message")
         return delivered
 
 
@@ -1318,6 +1385,7 @@ class WolfGateway:
         self.manager.orchestration_resolve_execution_policy = self._resolve_execution_policy
         self.manager.orchestration_gui_command_from_workflow_event = self._gui_command_from_workflow_event
         self.manager.orchestration_should_auto_continue_gui_command = self._should_auto_continue_gui_command
+        self.manager.orchestration_permission_provider_factory = self._make_gateway_permission_provider
 
         self.app.add_middleware(
             CORSMiddleware,
@@ -1435,6 +1503,12 @@ class WolfGateway:
                 actions.append("write_file")
             if config.get("enable_syscall") and "run_syscall" not in actions:
                 actions.append("run_syscall")
+            if config.get("enable_universe_management"):
+                actions.extend(GATEWAY_UNIVERSE_MANAGEMENT_ACTIONS)
+            if config.get("enable_universe_tool_execution"):
+                actions.extend(GATEWAY_UNIVERSE_TOOL_ACTIONS)
+            if config.get("enable_destructive_kb"):
+                actions.extend(GATEWAY_DESTRUCTIVE_KB_ACTIONS)
             return _dedupe_actions(actions)
 
 
@@ -1444,11 +1518,13 @@ class WolfGateway:
             # Broad non-filesystem/non-syscall workspace capability. This includes
             # GUI actions, memory/context, universe/KB/TB discovery/interactions,
             # and playbook actions, but excludes local read/write/syscall.
-            actions = [a for a in known if a not in {"read_file", "write_file", "run_syscall"}]
+            actions = [a for a in known if a not in {"read_file", "write_file", "run_syscall", *GATEWAY_HIGH_RISK_ACTIONS}]
         elif policy == "advanced":
-            # Everything except direct system calls. read_file/write_file remain
-            # guarded by explicit execution-policy flags below.
-            actions = [a for a in known if a != "run_syscall"]
+            # Broad capability except direct system calls and high-risk
+            # universe/deployment/tool execution. Those require master policy or
+            # explicit enable_* toggles so exposure, static guardrails, and human
+            # approval remain separate layers.
+            actions = [a for a in known if a not in {"run_syscall", *GATEWAY_HIGH_RISK_ACTIONS}]
         elif policy == "master":
             actions = known
         elif policy in {"write", "dev"}:
@@ -1466,22 +1542,47 @@ class WolfGateway:
             actions.append("write_file")
         if config.get("enable_syscall") and "run_syscall" not in actions:
             actions.append("run_syscall")
+        if config.get("enable_universe_management"):
+            actions.extend(GATEWAY_UNIVERSE_MANAGEMENT_ACTIONS)
+        if config.get("enable_universe_tool_execution"):
+            actions.extend(GATEWAY_UNIVERSE_TOOL_ACTIONS)
+        if config.get("enable_destructive_kb"):
+            actions.extend(GATEWAY_DESTRUCTIVE_KB_ACTIONS)
         return _dedupe_actions(actions)
 
     def _resolve_execution_policy(self, config: Dict[str, Any]) -> Dict[str, Any]:
         policy = str(config.get("action_policy") or "limited").strip().lower()
         allow_write = bool(config.get("enable_write")) or policy in {"write", "dev", "advanced", "master"}
         allow_syscall = bool(config.get("enable_syscall")) or policy in {"dev", "master"}
+        allow_universe_management = bool(config.get("enable_universe_management")) or policy in {"master"}
+        allow_universe_tool_execution = bool(config.get("enable_universe_tool_execution")) or policy in {"master"}
+        allow_destructive_kb = bool(config.get("enable_destructive_kb")) or policy in {"master"}
         allowed_cmds = config.get("syscall_allowed_commands") or GATEWAY_SYSCALL_DEFAULT_ALLOWLIST
         if isinstance(allowed_cmds, str):
             allowed_cmds = [c.strip() for c in allowed_cmds.split(",") if c.strip()]
+        deny_patterns = config.get("syscall_deny_patterns") or GATEWAY_SYSCALL_DEFAULT_DENY_PATTERNS
+        if isinstance(deny_patterns, str):
+            deny_patterns = [p.strip() for p in deny_patterns.split(",") if p.strip()]
+        credential_patterns = config.get("syscall_credential_exfiltration_patterns") or GATEWAY_SYSCALL_DEFAULT_CREDENTIAL_EXFILTRATION_PATTERNS
+        if isinstance(credential_patterns, str):
+            credential_patterns = [p.strip() for p in credential_patterns.split(",") if p.strip()]
         return {
             "allow_write_file": allow_write,
             "allow_run_syscall": allow_syscall,
             "allow_gui_capture": bool(config.get("enable_gui_capture", False)) or policy in {"advanced", "master"},
+            "allow_create_universe": allow_universe_management,
+            "allow_terminate_deployment": allow_universe_management,
+            "allow_universe_tb_execute": allow_universe_tool_execution,
+            "allow_universe_kb_purge": allow_destructive_kb,
             "syscall_allowed_commands": list(allowed_cmds),
-            "syscall_max_timeout": int(config.get("syscall_max_timeout") or 10),
+            "syscall_deny_patterns": list(deny_patterns),
+            "syscall_credential_exfiltration_patterns": list(credential_patterns),
+            "syscall_max_timeout": int(config.get("syscall_max_timeout") or 900),
             "syscall_allow_shell": bool(config.get("syscall_allow_shell", False)),
+            # If true, shell wrappers/metacharacter commands are not auto-executed,
+            # but are eligible to ask the user for explicit elevated approval after
+            # absolute-deny checks pass.
+            "syscall_request_approval_for_shell": bool(config.get("syscall_request_approval_for_shell", True)),
         }
 
     AGENT_PRESET_FILES = ["llms.json", "sample_llm_config.json"]
@@ -1654,26 +1755,312 @@ class WolfGateway:
                 self.manager.sessions[session_id].agent_config = cfg
         return resolved
 
+    def _get_or_create_runtime_for_session(self, session_id: str, account_id: str) -> Dict[str, Any]:
+        self.manager.get_or_create_session(account_id=account_id, session_id=session_id)
+        if not self.manager.session_belongs_to_account(session_id, account_id):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        runtime = self.manager.get_runtime(session_id)
+        if runtime is None:
+            cfg = self.manager.sessions[session_id].agent_config if session_id in self.manager.sessions else self.manager.default_config()
+            runtime = self.manager.create_runtime_session(session_id, account_id, cfg or self.manager.default_config())
+        return runtime
+
+    async def _build_infrastructure_snapshot_for_request(self, session_id: str, account_id: str) -> Dict[str, Any]:
+        runtime = self._get_or_create_runtime_for_session(session_id, account_id)
+        orch = self._get_orchestration_session(session_id)
+        return await build_infrastructure_snapshot(session_id=session_id, runtime=runtime, orch=orch)
+
+    def _runtime_infra_for_request(self, session_id: str, account_id: str) -> Any:
+        runtime = self._get_or_create_runtime_for_session(session_id, account_id)
+        return runtime.get("infra") or getattr(runtime.get("wf"), "infra", None)
+
+    def _universe_for_request(self, session_id: str, account_id: str, universe_name: str) -> Any:
+        infra = self._runtime_infra_for_request(session_id, account_id)
+        universes = getattr(infra, "UNIVs", {}) or {}
+        universe = universes.get(universe_name) if isinstance(universes, dict) else None
+        if universe is None:
+            raise HTTPException(status_code=404, detail=f"Universe not found: {universe_name}")
+        return universe
+
+    @staticmethod
+    def _http_exception_for_universe_app_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, HTTPException):
+            return exc
+        if isinstance(exc, KeyError):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, PermissionError):
+            return HTTPException(status_code=403, detail=str(exc))
+        if isinstance(exc, FileNotFoundError):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, ValueError):
+            return HTTPException(status_code=400, detail=str(exc))
+        return HTTPException(status_code=502, detail=f"Universe app request failed: {type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _websocket_proxy_query_without_gateway_auth(websocket: WebSocket) -> str:
+        pairs = []
+        for key, value in websocket.query_params.multi_items():
+            if key in {"token", "auth_token", "participant_id"}:
+                continue
+            pairs.append((key, value))
+        return urlencode(pairs, doseq=True)
+
+    @staticmethod
+    def _proxy_query_without_gateway_auth(request: Request) -> str:
+        pairs = []
+        for key, value in parse_qsl(str(request.url.query or ""), keep_blank_values=True):
+            if key in {"token", "auth_token", "participant_id"}:
+                continue
+            pairs.append((key, value))
+        return urlencode(pairs, doseq=True)
+
+    async def _broadcast_infrastructure_snapshot(self, session_id: str, account_id: str, *, reason: str = "infrastructure_update") -> Optional[Dict[str, Any]]:
+        """Best-effort broadcast of the current infrastructure snapshot to connected Gateway clients."""
+        try:
+            snapshot = await self._build_infrastructure_snapshot_for_request(session_id, account_id)
+            snapshot["broadcast_reason"] = reason
+            await self.manager.send_message_to_session(snapshot, session_id)
+            return snapshot
+        except Exception as exc:
+            try:
+                await self.manager.send_message_to_session({
+                    "type": "infrastructure_snapshot_error",
+                    "status": "error",
+                    "content": f"Infrastructure snapshot refresh failed after {reason}: {type(exc).__name__}: {exc}",
+                    "timestamp": datetime.now().isoformat(),
+                    "session_id": session_id,
+                }, session_id)
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def _tail_text_file(path: Any, *, tail: int = 200, max_chars: int = 20000) -> Dict[str, Any]:
+        if not path:
+            return {"path": None, "exists": False, "content": ""}
+        target = Path(str(path))
+        if not target.exists():
+            return {"path": str(target), "exists": False, "content": ""}
+        try:
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            content = "\n".join(lines[-max(1, int(tail or 200)):])
+            if len(content) > max_chars:
+                content = content[-max_chars:]
+            redacted = redact_value(content)
+            return {"path": str(target), "exists": True, "line_count": len(lines), "content": redacted}
+        except Exception as exc:
+            return {"path": str(target), "exists": True, "error": f"{type(exc).__name__}: {exc}", "content": ""}
+
+    def _deployment_logs_payload(self, session_id: str, runtime: Dict[str, Any], deployment_id: str, *, tail: int = 200) -> Dict[str, Any]:
+        infra = runtime.get("infra") or getattr(runtime.get("wf"), "infra", None)
+        deployments = getattr(infra, "managed_deployments", {}) if infra is not None else {}
+        entry = deployments.get(deployment_id) if isinstance(deployments, dict) else None
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=404, detail=f"Deployment not found: {deployment_id}")
+        stdout_path = entry.get("stdout_file") or entry.get("stdout_log")
+        stderr_path = entry.get("stderr_file") or entry.get("stderr_log")
+        return {
+            "type": "deployment_logs",
+            "session_id": session_id,
+            "deployment_id": deployment_id,
+            "timestamp": datetime.now().isoformat(),
+            "tail": max(1, int(tail or 200)),
+            "stdout": self._tail_text_file(stdout_path, tail=tail),
+            "stderr": self._tail_text_file(stderr_path, tail=tail),
+        }
+
+    def _get_orchestration_session(self, session_id: str) -> Optional[GatewayOrchestrationSession]:
+        """Return the orchestration session object for a gateway session if enabled.
+
+        Several REST and websocket paths use this helper to decide whether chat
+        should route into orchestration and whether orchestration control endpoints
+        are available. It must be a WolfGateway method, not only implicit runtime
+        dictionary access, so live websocket handlers do not crash with
+        AttributeError.
+        """
+        runtime = self.manager.get_runtime(session_id)
+        if not isinstance(runtime, dict):
+            return None
+        orch = runtime.get("orchestration")
+        return orch if isinstance(orch, GatewayOrchestrationSession) else None
+
+    BRIDGE_PAYLOAD_TAG_RE = re.compile(
+        r'<wolf_bridge_payload\b(?P<attrs>[^>]*)>(?P<body>.*?)</wolf_bridge_payload>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    BRIDGE_PAYLOAD_ATTR_RE = re.compile(r'([A-Za-z_:][A-Za-z0-9_.:-]*)\s*=\s*(["\'])(.*?)\2', flags=re.DOTALL)
+    BRIDGE_PAYLOAD_MAX_BODY_CHARS = 65536
+    BRIDGE_PAYLOAD_MAX_TAGS = 4
+    GUI_COMMAND_ACTION_ALLOWLIST = set(GATEWAY_GUI_ACTIONS)
+
+    def _bridge_payload_attrs(self, raw_attrs: str) -> Dict[str, str]:
+        """Parse the deliberately tiny wolf_bridge_payload attribute grammar."""
+        attrs: Dict[str, str] = {}
+        for match in self.BRIDGE_PAYLOAD_ATTR_RE.finditer(str(raw_attrs or "")):
+            key = str(match.group(1) or "").strip().lower()
+            value = str(match.group(3) or "").strip()
+            if key:
+                attrs[key] = value
+        return attrs
+
+    def _extract_bridge_payloads(self, value: Any, *, expected_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Extract strict, typed bridge payloads from trusted transport fields only.
+
+        This parser intentionally does not scan arbitrary assistant prose.  Callers
+        pass only action-result bridge fields such as result.bridge_payload(s).
+        Supported envelope:
+          <wolf_bridge_payload type="gui_command" format="json" version="1">{...}</wolf_bridge_payload>
+        """
+        values = value if isinstance(value, list) else [value]
+        extracted: List[Dict[str, Any]] = []
+        expected = str(expected_type or "").strip().lower()
+        for item in values:
+            if len(extracted) >= self.BRIDGE_PAYLOAD_MAX_TAGS:
+                break
+            if not isinstance(item, str):
+                continue
+            text = item
+            if not text or len(text) > self.BRIDGE_PAYLOAD_MAX_BODY_CHARS * self.BRIDGE_PAYLOAD_MAX_TAGS:
+                continue
+            for match in self.BRIDGE_PAYLOAD_TAG_RE.finditer(text):
+                if len(extracted) >= self.BRIDGE_PAYLOAD_MAX_TAGS:
+                    break
+                attrs = self._bridge_payload_attrs(match.group("attrs") or "")
+                payload_type = str(attrs.get("type") or "").strip().lower()
+                payload_format = str(attrs.get("format") or "json").strip().lower()
+                if expected and payload_type != expected:
+                    continue
+                if payload_format != "json":
+                    continue
+                body = match.group("body") or ""
+                if not body or len(body) > self.BRIDGE_PAYLOAD_MAX_BODY_CHARS:
+                    continue
+                try:
+                    payload = json.loads(body)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    extracted.append({
+                        "type": payload_type,
+                        "format": payload_format,
+                        "version": attrs.get("version") or "1",
+                        "payload": payload,
+                    })
+        return extracted
+
+    def _coerce_bridge_object(self, value: Any) -> Optional[Dict[str, Any]]:
+        """Coerce a trusted bridge field into a dict with bounded legacy fallbacks."""
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text or len(text) > self.BRIDGE_PAYLOAD_MAX_BODY_CHARS:
+            return None
+        # JSON object string compatibility.
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            # Legacy compatibility for previous Python-repr transport strings:
+            # "{'action': 'gui_get_visual_context', 'payload': {...}}".
+            try:
+                parsed = ast.literal_eval(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return None
+
+    def _coerce_gui_command(self, value: Any, *, fallback_action: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Validate and normalize a GUI command from a strict bridge source."""
+        command = self._coerce_bridge_object(value)
+        if not isinstance(command, dict):
+            return None
+        action = str(command.get("action") or fallback_action or "").strip()
+        if action not in self.GUI_COMMAND_ACTION_ALLOWLIST:
+            return None
+        payload = command.get("payload")
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return None
+        return {"action": action, "payload": payload}
+
     def _gui_command_from_workflow_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if event.get("type") != "workflow_result":
             return None
         result = event.get("result") or {}
         if not isinstance(result, dict) or not result.get("deferred_to_gui_client"):
             return None
-        command = result.get("gui_command") or {}
-        if not isinstance(command, dict):
+
+        command = self._coerce_gui_command(result.get("gui_command"), fallback_action=event.get("action"))
+        bridge_source = "result.gui_command"
+
+        if command is None:
+            for field_name in ("bridge_payloads", "bridge_payload"):
+                for envelope in self._extract_bridge_payloads(result.get(field_name), expected_type="gui_command"):
+                    command = self._coerce_gui_command(envelope.get("payload"), fallback_action=event.get("action"))
+                    if command is not None:
+                        bridge_source = f"result.{field_name}"
+                        break
+                if command is not None:
+                    break
+
+        if command is None:
             return None
-        action = command.get("action") or event.get("action")
+
+        action = command["action"]
         payload = command.get("payload") or {}
         return {
             "type": "gui_command",
             "command_id": f"guicmd_{uuid.uuid4().hex[:12]}",
             "action": action,
-            "payload": payload if isinstance(payload, dict) else {},
+            "payload": payload,
             "content": f"Execute GUI command locally: {action}",
             "workflow_event": event,
+            "bridge_source": bridge_source,
             "timestamp": datetime.now().isoformat(),
         }
+
+    def _should_auto_continue_gui_command(self, action: Any) -> bool:
+        """Return true when a deferred GUI command should wake/continue the workflow after result.
+
+        Capture/visual-context commands are normally intermediate perception steps;
+        once the browser returns their result, the agent should continue and use
+        the new observation rather than leave the task permanently waiting.
+        """
+        return str(action or "").strip() in {
+            "gui_get_visual_context",
+            "gui_capture_url",
+            "gui_capture_workspace",
+        }
+
+    def _gui_command_continuation_prompt(self, action: Any, command_id: Any, ok: Any) -> str:
+        """Build the system message that wakes an agent after a deferred GUI result.
+
+        Deferred GUI actions are fulfilled asynchronously by the browser/VUI.
+        When the result comes back, orchestration appends the full
+        gui_command_result event to the originating task history, then appends
+        this short continuation prompt so the worker knows to resume using the
+        newly attached observation instead of repeating the GUI action.
+        """
+        action_label = str(action or "gui_command").strip() or "gui_command"
+        command_label = str(command_id or "<unknown>").strip() or "<unknown>"
+        succeeded = bool(ok)
+        outcome = "completed successfully" if succeeded else "failed or returned an unsuccessful result"
+        return (
+            f"The browser/VUI has returned the result for deferred GUI command {command_label} "
+            f"({action_label}); the command {outcome}. Inspect the immediately preceding "
+            "gui_command_result tool event in this task history for the actual payload. "
+            "If it contains visual_context, use that context. If it contains capture_artifacts "
+            "or image_references, use those screenshot references as the visual evidence. "
+            "Continue the task now: answer the user's original request if enough visual "
+            "information is available, otherwise explain the concrete capture/inspection failure."
+        )
 
     def _normalize_capture_http_url(self, value: Any) -> Optional[str]:
         raw = str(value or "").strip()
@@ -2469,15 +2856,214 @@ class WolfGateway:
         @self.app.get("/sessions/{session_id}/infrastructure/snapshot")
         async def get_infrastructure_snapshot(session_id: str, token: str = Query(...)):
             current_account = self._get_account_id(token)
-            self.manager.get_or_create_session(account_id=current_account, session_id=session_id)
-            if not self.manager.session_belongs_to_account(session_id, current_account):
-                raise HTTPException(status_code=403, detail="Forbidden")
-            runtime = self.manager.get_runtime(session_id)
-            if runtime is None:
-                cfg = self.manager.sessions[session_id].agent_config if session_id in self.manager.sessions else self.manager.default_config()
-                runtime = self.manager.create_runtime_session(session_id, current_account, cfg or self.manager.default_config())
-            orch = self._get_orchestration_session(session_id)
-            return await build_infrastructure_snapshot(session_id=session_id, runtime=runtime, orch=orch)
+            return await self._build_infrastructure_snapshot_for_request(session_id, current_account)
+
+        @self.app.get("/sessions/{session_id}/infrastructure/universes")
+        async def get_infrastructure_universes(session_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            snapshot = await self._build_infrastructure_snapshot_for_request(session_id, current_account)
+            return {
+                "type": "universe_snapshot",
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "universes": (snapshot.get("resources") or {}).get("universes") or [],
+                "count": len((snapshot.get("resources") or {}).get("universes") or []),
+            }
+
+        @self.app.get("/sessions/{session_id}/infrastructure/apps")
+        async def get_infrastructure_apps(session_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            snapshot = await self._build_infrastructure_snapshot_for_request(session_id, current_account)
+            apps = (snapshot.get("resources") or {}).get("apps") or []
+            return {
+                "type": "universe_app_snapshot",
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "apps": apps,
+                "count": len(apps),
+            }
+
+        @self.app.get("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}")
+        async def get_gateway_universe_app(session_id: str, universe_name: str, app_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                return {"ok": True, "session_id": session_id, "universe": universe_name, "app": universe.get_app(app_id), "timestamp": datetime.now().isoformat()}
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.get("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/manifest")
+        async def get_gateway_universe_app_manifest(session_id: str, universe_name: str, app_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                return universe.get_app(app_id)
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.get("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/view")
+        async def view_gateway_universe_app(session_id: str, universe_name: str, app_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                return FileResponse(universe._resolve_static_app_file(app_id))
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.get("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/files/{asset_path:path}")
+        async def get_gateway_universe_app_file(session_id: str, universe_name: str, app_id: str, asset_path: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                return FileResponse(universe._resolve_static_app_file(app_id, asset_path))
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.api_route("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/proxy/{proxy_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+        async def proxy_gateway_universe_app(session_id: str, universe_name: str, app_id: str, proxy_path: str, request: Request, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                result = universe.proxy_app_http(
+                    app_id,
+                    proxy_path,
+                    request.method,
+                    query_string=self._proxy_query_without_gateway_auth(request),
+                    body=await request.body(),
+                    headers=dict(request.headers),
+                )
+                return Response(
+                    content=result.get("content") or b"",
+                    status_code=int(result.get("status_code") or 200),
+                    media_type=result.get("media_type"),
+                    headers=result.get("headers") or {},
+                )
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.websocket("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/proxy/{proxy_path:path}")
+        async def proxy_gateway_universe_app_websocket(session_id: str, universe_name: str, app_id: str, proxy_path: str, websocket: WebSocket):
+            token = websocket.query_params.get("token") or websocket.query_params.get("auth_token")
+            participant_id = websocket.query_params.get("participant_id")
+            if not token:
+                await websocket.close(code=1008, reason="Missing token")
+                return
+            try:
+                current_account = self._get_account_id(token)
+                if participant_id and not self.manager.participant_can(session_id, participant_id, "can_view_universes"):
+                    self.manager.record_collaboration_audit_event(
+                        session_id,
+                        "collaboration_permission_denied",
+                        severity="warning",
+                        actor_participant_id=participant_id,
+                        message=f"Participant {participant_id} was denied WebSocket capability can_view_universes.",
+                        metadata={"capability": "can_view_universes", "path": str(websocket.url.path)},
+                    )
+                    await websocket.close(code=1008, reason="Permission denied")
+                    return
+                universe = self._universe_for_request(session_id, current_account, universe_name)
+                await universe.proxy_app_websocket(
+                    app_id,
+                    proxy_path,
+                    websocket,
+                    query_string=self._websocket_proxy_query_without_gateway_auth(websocket),
+                )
+            except HTTPException as exc:
+                await websocket.close(code=1008, reason=str(exc.detail)[:120])
+            except KeyError:
+                await websocket.close(code=1008, reason="Unknown app")
+            except PermissionError:
+                await websocket.close(code=1008, reason="Permission denied")
+            except (FileNotFoundError, ValueError):
+                await websocket.close(code=1008, reason="Invalid app proxy target")
+            except Exception:
+                await websocket.close(code=1011, reason="WebSocket proxy failed")
+
+        @self.app.post("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/start")
+        async def start_gateway_universe_app(session_id: str, universe_name: str, app_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                app = universe.start_app(app_id)
+                await self._broadcast_infrastructure_snapshot(session_id, current_account, reason="universe_app_start")
+                return {"ok": True, "session_id": session_id, "universe": universe_name, "app": app, "timestamp": datetime.now().isoformat()}
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.post("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/stop")
+        async def stop_gateway_universe_app(session_id: str, universe_name: str, app_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                app = universe.stop_app(app_id)
+                await self._broadcast_infrastructure_snapshot(session_id, current_account, reason="universe_app_stop")
+                return {"ok": True, "session_id": session_id, "universe": universe_name, "app": app, "timestamp": datetime.now().isoformat()}
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.post("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/restart")
+        async def restart_gateway_universe_app(session_id: str, universe_name: str, app_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                app = universe.restart_app(app_id)
+                await self._broadcast_infrastructure_snapshot(session_id, current_account, reason="universe_app_restart")
+                return {"ok": True, "session_id": session_id, "universe": universe_name, "app": app, "timestamp": datetime.now().isoformat()}
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.delete("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}")
+        async def delete_gateway_universe_app(session_id: str, universe_name: str, app_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                ok = universe.delete_app(app_id)
+                if not ok:
+                    raise KeyError(f"Unknown Universe app: {app_id}")
+                await self._broadcast_infrastructure_snapshot(session_id, current_account, reason="universe_app_delete")
+                return {"ok": True, "session_id": session_id, "universe": universe_name, "app_id": app_id, "timestamp": datetime.now().isoformat()}
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.get("/sessions/{session_id}/infrastructure/universes/{universe_name}/apps/{app_id}/logs")
+        async def get_gateway_universe_app_logs(session_id: str, universe_name: str, app_id: str, token: str = Query(...), tail: int = Query(200, ge=1, le=5000)):
+            current_account = self._get_account_id(token)
+            universe = self._universe_for_request(session_id, current_account, universe_name)
+            try:
+                return {"ok": True, "session_id": session_id, "universe": universe_name, **universe.app_logs(app_id, tail=tail), "timestamp": datetime.now().isoformat()}
+            except Exception as exc:
+                raise self._http_exception_for_universe_app_error(exc)
+
+        @self.app.get("/sessions/{session_id}/infrastructure/deployments")
+        async def get_infrastructure_deployments(session_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            runtime = self._get_or_create_runtime_for_session(session_id, current_account)
+            infra = runtime.get("infra") or getattr(runtime.get("wf"), "infra", None)
+            deployments = summarize_managed_deployments(infra)
+            return {
+                "type": "deployment_snapshot",
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "deployments": deployments,
+                "deployment_counts": deployment_counts(deployments),
+            }
+
+        @self.app.get("/sessions/{session_id}/infrastructure/deployments/{deployment_id}")
+        async def get_infrastructure_deployment_detail(session_id: str, deployment_id: str, token: str = Query(...)):
+            current_account = self._get_account_id(token)
+            runtime = self._get_or_create_runtime_for_session(session_id, current_account)
+            infra = runtime.get("infra") or getattr(runtime.get("wf"), "infra", None)
+            deployments = summarize_managed_deployments(infra)
+            for row in deployments:
+                if str(row.get("deployment_id") or row.get("name")) == str(deployment_id):
+                    return {"type": "deployment_detail", "session_id": session_id, "deployment": row, "timestamp": datetime.now().isoformat()}
+            raise HTTPException(status_code=404, detail=f"Deployment not found: {deployment_id}")
+
+        @self.app.get("/sessions/{session_id}/infrastructure/deployments/{deployment_id}/logs")
+        async def get_infrastructure_deployment_logs(session_id: str, deployment_id: str, token: str = Query(...), tail: int = Query(200, ge=1, le=5000)):
+            current_account = self._get_account_id(token)
+            runtime = self._get_or_create_runtime_for_session(session_id, current_account)
+            return self._deployment_logs_payload(session_id, runtime, deployment_id, tail=tail)
 
         @self.app.get("/sessions/{session_id}/orchestration/snapshot")
         async def get_orchestration_snapshot(session_id: str, token: str = Query(...)):
@@ -2899,17 +3485,38 @@ class WolfGateway:
             approval_request_id: Optional[str] = None
             current_account: Optional[str] = None
 
+            async def _reject_ws(code: int, reason: str, detail: str) -> None:
+                console.print(
+                    f"[Gateway WS auth] reject account={account_id} session={session_id} "
+                    f"participant={participant_id or '<unset>'} client={client_type} code={code} reason={reason}: {detail}"
+                )
+                try:
+                    await websocket.accept()
+                    await websocket.send_json({
+                        "type": "error",
+                        "error": reason,
+                        "content": detail,
+                        "session_id": session_id,
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                except Exception:
+                    pass
+                try:
+                    await websocket.close(code=code, reason=reason)
+                except Exception:
+                    pass
+
             if token:
                 try:
                     current_account = self._get_account_id(token)
                 except HTTPException:
-                    await websocket.close(code=4001, reason="Unauthorized")
+                    await _reject_ws(4001, "Unauthorized", "Gateway auth token is invalid or expired. Re-authenticate with username/password; tokens are reset when the gateway restarts.")
                     return
                 if current_account != account_id:
-                    await websocket.close(code=4003, reason="Forbidden")
+                    await _reject_ws(4003, "Forbidden", f"Gateway auth token belongs to account {current_account}, not requested account {account_id}.")
                     return
                 if session_id in self.manager.sessions and not self.manager.session_belongs_to_account(session_id, account_id):
-                    await websocket.close(code=4003, reason="Forbidden")
+                    await _reject_ws(4003, "Forbidden", f"Session {session_id} does not belong to account {account_id}.")
                     return
                 participant_role = "owner" if participant_role == "user" else participant_role
                 permissions = self.manager.collaboration_permissions_for_role(participant_role)
@@ -2987,7 +3594,7 @@ class WolfGateway:
                         self.manager.join_requests[request_id]["status"] = "disconnected"
                     return
             else:
-                await websocket.close(code=4001, reason="Unauthorized")
+                await _reject_ws(4001, "Unauthorized", "No gateway auth token, invite token, approval token, or join request was provided.")
                 return
 
             join_mode = str(join_mode or "message").strip().lower().replace("-", "_")
@@ -3087,13 +3694,20 @@ class WolfGateway:
                             runtime = self.manager.get_runtime(session_id)
                             orch = self._get_orchestration_session(session_id)
                             if orch is not None:
-                                await orch.submit_user_message(
+                                if runtime is not None:
+                                    runtime["event_loop"] = asyncio.get_running_loop()
+                                    runtime["permission_provider_factory"] = self._make_gateway_permission_provider
+                                task = asyncio.create_task(self._handle_orchestration_chat_message(
+                                    orch,
                                     data.get("content", ""),
+                                    session_id,
                                     sender=data.get("sender") or participant_id,
                                     visual_context=visual_context,
                                     target_task_id=data.get("target_task_id") or data.get("task_id"),
                                     force_new_root=bool(data.get("force_new_run") or data.get("force_new_root")),
-                                )
+                                ))
+                                if runtime is not None:
+                                    runtime["active_task"] = task
                             else:
                                 control = self._run_control_for(runtime) if runtime else {}
                                 active_statuses = {"running", "pause_requested", "paused", "resume_requested", "stop_requested"}
@@ -3159,6 +3773,9 @@ class WolfGateway:
                                 "timestamp": datetime.now().isoformat(),
                                 "session_id": session_id,
                             }
+                            for meta_key in ("task_id", "source", "agent_name"):
+                                if data.get(meta_key) is not None:
+                                    gui_result_event[meta_key] = data.get(meta_key)
 
                             runtime = self.manager.get_runtime(session_id)
                             pending_command = None
@@ -3168,17 +3785,30 @@ class WolfGateway:
                                 if command_id:
                                     pending_command = pending.pop(command_id, None)
                             action_label = data.get("action") or (pending_command or {}).get("action") or "gui_command_result"
-                            orchestration_target_task_id = (pending_command or {}).get("target_task_id")
-                            orchestration_source = (pending_command or {}).get("source") == "orchestration"
+                            # Preferred path uses runtime["pending_gui_commands"], but a browser
+                            # may reconnect or a runtime edge can lose that pending entry while the
+                            # client still returns task/source metadata from the original gui_command.
+                            # Fall back to trusted websocket payload metadata so orchestration GUI
+                            # screenshot/context results are still routed back to the waiting task.
+                            orchestration_target_task_id = (pending_command or {}).get("target_task_id") or data.get("task_id")
+                            orchestration_source = (pending_command or {}).get("source") == "orchestration" or (data.get("source") == "orchestration" and bool(orchestration_target_task_id))
                             orch = self._get_orchestration_session(session_id) if orchestration_source else None
                             should_continue = bool((pending_command or {}).get("auto_continue")) or self._should_auto_continue_gui_command(action_label)
                             orchestration_continuation_prompt = None
                             if should_continue and orch is not None and orchestration_target_task_id:
-                                orchestration_continuation_prompt = self._gui_command_continuation_prompt(
-                                    action_label,
-                                    data.get("command_id"),
-                                    self._capture_command_effective_ok(data.get("ok"), data.get("result")),
-                                )
+                                try:
+                                    orchestration_continuation_prompt = self._gui_command_continuation_prompt(
+                                        action_label,
+                                        data.get("command_id"),
+                                        self._capture_command_effective_ok(data.get("ok"), data.get("result")),
+                                    )
+                                except Exception as prompt_exc:
+                                    orchestration_continuation_prompt = (
+                                        f"The browser/VUI returned a result for deferred GUI command {data.get('command_id') or '<unknown>'} "
+                                        f"({action_label}), but the gateway could not build the standard continuation prompt: "
+                                        f"{type(prompt_exc).__name__}: {prompt_exc}. Inspect the preceding gui_command_result event and continue."
+                                    )
+                                    gui_result_event["continuation_prompt_error"] = f"{type(prompt_exc).__name__}: {prompt_exc}"
 
                             def _collect_capture_artifacts(value):
                                 found = []
@@ -3309,6 +3939,11 @@ class WolfGateway:
                                     },
                                     session_id,
                                 )
+                        elif msg_type == "permission_decision":
+                            if not participant_permissions.get("can_approve_agent_permissions", False):
+                                await _permission_denied("can_approve_agent_permissions")
+                                continue
+                            await self._handle_permission_decision(data, session_id, participant_id)
                         elif msg_type == "participant_message":
                             if not participant_permissions.get("can_send_participant_message", False):
                                 await _permission_denied("can_send_participant_message")
@@ -3319,6 +3954,32 @@ class WolfGateway:
                                 await _permission_denied("can_send_direct_message")
                                 continue
                             await self._handle_participant_message(data, session_id, participant_id)
+                        elif msg_type == "infrastructure_snapshot_request":
+                            if not participant_permissions.get("can_view_infrastructure_snapshot", False):
+                                await _permission_denied("can_view_infrastructure_snapshot")
+                                continue
+                            await websocket.send_json(await self._build_infrastructure_snapshot_for_request(session_id, account_id))
+                        elif msg_type == "deployment_list_request":
+                            if not (participant_permissions.get("can_view_deployments", False) or participant_permissions.get("can_view_infrastructure_snapshot", False)):
+                                await _permission_denied("can_view_deployments")
+                                continue
+                            runtime = self._get_or_create_runtime_for_session(session_id, account_id)
+                            infra = runtime.get("infra") or getattr(runtime.get("wf"), "infra", None)
+                            deployments = summarize_managed_deployments(infra)
+                            await websocket.send_json({"type": "deployment_snapshot", "session_id": session_id, "timestamp": datetime.now().isoformat(), "deployments": deployments, "deployment_counts": deployment_counts(deployments)})
+                        elif msg_type == "deployment_logs_request":
+                            if not participant_permissions.get("can_view_deployment_logs", False):
+                                await _permission_denied("can_view_deployment_logs")
+                                continue
+                            deployment_id = str(data.get("deployment_id") or data.get("name") or "").strip()
+                            if not deployment_id:
+                                await websocket.send_json({"type": "error", "content": "deployment_logs_request requires deployment_id", "timestamp": datetime.now().isoformat(), "session_id": session_id})
+                                continue
+                            runtime = self._get_or_create_runtime_for_session(session_id, account_id)
+                            try:
+                                await websocket.send_json(self._deployment_logs_payload(session_id, runtime, deployment_id, tail=int(data.get("tail") or 200)))
+                            except HTTPException as exc:
+                                await websocket.send_json({"type": "error", "content": str(exc.detail), "timestamp": datetime.now().isoformat(), "session_id": session_id})
                         elif msg_type == "orchestration_snapshot_request":
                             if not participant_permissions.get("can_request_orchestration_snapshot", False):
                                 await _permission_denied("can_request_orchestration_snapshot")
@@ -3353,146 +4014,58 @@ class WolfGateway:
                 console.print(traceback.format_exc())
                 self.manager.disconnect(account_id, session_id, participant_id)
 
-    def _get_orchestration_session(self, session_id: str) -> Optional[GatewayOrchestrationSession]:
-        runtime = self.manager.get_runtime(session_id)
-        if not runtime:
-            return None
-        orch = runtime.get("orchestration")
-        if orch is None:
-            return None
-        config = runtime.get("config") or {}
-        if not config.get("orchestration_enabled"):
-            return None
-        return orch
 
-    def _run_control_for(self, runtime: Dict[str, Any]) -> Dict[str, Any]:
-        control = runtime.setdefault("run_control", _default_run_control())
-        for key, value in _default_run_control().items():
-            control.setdefault(key, copy.deepcopy(value))
-        return control
-
-    def _run_control_snapshot(self, session_id: str, control: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "type": "run_control_state",
-            "session_id": session_id,
-            "run_id": control.get("run_id"),
-            "status": control.get("status") or "idle",
-            "pause_requested": bool(control.get("pause_requested")),
-            "stop_requested": bool(control.get("stop_requested")),
-            "reassess_requested": bool(control.get("reassess_requested")),
-            "pending_user_message_count": len(control.get("pending_user_messages") or []),
-            "step": int(control.get("step") or 0),
-            "timestamp": datetime.now().isoformat(),
-            "content": f"Agent run status: {control.get('status') or 'idle'}",
-        }
-
-    async def _broadcast_run_control(self, session_id: str, control: Dict[str, Any], content: Optional[str] = None):
-        event = self._run_control_snapshot(session_id, control)
-        if content:
-            event["content"] = content
-        await self.manager.send_message_to_session(event, session_id)
-
-    def _should_auto_continue_gui_command(self, action: Any) -> bool:
-        """Return true for deferred GUI commands whose result should feed a follow-up agent turn."""
-        return str(action or "").strip() in {"gui_get_visual_context", "gui_capture_url", "gui_capture_workspace"}
-
-    def _gui_command_continuation_prompt(self, action: Any, command_id: Any, ok: Any) -> str:
-        status = "succeeded" if ok else "failed"
-        return (
-            "[SYSTEM CONTINUATION: A deferred GUI browser command result is now available in the "
-            "conversation history.\n"
-            f"Command: {action or 'gui_command'}\n"
-            f"Command id: {command_id or 'unknown'}\n"
-            f"Status: {status}\n\n"
-            "Use the most recent [GUI COMMAND RESULT] entry to answer the user's original request. "
-            "Do not repeat the same GUI command unless the result is missing or unusable. "
-            "If the result reports cross-origin iframe, DOM, pixel, or permission limitations, briefly "
-            "explain the limitation and answer using the available dashboard/workspace metadata. "
-            "Respond to the user with a normal send_message action.]"
-        )
-
-    async def _auto_continue_after_gui_command_result(
+    async def _handle_orchestration_chat_message(
         self,
+        orch: GatewayOrchestrationSession,
+        content: str,
         session_id: str,
         *,
-        action: Any,
-        command_id: Any,
-        ok: Any,
-        previous_task: Any = None,
+        sender: str = "user",
+        visual_context: Optional[Dict[str, Any]] = None,
+        target_task_id: Optional[str] = None,
+        force_new_root: bool = False,
     ) -> None:
-        """Start a follow-up agent turn after browser-deferred GUI context/capture results.
+        """Submit a chat message to orchestration without risking websocket death.
 
-        Deferred GUI commands complete after the workflow step that requested them.
-        Without this continuation, the command result is stored in history but the
-        agent never gets another turn to consume it, leaving the user with a silent
-        "GUI command completed" notice and no assistant response.
+        The websocket receive loop must stay alive while orchestration starts a
+        root task or injects into an existing task. Any exception here is
+        surfaced as a workflow_error event instead of escaping the receive loop,
+        which browsers report as an abnormal websocket warning / no agent reply.
         """
-        runtime = self.manager.get_runtime(session_id)
-        if not runtime:
-            await self.manager.send_message_to_session(
-                {
-                    "type": "workflow_error",
-                    "status": "error",
-                    "content": "GUI command result arrived, but no runtime exists to continue the agent turn.",
-                    "error": "No runtime configured for GUI command auto-continuation.",
-                    "timestamp": datetime.now().isoformat(),
-                    "session_id": session_id,
-                },
-                session_id,
-            )
-            return
-
         try:
-            current = asyncio.current_task()
-            if previous_task is not None and previous_task is not current and not previous_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(previous_task), timeout=15)
-                except asyncio.TimeoutError:
-                    await self.manager.send_message_to_session(
-                        {
-                            "type": "workflow_status",
-                            "status": "waiting",
-                            "content": "GUI command result is ready; waiting for the current agent step lock before continuing.",
-                            "timestamp": datetime.now().isoformat(),
-                            "session_id": session_id,
-                        },
-                        session_id,
-                    )
-                except Exception:
-                    # The previous task may have failed; still attempt to continue so
-                    # the agent can explain the GUI command result or failure.
-                    pass
-
-            control = self._run_control_for(runtime)
-            control["status"] = "running"
-            control["run_id"] = f"run_{uuid.uuid4().hex[:12]}"
-            control["pause_requested"] = False
-            control["stop_requested"] = False
-            control["reassess_requested"] = False
-            control["updated_at"] = datetime.now().isoformat()
-            await self._broadcast_run_control(session_id, control, content=f"GUI command result received; continuing agent response for {action}.")
-            await self.manager.send_message_to_session(
-                {
-                    "type": "workflow_status",
-                    "status": "continuing",
-                    "content": f"GUI command result received; asking agent to answer using {action} result.",
-                    "action": action,
-                    "command_id": command_id,
-                    "timestamp": datetime.now().isoformat(),
-                    "session_id": session_id,
-                },
-                session_id,
+            runtime = self.manager.get_runtime(session_id)
+            if runtime is not None:
+                runtime["event_loop"] = asyncio.get_running_loop()
+                runtime["permission_provider_factory"] = self._make_gateway_permission_provider
+            result = await orch.submit_user_message(
+                content,
+                sender=sender,
+                visual_context=visual_context,
+                target_task_id=target_task_id,
+                force_new_root=force_new_root,
             )
-
-            prompt = self._gui_command_continuation_prompt(action, command_id, ok)
-            await self._handle_chat_message(prompt, session_id, sender="system_gui_continuation", visual_context=None)
+            if isinstance(result, dict):
+                await self.manager.send_message_to_session(
+                    {
+                        "type": "workflow_status",
+                        "status": result.get("status") or "orchestration_submitted",
+                        "content": result.get("content") or f"Orchestration accepted message ({result.get('status') or 'submitted'}).",
+                        "task_id": result.get("task_id"),
+                        "timestamp": datetime.now().isoformat(),
+                        "session_id": session_id,
+                    },
+                    session_id,
+                )
         except Exception as exc:
+            console.print(f"[!] Orchestration chat submission failed: {type(exc).__name__}: {exc}")
+            console.print(traceback.format_exc())
             try:
                 await self.manager.send_message_to_session(
                     {
                         "type": "workflow_error",
                         "status": "error",
-                        "content": f"GUI command auto-continuation failed: {type(exc).__name__}: {exc}",
+                        "content": f"Orchestration chat submission failed: {type(exc).__name__}: {exc}",
                         "error": str(exc),
                         "timestamp": datetime.now().isoformat(),
                         "session_id": session_id,
@@ -3501,64 +4074,441 @@ class WolfGateway:
                 )
             except Exception:
                 pass
-        finally:
-            runtime = self.manager.get_runtime(session_id)
-            if runtime and runtime.get("gui_auto_continue_task") is asyncio.current_task():
-                runtime.pop("gui_auto_continue_task", None)
 
-    async def _handle_agent_control(self, data: Dict[str, Any], session_id: str, participant_id: str = "gui"):
+    def _run_control_for(self, runtime: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the mutable run-control state for a gateway runtime.
+
+        Some websocket paths were updated to use cooperative pause/stop/reassess
+        controls, but the helper was missing from WolfGateway.  Keep this helper
+        deliberately small and backward-compatible: create a default control
+        object if the runtime was created by an older code path or restored from
+        a partial snapshot.
+        """
+        if not isinstance(runtime, dict):
+            return _default_run_control()
+        control = runtime.get("run_control")
+        if not isinstance(control, dict):
+            control = _default_run_control()
+            runtime["run_control"] = control
+        control.setdefault("run_id", None)
+        control.setdefault("status", "idle")
+        control.setdefault("pause_requested", False)
+        control.setdefault("stop_requested", False)
+        control.setdefault("reassess_requested", False)
+        control.setdefault("pending_user_messages", [])
+        control.setdefault("step", 0)
+        control.setdefault("updated_at", datetime.now().isoformat())
+        return control
+
+    async def _broadcast_run_control(self, session_id: str, control: Dict[str, Any], content: str = "") -> None:
+        """Broadcast current cooperative run-control state to websocket clients."""
+        event = {
+            "type": "run_control_state",
+            "status": control.get("status") or "idle",
+            "content": content or f"Agent run state: {control.get('status') or 'idle'}",
+            "run_id": control.get("run_id"),
+            "pause_requested": bool(control.get("pause_requested")),
+            "stop_requested": bool(control.get("stop_requested")),
+            "reassess_requested": bool(control.get("reassess_requested")),
+            "step": control.get("step", 0),
+            "pending_user_message_count": len(control.get("pending_user_messages") or []),
+            "updated_at": control.get("updated_at") or datetime.now().isoformat(),
+            "timestamp": datetime.now().isoformat(),
+            "session_id": session_id,
+        }
+        await self.manager.send_message_to_session(event, session_id)
+
+    async def _send_gateway_state(self, session_id: str, participant_id: str, control: Dict[str, Any], content: str = "Gateway state synchronized.") -> Dict[str, Any]:
+        """Send a point-in-time gateway/VUI state response for GUI state_request."""
+        runtime = self.manager.get_runtime(session_id)
+        session = self.manager.sessions.get(session_id)
+        participants = self.manager.session_participants.get(session_id, {}) or {}
+        event = {
+            "type": "gateway_state",
+            "status": control.get("status") or "idle",
+            "content": content,
+            "run_control": {
+                "run_id": control.get("run_id"),
+                "status": control.get("status") or "idle",
+                "pause_requested": bool(control.get("pause_requested")),
+                "stop_requested": bool(control.get("stop_requested")),
+                "reassess_requested": bool(control.get("reassess_requested")),
+                "step": control.get("step", 0),
+                "pending_user_message_count": len(control.get("pending_user_messages") or []),
+                "updated_at": control.get("updated_at"),
+            },
+            "runtime": {
+                "available": runtime is not None,
+                "agent_name": getattr((runtime or {}).get("agent"), "name", None) if runtime else None,
+                "session_dir": (runtime or {}).get("session_dir") if runtime else None,
+            },
+            "session": {
+                "session_id": session_id,
+                "account_id": getattr(session, "account_id", None) if session else None,
+                "active": bool(getattr(session, "active", False)) if session else False,
+            },
+            "participants": {
+                "count": len(participants),
+                "active_count": sum(1 for p in participants.values() if p.get("active")),
+                "self": participants.get(participant_id, {}),
+            },
+            "timestamp": datetime.now().isoformat(),
+            "session_id": session_id,
+            "to_participant_id": participant_id,
+            "visibility": "direct",
+        }
+        await self.manager.send_message_to_session(event, session_id)
+        # Also broadcast the existing run_control_state shape because the VUI already understands it.
+        await self._broadcast_run_control(session_id, control, content=content)
+        return {"ok": True, "status": control.get("status") or "idle"}
+
+    async def _handle_agent_control(self, data: Dict[str, Any], session_id: str, participant_id: str):
+        """Apply cooperative run-control commands for an active gateway agent run.
+
+        Supported commands:
+        - pause / pause_after_step
+        - resume
+        - stop / cancel
+        - reassess / reassess_after_step / message
+
+        The workflow checks this state at safe boundaries; this method does not
+        hard-cancel an in-flight model/tool call.
+        """
         runtime = self.manager.get_runtime(session_id)
         if not runtime:
-            await self.manager.send_message_to_session({"type": "error", "content": "No runtime configured for agent control.", "timestamp": datetime.now().isoformat(), "session_id": session_id}, session_id)
-            return
+            await self.manager.send_message_to_session({
+                "type": "run_control_state",
+                "status": "error",
+                "content": "No runtime configured for run-control command.",
+                "timestamp": datetime.now().isoformat(),
+                "session_id": session_id,
+            }, session_id)
+            return {"ok": False, "error": "no_runtime"}
+
         control = self._run_control_for(runtime)
-        command = str(data.get("command") or data.get("action") or "state_request").strip().lower()
+        raw_command = data.get("command") or data.get("type") or ""
+        command = str(raw_command).strip().lower().replace("-", "_")
         now = datetime.now().isoformat()
-        control["updated_at"] = now
-        content = "Agent control state requested."
+        content = data.get("content") or data.get("message") or ""
 
-        if command in {"pause", "pause_after_step"}:
+        if command in {"state_request", "get_state", "status", "sync_state", "state"}:
+            control["updated_at"] = now
+            control["updated_by"] = participant_id
+            return await self._send_gateway_state(session_id, participant_id, control, content="Gateway state synchronized.")
+        elif command in {"pause", "pause_after_step"}:
             control["pause_requested"] = True
-            if control.get("status") in {"idle", "completed", "failed", "stopped"}:
-                content = "No active run to pause."
-            else:
-                control["status"] = "pause_requested"
-                content = "Pause requested; agent will pause at the next safe step boundary."
-        elif command in {"resume", "resume_run"}:
+            control["status"] = "pause_requested"
+            msg = "Agent pause requested; pausing at the next safe checkpoint."
+        elif command in {"resume", "continue"}:
             control["pause_requested"] = False
-            control["status"] = "running" if control.get("run_id") else "idle"
-            content = "Resume requested."
-        elif command in {"stop", "stop_after_step", "cancel", "cancel_after_step"}:
+            control["status"] = "running"
+            msg = "Agent resume requested."
+        elif command in {"stop", "cancel", "abort"}:
             control["stop_requested"] = True
+            control["pause_requested"] = False
+            control["status"] = "stop_requested"
+            msg = "Agent stop requested; stopping at the next safe checkpoint."
+        elif command in {"reassess", "reassess_after_step", "message", "user_message"}:
+            pending = control.setdefault("pending_user_messages", [])
+            pending.append({
+                "content": content,
+                "sender": data.get("sender") or participant_id,
+                "visual_context": data.get("visual_context"),
+                "timestamp": now,
+                "source": "agent_control",
+            })
+            control["reassess_requested"] = True
             if control.get("status") in {"idle", "completed", "failed", "stopped"}:
-                control["status"] = "stopped"
-                content = "No active run; marked stopped."
-            else:
-                control["status"] = "stop_requested"
-                content = "Stop requested; agent will stop at the next safe step boundary."
-        elif command in {"reassess", "reassess_after_step", "append_user_message"}:
-            msg = str(data.get("content") or data.get("message") or "").strip()
-            if msg:
-                control.setdefault("pending_user_messages", []).append({
-                    "content": msg,
-                    "sender": data.get("sender") or participant_id,
-                    "visual_context": data.get("visual_context") if isinstance(data.get("visual_context"), dict) else {},
-                    "created_at": now,
-                })
-                control["reassess_requested"] = True
-                if control.get("status") == "idle":
-                    content = "Reassessment message queued, but no run is active."
-                else:
-                    content = "Reassessment queued; agent will incorporate the message at the next safe checkpoint."
-            else:
-                content = "No reassessment message content supplied."
-        elif command in {"state", "state_request", "status"}:
-            content = "Agent control state."
+                control["status"] = "running"
+            msg = "Agent reassessment message queued."
         else:
-            await self.manager.send_message_to_session({"type": "error", "content": f"Unsupported agent control command: {command}", "timestamp": now, "session_id": session_id}, session_id)
+            msg = f"Unknown agent control command: {raw_command}"
+            await self.manager.send_message_to_session({
+                "type": "run_control_state",
+                "status": "error",
+                "content": msg,
+                "command": raw_command,
+                "timestamp": now,
+                "session_id": session_id,
+            }, session_id)
+            return {"ok": False, "error": msg}
+
+        control["updated_at"] = now
+        control["updated_by"] = participant_id
+        await self._broadcast_run_control(session_id, control, content=msg)
+        return {"ok": True, "status": control.get("status"), "command": command}
+
+    async def _handle_permission_decision(self, data: Dict[str, Any], session_id: str, participant_id: str):
+        """Resolve a pending risky-action permission request from a gateway client.
+
+        The actual action execution is running in a worker thread.  The gateway
+        permission provider stores a thread-safe Future in the runtime; this
+        websocket handler fills that Future from the event loop thread.
+        """
+        runtime = self.manager.get_runtime(session_id)
+        request_id = str(data.get("request_id") or data.get("id") or "").strip()
+        if not runtime or not request_id:
+            await self.manager.send_message_to_session({
+                "type": "permission_decision_ack",
+                "ok": False,
+                "request_id": request_id,
+                "content": "Permission decision could not be applied: runtime or request_id missing.",
+                "timestamp": datetime.now().isoformat(),
+                "session_id": session_id,
+            }, session_id)
             return
 
-        await self._broadcast_run_control(session_id, control, content=content)
+        pending = runtime.setdefault("pending_permission_requests", {})
+        item = pending.get(request_id)
+        if not item:
+            await self.manager.send_message_to_session({
+                "type": "permission_decision_ack",
+                "ok": False,
+                "request_id": request_id,
+                "content": f"Permission request {request_id} is no longer pending.",
+                "timestamp": datetime.now().isoformat(),
+                "session_id": session_id,
+            }, session_id)
+            return
+
+        req = item.get("request") or {}
+        approved = bool(data.get("approved"))
+        decision = {
+            "request_id": request_id,
+            "kind": data.get("kind") or req.get("kind"),
+            "approved": approved,
+            "approve_for_session": bool(data.get("approve_for_session")),
+            "source": "gateway_websocket",
+            "status": "approved" if approved else "denied",
+            "reason": data.get("reason") or data.get("feedback") or ("approved by gateway participant" if approved else "denied by gateway participant"),
+            "feedback": data.get("feedback") or data.get("reason"),
+            "decided_by": participant_id,
+            "metadata": {"session_id": session_id},
+        }
+
+        future = item.get("future")
+        if future is not None and not future.done():
+            future.set_result(decision)
+        pending.pop(request_id, None)
+
+        await self.manager.send_message_to_session({
+            "type": "permission_decision_ack",
+            "ok": True,
+            "request_id": request_id,
+            "kind": decision.get("kind"),
+            "approved": approved,
+            "approve_for_session": decision.get("approve_for_session"),
+            "decided_by": participant_id,
+            "content": f"Permission request {request_id} {'approved' if approved else 'denied'}.",
+            "timestamp": datetime.now().isoformat(),
+            "session_id": session_id,
+        }, session_id)
+
+    @staticmethod
+    def _normalize_permission_routing_mode(value: Any) -> str:
+        raw = str(value or "session_owner").strip().lower().replace("-", "_")
+        aliases = {
+            "": "session_owner",
+            "default": "session_owner",
+            "owner": "session_owner",
+            "session": "session_owner",
+            "session_owner": "session_owner",
+            "no_delegation": "session_owner",
+            "no_delegation_default": "session_owner",
+            "agent0": "delegate_to_root_agent",
+            "root_agent": "delegate_to_root_agent",
+            "delegate_to_root": "delegate_to_root_agent",
+            "delegate_to_root_agent": "delegate_to_root_agent",
+            "line_of_management": "line_of_management",
+            "management_chain": "line_of_management",
+            "self_approved": "self_approved",
+            "self_approve": "self_approved",
+            "auto_approve": "self_approved",
+        }
+        return aliases.get(raw, "session_owner")
+
+    def install_gateway_permission_provider(
+        self,
+        infra: Any,
+        session_id: str,
+        runtime: Dict[str, Any],
+        loop: asyncio.AbstractEventLoop,
+        execution_policy: Optional[Dict[str, Any]] = None,
+        *,
+        scope_metadata: Optional[Dict[str, Any]] = None,
+        permission_routing_mode: Optional[str] = None,
+    ) -> bool:
+        """Install the unified gateway permission provider on an infra object.
+
+        This is the central helper described by the orchestration permission
+        routing workplan.  It keeps the main gateway workflow and task-local
+        orchestration worker workflows on the same permission-routing path.
+        """
+        if infra is None or not hasattr(infra, "set_permission_providers"):
+            return False
+        if not loop or not getattr(loop, "is_running", lambda: False)():
+            return False
+        provider = self._make_gateway_permission_provider(
+            session_id,
+            runtime,
+            loop,
+            execution_policy or {},
+            scope_metadata=scope_metadata or {},
+            permission_routing_mode=permission_routing_mode,
+        )
+        infra.set_permission_providers([provider])
+        return True
+
+    def _make_gateway_permission_provider(
+        self,
+        session_id: str,
+        runtime: Dict[str, Any],
+        loop: asyncio.AbstractEventLoop,
+        execution_policy: Optional[Dict[str, Any]] = None,
+        *,
+        scope_metadata: Optional[Dict[str, Any]] = None,
+        permission_routing_mode: Optional[str] = None,
+    ):
+        """Create a sync PermissionManager provider backed by gateway websocket UI.
+
+        Supports the routing modes from IMPROVEMENTS/orchestration_permission_routing.md:
+        session_owner/no_delegation routes to connected human approval surfaces;
+        delegate_to_root_agent and line_of_management are recognized but fall back
+        to session_owner for now; self_approved approves after static guardrails.
+        """
+        execution_policy = execution_policy or {}
+        scope_metadata = dict(scope_metadata or {})
+        config = runtime.get("config", {}) if isinstance(runtime, dict) else {}
+        routing_mode = self._normalize_permission_routing_mode(
+            permission_routing_mode
+            or execution_policy.get("permission_routing_mode")
+            or config.get("permission_routing_mode")
+            or os.environ.get("WOLF_PERMISSION_ROUTING_MODE")
+        )
+
+        def _provider(request: PermissionRequest):
+            metadata = dict(getattr(request, "metadata", None) or {})
+            metadata.update(scope_metadata)
+            metadata.setdefault("permission_routing_mode", routing_mode)
+            metadata.setdefault("gateway_session_id", session_id)
+            if routing_mode in {"delegate_to_root_agent", "line_of_management"}:
+                metadata.setdefault("delegation_warning", f"{routing_mode} is experimental; falling back to session_owner routing")
+
+            request = request.model_copy(update={"metadata": metadata})
+
+            if routing_mode == "self_approved":
+                return {
+                    "request_id": request.id,
+                    "kind": request.kind,
+                    "approved": True,
+                    "approve_for_session": False,
+                    "source": "self_approved",
+                    "status": "approved",
+                    "reason": "Permission routing mode self_approved approved this request after static gateway guardrails.",
+                    "metadata": metadata,
+                }
+
+            if not loop or not loop.is_running():
+                return None
+
+            participants = self.manager.session_participants.get(session_id, {}) or {}
+            has_approver = any(
+                bool(meta.get("active", True)) and bool((meta.get("permissions") or {}).get("can_approve_agent_permissions"))
+                for meta in participants.values()
+            )
+            # Do not fail silently if participant metadata is stale or incomplete.
+            # Broadcast the request to connected clients; permission_decision handling
+            # still enforces can_approve_agent_permissions before unblocking execution.
+
+            try:
+                timeout = float((request.metadata or {}).get("wait_timeout") or execution_policy.get("permission_wait_timeout") or os.environ.get("WOLF_GATEWAY_PERMISSION_TIMEOUT") or os.environ.get("WOLF_PERMISSION_APPROVAL_TIMEOUT") or 300)
+            except Exception:
+                timeout = 300.0
+            timeout = max(1.0, timeout)
+
+            future: concurrent.futures.Future = concurrent.futures.Future()
+            payload = request.model_dump(mode="json")
+            payload["status"] = "pending"
+            payload["session_id"] = session_id
+            payload["expires_at"] = time.time() + timeout
+            runtime.setdefault("pending_permission_requests", {})[request.id] = {
+                "request": payload,
+                "future": future,
+                "created_at": datetime.now().isoformat(),
+                "timeout": timeout,
+                "permission_routing_mode": routing_mode,
+                "scope_metadata": metadata,
+            }
+
+            event = {
+                "type": "permission_request",
+                "request_id": request.id,
+                "kind": request.kind,
+                "action": request.action,
+                "request": payload,
+                "summary": request.display_summary(),
+                "content": f"Agent requests permission for {request.kind}.",
+                "timestamp": datetime.now().isoformat(),
+                "session_id": session_id,
+                "has_known_approver": has_approver,
+                "participant_count": len(participants),
+                "decision_options": ["deny", "approve_once", "approve_for_session"],
+                "permission_routing_mode": routing_mode,
+                "permission_source": metadata.get("permission_source"),
+                "task_id": metadata.get("task_id"),
+                "parent_task_id": metadata.get("parent_task_id"),
+                "worker_agent_name": metadata.get("worker_agent_name"),
+                "worker_session_dir": metadata.get("worker_session_dir"),
+                "workflow_type": metadata.get("workflow_type"),
+            }
+            if isinstance(event.get("summary"), dict):
+                event["summary"]["metadata"] = metadata
+            try:
+                asyncio.run_coroutine_threadsafe(self.manager.send_message_to_session(event, session_id), loop).result(timeout=3)
+            except Exception:
+                runtime.setdefault("pending_permission_requests", {}).pop(request.id, None)
+                return None
+
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                runtime.setdefault("pending_permission_requests", {}).pop(request.id, None)
+                timeout_decision = {
+                    "request_id": request.id,
+                    "kind": request.kind,
+                    "approved": False,
+                    "source": "gateway_websocket",
+                    "status": "timeout",
+                    "reason": "Permission request timed out in gateway UI.",
+                    "metadata": metadata,
+                }
+                try:
+                    asyncio.run_coroutine_threadsafe(self.manager.send_message_to_session({
+                        "type": "permission_request_timeout",
+                        "request_id": request.id,
+                        "kind": request.kind,
+                        "content": f"Permission request {request.id} timed out.",
+                        "timestamp": datetime.now().isoformat(),
+                        "session_id": session_id,
+                        "permission_routing_mode": routing_mode,
+                        "task_id": metadata.get("task_id"),
+                    }, session_id), loop)
+                except Exception:
+                    pass
+                return timeout_decision
+            except Exception as exc:
+                runtime.setdefault("pending_permission_requests", {}).pop(request.id, None)
+                return {
+                    "request_id": request.id,
+                    "kind": request.kind,
+                    "approved": False,
+                    "source": "gateway_websocket",
+                    "status": "provider_error",
+                    "reason": f"Gateway permission provider failed: {type(exc).__name__}: {exc}",
+                    "metadata": metadata,
+                }
+
+        return _provider
 
     async def _handle_chat_message(self, content: str, session_id: str, sender: str = "user", visual_context: Optional[Dict[str, Any]] = None):
         runtime = self.manager.get_runtime(session_id)
@@ -3568,6 +4518,12 @@ class WolfGateway:
                 session_id,
             )
             return
+
+        # Orchestration worker sessions are created inside scheduler/adapter paths
+        # and need a gateway event loop plus provider factory to broadcast
+        # permission_request events back to connected GUI/web clients.
+        runtime["event_loop"] = asyncio.get_running_loop()
+        runtime["permission_provider_factory"] = self._make_gateway_permission_provider
 
         await self.manager.send_message_to_session(
             {"type": "user_echo", "content": content, "sender": sender, "timestamp": datetime.now().isoformat(), "session_id": session_id},
@@ -3658,18 +4614,57 @@ class WolfGateway:
         await self._broadcast_run_control(session_id, control, content="Agent run started.")
 
         try:
-            async with runtime["lock"]:
-                wf: GatewayActionWorkflow = runtime["wf"]
-                events = await wf.process_user_message(
-                    workflow_content,
-                    user_name="user",
-                    action_names=action_names,
-                    mode=mode,
-                    max_steps=max_steps,
-                    log_console=False,
-                    execution_policy=execution_policy,
-                    control_state=control,
-                )
+            loop = asyncio.get_running_loop()
+            infra = runtime.get("infra")
+            self.install_gateway_permission_provider(
+                infra,
+                session_id,
+                runtime,
+                loop,
+                execution_policy,
+                scope_metadata={
+                    "permission_source": "main_gateway_workflow",
+                    "gateway_session_id": session_id,
+                    "workflow_type": "gateway_chat",
+                    "session_dir": runtime.get("session_dir"),
+                },
+                permission_routing_mode=(runtime.get("config", {}) or {}).get("permission_routing_mode"),
+            )
+
+            wf: GatewayActionWorkflow = runtime["wf"]
+            streamed_event_ids = set()
+
+            def _forward_workflow_event(event: Dict[str, Any]) -> None:
+                try:
+                    event = dict(event or {})
+                    event.setdefault("session_id", session_id)
+                    event.setdefault("transport", "base_workflow_event")
+                    event_id = event.get("event_id") or f"{event.get('type')}|{event.get('timestamp')}|{event.get('step')}|{event.get('status')}"
+                    event["event_id"] = event_id
+                    streamed_event_ids.add(event_id)
+                    loop.call_soon_threadsafe(asyncio.create_task, self.manager.send_message_to_session(event, session_id))
+                except Exception as listener_exc:
+                    console.print(f"[!] Failed to forward workflow event: {listener_exc}")
+
+            if hasattr(wf, "add_event_listener"):
+                wf.add_event_listener(_forward_workflow_event)
+
+            try:
+                async with runtime["lock"]:
+                    events = await wf.process_user_message(
+                        workflow_content,
+                        user_name="user",
+                        action_names=action_names,
+                        mode=mode,
+                        max_steps=max_steps,
+                        log_console=False,
+                        execution_policy=execution_policy,
+                        control_state=control,
+                    )
+            finally:
+                if hasattr(wf, "remove_event_listener"):
+                    wf.remove_event_listener(_forward_workflow_event)
+
             for event in events:
                 if event.get("step") is not None:
                     try:
@@ -3677,7 +4672,11 @@ class WolfGateway:
                     except Exception:
                         pass
                 event.setdefault("session_id", session_id)
-                await self.manager.send_message_to_session(event, session_id)
+                event_id = event.get("event_id") or f"{event.get('type')}|{event.get('timestamp')}|{event.get('step')}|{event.get('status')}"
+                if event_id not in streamed_event_ids:
+                    await self.manager.send_message_to_session(event, session_id)
+                if event.get("type") == "workflow_result" and str(event.get("action") or "").lower() in INFRASTRUCTURE_LIFECYCLE_ACTIONS:
+                    await self._broadcast_infrastructure_snapshot(session_id, account_id, reason=str(event.get("action") or "infrastructure_update"))
                 gui_command = self._gui_command_from_workflow_event(event)
                 if gui_command:
                     gui_command.setdefault("session_id", session_id)

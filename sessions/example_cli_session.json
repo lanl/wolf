@@ -1,6 +1,6 @@
 {
   "mode": "cli",
-  "workflow": "TurnBasedWorkflow",
+  "workflow": "FastTurnBasedWorkflow",
   "resume_session": null,
   "user_name": "user",
   "session": {
