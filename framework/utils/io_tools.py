@@ -14,9 +14,16 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.console import Console
+
+import framework
+
 console = Console()
 
 CONTAINER_HANDLES = ["```json", "```python", "```js", "```html", "```java",]
+
+WOLF_PATH = root \
+    if Path.cwd().resolve() != (root := Path(framework.__path__[0]).parent.resolve()) \
+    else Path()
 
 # ------------------------------------------------------------------
 # Helper I/O functions – replace these with your real implementations
@@ -26,8 +33,8 @@ def load_env_vars(env_path=".env"):
     env_file = Path(env_path)
     if not env_file.exists():
         print(f".env file not found at {env_path}")
-        return {}
-    load_dotenv(dotenv_path=env_file)
+    else:
+        load_dotenv(dotenv_path=env_file)
     return {key: os.getenv(key) for key in os.environ}
 
 def _resolve_path(file_path: Union[str, Path]) -> Path:
