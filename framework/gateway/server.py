@@ -112,23 +112,46 @@ class GatewayServer:
 
     async def get_snapshot(self, session_id: str) -> Dict[str, Any]:
         snap = await self.runtime.snapshot()
-        tasks = [t for t in snap['tasks'] if (t.spec.session_id or self._task_to_session.get(t.id)) == session_id]
+
+        def _task_id(task: Any) -> str | None:
+            if isinstance(task, dict):
+                return task.get('id')
+            return getattr(task, 'id', None)
+
+        def _task_status(task: Any) -> str:
+            if isinstance(task, dict):
+                return str(task.get('status') or '')
+            status = getattr(task, 'status', None)
+            return str(getattr(status, 'value', status) or '')
+
+        def _task_session_id(task: Any) -> str | None:
+            if isinstance(task, dict):
+                tid = task.get('id')
+                spec = task.get('spec') or {}
+                if isinstance(spec, dict):
+                    return spec.get('session_id') or self._task_to_session.get(tid)
+                return self._task_to_session.get(tid)
+            spec = getattr(task, 'spec', None)
+            return getattr(spec, 'session_id', None) or self._task_to_session.get(getattr(task, 'id', None))
+
+        tasks = [t for t in snap.get('tasks', []) if _task_session_id(t) == session_id]
         tasks_by_status = {
-            'running': [t for t in tasks if t.status.value == 'running'],
-            'waiting': [t for t in tasks if t.status.value == 'waiting'],
-            'ready': [t for t in tasks if t.status.value == 'ready'],
-            'paused': [t for t in tasks if t.status.value == 'paused'],
-            'blocked': [t for t in tasks if t.status.value == 'blocked'],
-            'completed': [t for t in tasks if t.status.value == 'completed'],
-            'failed': [t for t in tasks if t.status.value == 'failed'],
-            'cancelled': [t for t in tasks if t.status.value == 'cancelled'],
+            'running': [t for t in tasks if _task_status(t) == 'running'],
+            'waiting': [t for t in tasks if _task_status(t) == 'waiting'],
+            'ready': [t for t in tasks if _task_status(t) == 'ready'],
+            'paused': [t for t in tasks if _task_status(t) == 'paused'],
+            'blocked': [t for t in tasks if _task_status(t) == 'blocked'],
+            'completed': [t for t in tasks if _task_status(t) == 'completed'],
+            'failed': [t for t in tasks if _task_status(t) == 'failed'],
+            'cancelled': [t for t in tasks if _task_status(t) == 'cancelled'],
         }
+        task_ids = {_task_id(t) for t in tasks}
         return {
             'session_id': session_id,
             'tasks': tasks,
             'agent_pool': snap['agent_pool'],
             'events': self.hub.history(session_id),
-            'artifacts': {tid: rows for tid, rows in snap.get('artifacts', {}).items() if any(t.id == tid for t in tasks)},
+            'artifacts': {tid: rows for tid, rows in snap.get('artifacts', {}).items() if tid in task_ids},
             'task_counts': {k: len(v) for k, v in tasks_by_status.items()},
             'queues': tasks_by_status,
         }

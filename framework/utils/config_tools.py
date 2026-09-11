@@ -11,7 +11,7 @@ from chromadb.config import Settings
 
 # UTILs
 from framework.utils.io_tools import console, image_to_ascii
-from framework.utils.io_tools import USER_ENV_VARs
+from framework.utils.io_tools import WOLF_PATH, USER_ENV_VARs
 from framework.utils.machines_ssl_config import conform_machine_ssl_certs
 from framework.utils.multimodal_input import normalize_capabilities
 
@@ -39,7 +39,7 @@ from framework.infrastructure.base_memory_manager import MemoryManager
 from framework.infrastructure.base_context_manager import ContextManager
 from framework.infrastructure.base_infrastructure import BaseInfrastructure 
 #from framework.workflows.base_workflow import BaseWorkflow
-from framework.workflows.custom_workflows.turn_based_workflow import TurnBasedWorkflow
+from framework.workflows.custom_workflows.fast_workflow import FastTurnBasedWorkflow
 from framework.workflows.base_workflow import BaseWorkflow
 
 
@@ -84,7 +84,8 @@ def load_session_certs(session_params):
 
 def show_banner(session_params):
     console.print("|=================================================================================|")
-    image_to_ascii(session_params.get('banner_image_file','config/preferences/banner/WOLF.png'),
+    image_to_ascii(session_params.get('banner_image_file',
+                                      WOLF_PATH / 'config/preferences/banner/WOLF.png'),
                    width=session_params.get('banner_image_width', 100),
                    flag=session_params.get('banner_image_color', 'purple')
                    )
@@ -116,6 +117,20 @@ def build_list_agents(session_params):
         )
     return AGENTs
 
+def apply_agent_identity_snapshot(main_agent, workers, snapshot_data: dict):
+    """Apply saved agent names from a session snapshot to rebuilt agents."""
+    agent_info = snapshot_data.get('agent_info') or {}
+    worker_infos = snapshot_data.get('workers_info') or []
+    main_name = agent_info.get('name')
+    if main_name and hasattr(main_agent, 'name'):
+        main_agent.name = main_name
+    for worker, info in zip(workers, worker_infos):
+        name = info.get('name') if isinstance(info, dict) else None
+        if name and hasattr(worker, 'name'):
+            worker.name = name
+    return main_agent, workers
+
+
 def build_list_universes(session_params):
     UNIVs = []
     console.print("|=================================================================================|")
@@ -140,7 +155,7 @@ def build_list_universes(session_params):
     return UNIVs
 
 
-def load_existing_session(session_identifier: str, session_params: dict, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow) -> dict:
+def load_existing_session(session_identifier: str, session_params: dict, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = FastTurnBasedWorkflow) -> dict:
     """Load an existing session from snapshots.
     
     Args:
@@ -201,6 +216,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     agents = list(AGENTs.keys())
     main_agent = AGENTs[agents[0]]
     workers = [AGENTs[worker] for worker in agents[1:]] if len(agents) > 1 else []
+    main_agent, workers = apply_agent_identity_snapshot(main_agent, workers, snapshot_data)
     
     # Reconstruct universes
     UNIVs = build_list_universes(session_params)
@@ -263,6 +279,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     
     # Restore infrastructure state
     INFRA.restore(infra_snapshot)
+    INFRA.sync_agent_roster()
     
     # Create workflow with restored infrastructure
     #WF = BaseWorkflow(
@@ -289,7 +306,7 @@ def load_existing_session(session_identifier: str, session_params: dict, db_clie
     }
 
 
-def setup_cli_session(session_params, resume_session: Optional[str] = None, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow):
+def setup_cli_session(session_params, resume_session: Optional[str] = None, db_client: Optional[chromadb.Client] = None, workflow_cls: Type[BaseWorkflow] = FastTurnBasedWorkflow):
     """Setup CLI session - either new or resumed.
     
     Args:
@@ -427,7 +444,7 @@ class BaseSession:
 class CliSession(BaseSession):
     def __init__(self, session_params, db_client: Optional[chromadb.Client] = None):
         super().__init__(session_params=session_params, db_client=db_client)
-    def create_session(self, resume_session: Optional[str] = None, db_client=None, workflow_cls: Type[BaseWorkflow] = TurnBasedWorkflow):
+    def create_session(self, resume_session: Optional[str] = None, db_client=None, workflow_cls: Type[BaseWorkflow] = FastTurnBasedWorkflow):
         if db_client is None: db_client = self.db_client
         self.session = setup_cli_session(session_params=self.session_params,
                                          resume_session=resume_session,

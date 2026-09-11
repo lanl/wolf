@@ -100,6 +100,10 @@ class DashboardPanel:
     session_id: Optional[str] = None
     workflow: Optional[str] = None
     host_status: str = "unknown"
+    zoom: float = 1.0
+    min_zoom: float = 0.25
+    max_zoom: float = 3.0
+    zoom_step: float = 0.1
 
 
 @dataclass
@@ -137,6 +141,8 @@ class GuiRuntime:
         self.apps: List[WorkspaceApp] = []
         self.dashboards: List[Dashboard] = []
         self.active_dashboard_id: Optional[str] = None
+        self.approvals: List[Dict[str, Any]] = []
+        self.chat_scale: float = 1.0
         self.messages: List[ChatMessage] = [
             ChatMessage(
                 id=self._id("msg"),
@@ -170,6 +176,8 @@ class GuiRuntime:
             "workspace": asdict(self.workspace),
             "annotations": [asdict(a) for a in self.annotations],
             "messages": [asdict(m) for m in self.messages],
+            "approvals": self.approval_requests_list(include_done=False),
+            "chat_scale": self.chat_scale,
             "apps": self.apps_list(),
             "dashboards": self.dashboards_list(),
             "launch_config": self.redacted_launch_config(),
@@ -186,6 +194,7 @@ class GuiRuntime:
             "annotations": len(self.annotations),
             "apps": len(self.apps),
             "dashboards": len(self.dashboards),
+            "chat_scale": self.chat_scale,
             "events": len(self.events),
         }
 
@@ -379,6 +388,30 @@ class GuiRuntime:
         self.emit("dashboard_created", asdict(dashboard))
         return asdict(dashboard)
 
+    def _truthy(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _should_open_after_panel_add(self, data: Dict[str, Any], panel: DashboardPanel, dashboard: Dashboard) -> bool:
+        """Decide whether adding a dashboard panel should make that dashboard visible.
+
+        Agent/actionbox dashboard panel creation is a visual action; by default it
+        should produce visible feedback. Callers that are building a dashboard in
+        batches, such as publish_dashboard, can pass open_after_add=False and open
+        once after all panels are installed.
+        """
+        for key in ("open_after_add", "open", "auto_open"):
+            if key in data:
+                return self._truthy(data.get(key))
+        actor = str(data.get("created_by") or panel.created_by or "").lower()
+        source = str(data.get("source") or panel.source or dashboard.source or "").lower()
+        return actor in {"agent", "actionbox"} or source in {"agent", "actionbox"}
+
     def add_dashboard_panel(self, data: Dict[str, Any]) -> Dict[str, Any]:
         dashboard = self._find_dashboard(data.get("dashboard_id"))
         if dashboard is None:
@@ -412,11 +445,18 @@ class GuiRuntime:
             session_id=data.get("session_id") or dashboard.session_id,
             workflow=data.get("workflow") or dashboard.workflow,
             host_status=str(data.get("host_status") or dashboard.host_status or "unknown"),
+            zoom=self._coerce_zoom(data.get("zoom", 1.0), data.get("min_zoom", 0.25), data.get("max_zoom", 3.0)),
+            min_zoom=float(data.get("min_zoom") or 0.25),
+            max_zoom=float(data.get("max_zoom") or 3.0),
+            zoom_step=float(data.get("zoom_step") or 0.1),
         )
         dashboard.panels = [p for p in dashboard.panels if p.id != panel.id]
         dashboard.panels.append(panel)
         dashboard.updated_at = now_ts()
-        self.emit("dashboard_panel_added", {"dashboard": asdict(dashboard), "panel": asdict(panel)})
+        payload = {"dashboard": asdict(dashboard), "panel": asdict(panel)}
+        self.emit("dashboard_panel_added", payload)
+        if self._should_open_after_panel_add(data, panel, dashboard):
+            payload["opened"] = self.open_dashboard(dashboard_id=dashboard.id)
         return asdict(panel)
 
     def update_dashboard_panel(self, panel_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -426,6 +466,14 @@ class GuiRuntime:
                     for key in ("name", "kind", "url", "title", "content_html", "status", "source", "universe", "created_by", "session_id", "workflow", "host_status"):
                         if key in data:
                             setattr(panel, key, data[key])
+                    if "min_zoom" in data:
+                        panel.min_zoom = float(data.get("min_zoom") or panel.min_zoom)
+                    if "max_zoom" in data:
+                        panel.max_zoom = float(data.get("max_zoom") or panel.max_zoom)
+                    if "zoom_step" in data:
+                        panel.zoom_step = float(data.get("zoom_step") or panel.zoom_step)
+                    if "zoom" in data:
+                        panel.zoom = self._coerce_zoom(data.get("zoom"), panel.min_zoom, panel.max_zoom)
                     if "layout" in data:
                         panel.layout = dict(data.get("layout") or {})
                     if "metadata" in data:
@@ -456,6 +504,152 @@ class GuiRuntime:
         self.emit("dashboard_opened", payload)
         return payload
 
+
+    def _coerce_zoom(self, value: Any, min_zoom: Any = 0.25, max_zoom: Any = 3.0) -> float:
+        try:
+            lo = float(min_zoom if min_zoom is not None else 0.25)
+        except (TypeError, ValueError):
+            lo = 0.25
+        try:
+            hi = float(max_zoom if max_zoom is not None else 3.0)
+        except (TypeError, ValueError):
+            hi = 3.0
+        if hi < lo:
+            lo, hi = hi, lo
+        try:
+            zoom = float(value if value is not None else 1.0)
+        except (TypeError, ValueError):
+            zoom = 1.0
+        return round(max(lo, min(hi, zoom)), 3)
+
+    def _find_dashboard_panel(self, panel_id: str) -> tuple[Dashboard, DashboardPanel]:
+        panel_id = str(panel_id or "")
+        for dashboard in self.dashboards:
+            for panel in dashboard.panels:
+                if panel.id == panel_id:
+                    return dashboard, panel
+        raise ValueError(f"Dashboard panel not found: {panel_id}")
+
+    def _record_dashboard_note(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        msg = ChatMessage(
+            id=self._id("msg"),
+            role="system",
+            content=content,
+            metadata={"dashboard_control": True, **(metadata or {})},
+        )
+        self.messages.append(msg)
+        self.emit("message_created", asdict(msg))
+        return asdict(msg)
+
+
+    def _coerce_chat_scale(self, value: Any) -> float:
+        try:
+            scale = float(value if value is not None else 1.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        return round(max(0.75, min(1.6, scale)), 3)
+
+    def _record_chat_control_note(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        msg = ChatMessage(
+            id=self._id("msg"),
+            role="system",
+            content=content,
+            metadata={"chat_control": True, **(metadata or {})},
+        )
+        self.messages.append(msg)
+        self.emit("message_created", asdict(msg))
+        return asdict(msg)
+
+    def set_chat_scale(self, scale: Any, source: str = "agent") -> Dict[str, Any]:
+        old_scale = float(getattr(self, "chat_scale", 1.0) or 1.0)
+        self.chat_scale = self._coerce_chat_scale(scale)
+        payload = {"chat_scale": self.chat_scale, "old_chat_scale": old_scale, "source": source}
+        self.emit("chat_scale_changed", payload)
+        self._record_chat_control_note(
+            f"Agent chat display size set to {round(self.chat_scale * 100)}% by {source}.",
+            {"event": "chat_scale_changed", "chat_scale": self.chat_scale, "old_chat_scale": old_scale, "source": source},
+        )
+        return payload
+
+    def adjust_chat_scale(self, delta: Any, source: str = "agent") -> Dict[str, Any]:
+        try:
+            amount = float(delta)
+        except (TypeError, ValueError):
+            amount = 0.1
+        return self.set_chat_scale(float(getattr(self, "chat_scale", 1.0) or 1.0) + amount, source=source)
+
+    def reset_chat_scale(self, source: str = "agent") -> Dict[str, Any]:
+        return self.set_chat_scale(1.0, source=source)
+
+    def set_dashboard_panel_zoom(self, panel_id: str, zoom: Any, source: str = "agent") -> Dict[str, Any]:
+        dashboard, panel = self._find_dashboard_panel(panel_id)
+        old_zoom = float(panel.zoom or 1.0)
+        panel.zoom = self._coerce_zoom(zoom, panel.min_zoom, panel.max_zoom)
+        panel.updated_at = now_ts()
+        dashboard.updated_at = panel.updated_at
+        payload = {"dashboard": asdict(dashboard), "panel": asdict(panel), "old_zoom": old_zoom, "zoom": panel.zoom, "source": source}
+        self.emit("dashboard_panel_zoom_changed", payload)
+        pct = round(panel.zoom * 100)
+        self._record_dashboard_note(
+            f"Dashboard panel '{panel.title or panel.name}' zoom set to {pct}% by {source}.",
+            {"event": "dashboard_panel_zoom_changed", "panel_id": panel.id, "dashboard_id": dashboard.id, "zoom": panel.zoom, "old_zoom": old_zoom, "source": source},
+        )
+        return payload
+
+    def adjust_dashboard_panel_zoom(self, panel_id: str, delta: Any, source: str = "agent") -> Dict[str, Any]:
+        _dashboard, panel = self._find_dashboard_panel(panel_id)
+        try:
+            amount = float(delta)
+        except (TypeError, ValueError):
+            amount = float(panel.zoom_step or 0.1)
+        return self.set_dashboard_panel_zoom(panel_id, float(panel.zoom or 1.0) + amount, source=source)
+
+    def reset_dashboard_panel_zoom(self, panel_id: str, source: str = "agent") -> Dict[str, Any]:
+        return self.set_dashboard_panel_zoom(panel_id, 1.0, source=source)
+
+    def remove_dashboard_panel(self, panel_id: str, source: str = "agent") -> Dict[str, Any]:
+        dashboard, panel = self._find_dashboard_panel(panel_id)
+        dashboard.panels = [p for p in dashboard.panels if p.id != panel.id]
+        dashboard.updated_at = now_ts()
+        payload = {"dashboard": asdict(dashboard), "panel": asdict(panel), "panel_id": panel.id, "source": source}
+        self.emit("dashboard_panel_removed", payload)
+        self._record_dashboard_note(
+            f"Dashboard panel '{panel.title or panel.name}' was closed by {source}.",
+            {"event": "dashboard_panel_removed", "panel_id": panel.id, "dashboard_id": dashboard.id, "source": source},
+        )
+        return payload
+
+    def remove_dashboard(self, dashboard_id: Optional[str] = None, source: str = "agent") -> Dict[str, Any]:
+        dashboard = self._find_dashboard(dashboard_id)
+        if dashboard is None:
+            raise ValueError("No dashboard found to close")
+        removed = asdict(dashboard)
+        self.dashboards = [d for d in self.dashboards if d.id != dashboard.id]
+        next_dashboard = self.dashboards[0] if self.dashboards else None
+        if next_dashboard is not None:
+            self.active_dashboard_id = next_dashboard.id
+            self.workspace.mode = "dashboard"
+            self.workspace.url = f"about:dashboard/{next_dashboard.id}"
+            self.workspace.title = next_dashboard.name
+            self.workspace.file_path = None
+            self.workspace.glance_url = None
+            self.workspace.metadata = {**(self.workspace.metadata or {}), "active_dashboard_id": next_dashboard.id, "active_dashboard_layout": next_dashboard.layout}
+        else:
+            self.active_dashboard_id = None
+            self.workspace.mode = "browser"
+            self.workspace.url = "about:blank"
+            self.workspace.title = "Blank workspace"
+            self.workspace.file_path = None
+            self.workspace.glance_url = None
+            self.workspace.metadata = {k: v for k, v in (self.workspace.metadata or {}).items() if not str(k).startswith("active_dashboard")}
+        payload = {"dashboard": removed, "dashboard_id": dashboard.id, "next_dashboard": asdict(next_dashboard) if next_dashboard else None, "workspace": asdict(self.workspace), "source": source}
+        self.emit("dashboard_removed", payload)
+        self._record_dashboard_note(
+            f"Dashboard '{dashboard.name}' was closed by {source}.",
+            {"event": "dashboard_removed", "dashboard_id": dashboard.id, "source": source, "next_dashboard_id": next_dashboard.id if next_dashboard else None},
+        )
+        return payload
+
     def add_message(self, content: str, visual_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_msg = ChatMessage(
             id=self._id("msg"),
@@ -483,6 +677,64 @@ class GuiRuntime:
         self.messages.append(assistant_msg)
         self.emit("message_created", asdict(assistant_msg))
         return {"ok": True, "messages": [asdict(user_msg), asdict(assistant_msg)]}
+
+
+    def approval_requests_list(self, include_done: bool = False) -> List[Dict[str, Any]]:
+        rows = list(self.approvals or [])
+        if not include_done:
+            rows = [r for r in rows if str(r.get("status") or "pending") == "pending"]
+        return sorted(rows, key=lambda r: float(r.get("created_at") or 0), reverse=True)
+
+    def create_approval_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(data or {})
+        request_id = str(payload.get("id") or payload.get("request_id") or self._id("approval"))
+        payload["id"] = request_id
+        payload.setdefault("request_id", request_id)
+        payload.setdefault("kind", payload.get("action") or "unknown")
+        payload.setdefault("action", payload.get("kind") or "unknown")
+        payload.setdefault("status", "pending")
+        payload.setdefault("created_at", now_ts())
+        payload.setdefault("requested_at_iso", time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(payload.get("requested_at") or time.time()))))
+        payload.setdefault("decision", None)
+        self.approvals = [r for r in self.approvals if r.get("id") != request_id]
+        self.approvals.insert(0, payload)
+        if len(self.approvals) > 200:
+            self.approvals = self.approvals[:200]
+        self.emit("approval_requested", {"request": payload})
+        return payload
+
+    def get_approval_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        request_id = str(request_id or "")
+        for req in self.approvals:
+            if str(req.get("id") or req.get("request_id")) == request_id:
+                return req
+        return None
+
+    def decide_approval_request(self, request_id: str, decision: Dict[str, Any]) -> Dict[str, Any]:
+        req = self.get_approval_request(request_id)
+        if req is None:
+            raise KeyError(request_id)
+        approved = bool((decision or {}).get("approved"))
+        status = str((decision or {}).get("status") or ("approved" if approved else "denied")).lower()
+        if status not in {"approved", "denied", "timeout"}:
+            status = "approved" if approved else "denied"
+        decision_payload = {
+            "request_id": request_id,
+            "kind": (decision or {}).get("kind") or req.get("kind"),
+            "approved": status == "approved" or approved,
+            "approve_for_session": bool((decision or {}).get("approve_for_session")),
+            "reason": (decision or {}).get("reason") or (decision or {}).get("feedback"),
+            "feedback": (decision or {}).get("feedback") or (decision or {}).get("reason"),
+            "source": (decision or {}).get("source") or "wolf_gui",
+            "status": status,
+            "decided_at": now_ts(),
+            "decided_by": (decision or {}).get("decided_by") or "gui_user",
+        }
+        req["status"] = status
+        req["decision"] = decision_payload
+        req["decided_at"] = decision_payload["decided_at"]
+        self.emit("approval_decided", {"request": req, "decision": decision_payload})
+        return req
 
     def events_since(self, seq: int = 0) -> Dict[str, Any]:
         events = [e for e in self.events if e.seq > seq]
@@ -535,6 +787,15 @@ class GuiWorkspaceController:
             "universe": universe,
         })
 
+    def set_chat_scale(self, *, scale: Any, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.set_chat_scale(scale=scale, source=source)
+
+    def adjust_chat_scale(self, *, delta: Any, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.adjust_chat_scale(delta=delta, source=source)
+
+    def reset_chat_scale(self, *, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.reset_chat_scale(source=source)
+
     def create_dashboard(self, **kwargs: Any) -> Dict[str, Any]:
         return self.runtime.create_dashboard(kwargs)
 
@@ -546,6 +807,21 @@ class GuiWorkspaceController:
 
     def open_dashboard(self, *, dashboard_id: Optional[str] = None) -> Dict[str, Any]:
         return self.runtime.open_dashboard(dashboard_id=dashboard_id)
+
+    def set_dashboard_panel_zoom(self, *, panel_id: str, zoom: Any, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.set_dashboard_panel_zoom(panel_id=panel_id, zoom=zoom, source=source)
+
+    def adjust_dashboard_panel_zoom(self, *, panel_id: str, delta: Any, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.adjust_dashboard_panel_zoom(panel_id=panel_id, delta=delta, source=source)
+
+    def reset_dashboard_panel_zoom(self, *, panel_id: str, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.reset_dashboard_panel_zoom(panel_id=panel_id, source=source)
+
+    def remove_dashboard_panel(self, *, panel_id: str, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.remove_dashboard_panel(panel_id=panel_id, source=source)
+
+    def remove_dashboard(self, *, dashboard_id: Optional[str] = None, source: str = "agent") -> Dict[str, Any]:
+        return self.runtime.remove_dashboard(dashboard_id=dashboard_id, source=source)
 
     def notify(self, message: str, level: str = "info", source: str = "agent") -> Dict[str, Any]:
         payload = {"id": self.runtime._id("note"), "message": message, "level": level, "source": source, "created_at": now_ts()}
@@ -572,6 +848,15 @@ class GuiControllerClient:
     def annotate(self, **kwargs: Any) -> Dict[str, Any]:
         return self.controller.annotate(**kwargs)
 
+    def set_chat_scale(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.set_chat_scale(**kwargs)
+
+    def adjust_chat_scale(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.adjust_chat_scale(**kwargs)
+
+    def reset_chat_scale(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.reset_chat_scale(**kwargs)
+
     def create_dashboard(self, **kwargs: Any) -> Dict[str, Any]:
         return self.controller.create_dashboard(**kwargs)
 
@@ -583,6 +868,21 @@ class GuiControllerClient:
 
     def open_dashboard(self, **kwargs: Any) -> Dict[str, Any]:
         return self.controller.open_dashboard(**kwargs)
+
+    def set_panel_zoom(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.set_dashboard_panel_zoom(**kwargs)
+
+    def adjust_panel_zoom(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.adjust_dashboard_panel_zoom(**kwargs)
+
+    def reset_panel_zoom(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.reset_dashboard_panel_zoom(**kwargs)
+
+    def close_panel(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.remove_dashboard_panel(**kwargs)
+
+    def close_dashboard(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.controller.remove_dashboard(**kwargs)
 
     def notify(self, message: str, level: str = "info", source: str = "agent") -> Dict[str, Any]:
         return self.controller.notify(message=message, level=level, source=source)
@@ -625,7 +925,8 @@ class GuiControllerClient:
                 session_id=panel.get("session_id", session_id),
                 workflow=panel.get("workflow", workflow),
                 host_status=panel.get("host_status", host_status),
-                **{k: v for k, v in panel.items() if k not in {"source", "universe", "created_by", "session_id", "workflow", "host_status"}},
+                open_after_add=False,
+                **{k: v for k, v in panel.items() if k not in {"source", "universe", "created_by", "session_id", "workflow", "host_status", "open_after_add", "open", "auto_open"}},
             ))
         opened = self.controller.open_dashboard(dashboard_id=dashboard.get("id")) if open_after_create else None
         note = self.controller.notify(message=f"Agent opened dashboard: {dashboard.get('name')}", level="info", source=source) if open_after_create else None

@@ -107,7 +107,7 @@ Default provider settings:
 ```python
 Provider_params = {
     'provider_type': 'openai',
-    'host': 'https://shirty.sandia.gov',
+    'host': 'http://localhost',
     'port': None,
     'api_key_var': 'LOCAL_API_KEY',
     'api_version': 'api/v1',

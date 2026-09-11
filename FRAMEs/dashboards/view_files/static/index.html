@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>View Files Dashboard</title>
+  <style>
+    :root {
+      --bg: #111111;
+      --panel: rgba(255,255,255,0.08);
+      --text: #f6f7fb;
+      --muted: #aeb3c2;
+      --accent: #7dd3fc;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body { transition: background-color 160ms ease; }
+    #app {
+      width: 100vw;
+      height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      background: var(--bg);
+    }
+    header {
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 8px 14px;
+      background: linear-gradient(180deg, rgba(0,0,0,0.55), rgba(0,0,0,0.12));
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      z-index: 10;
+    }
+    .title {
+      font-size: 14px;
+      font-weight: 650;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .status {
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    main {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      height: 100%;
+      overflow: auto;
+      padding: 24px;
+    }
+    #stage {
+      transform-origin: center center;
+      transition: transform 120ms ease;
+      max-width: 100%;
+      max-height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .placeholder {
+      text-align: center;
+      max-width: 760px;
+      padding: 34px;
+      border-radius: 22px;
+      background: var(--panel);
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: 0 18px 60px rgba(0,0,0,0.28);
+    }
+    .placeholder h1 { margin: 0 0 10px; font-size: 28px; }
+    .placeholder p { color: var(--muted); line-height: 1.5; }
+    .placeholder code {
+      color: #e0f2fe;
+      background: rgba(125,211,252,0.12);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+    img, video {
+      max-width: 96vw;
+      max-height: calc(96vh - 58px);
+      object-fit: contain;
+      border-radius: 10px;
+      box-shadow: 0 20px 70px rgba(0,0,0,0.42);
+    }
+    audio { width: min(760px, 90vw); }
+    iframe, embed {
+      width: min(1200px, 94vw);
+      height: calc(94vh - 58px);
+      border: 0;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 20px 70px rgba(0,0,0,0.42);
+    }
+    pre {
+      width: min(1200px, 92vw);
+      max-height: calc(92vh - 58px);
+      overflow: auto;
+      margin: 0;
+      padding: 22px;
+      border-radius: 14px;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: #f8fafc;
+      font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      white-space: pre-wrap;
+    }
+    table {
+      border-collapse: collapse;
+      background: rgba(8,13,26,0.86);
+      color: #f8fafc;
+      min-width: min(800px, 90vw);
+      max-width: 94vw;
+      box-shadow: 0 20px 70px rgba(0,0,0,0.42);
+    }
+    th, td {
+      border: 1px solid rgba(255,255,255,0.14);
+      padding: 8px 11px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: rgba(125,211,252,0.16); }
+    .hidden { display: none !important; }
+    .markdown-body {
+      width: min(980px, 92vw);
+      max-height: calc(92vh - 58px);
+      overflow: auto;
+      padding: 30px 38px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.94);
+      color: #0f172a;
+      box-shadow: 0 20px 70px rgba(0,0,0,0.42);
+      line-height: 1.62;
+    }
+    .markdown-body h1, .markdown-body h2, .markdown-body h3 { line-height: 1.2; }
+    .markdown-body a { color: #0369a1; }
+    .markdown-body code { background: #e2e8f0; padding: 2px 5px; border-radius: 5px; }
+    .markdown-body pre { width: auto; max-height: none; background: #0f172a; color: #e2e8f0; white-space: pre; }
+    .markdown-body blockquote { margin: 1em 0; padding-left: 1em; border-left: 4px solid #38bdf8; color: #475569; }
+    .markdown-body table { background: white; color: #0f172a; box-shadow: none; }
+    .markdown-body th { background: #e0f2fe; }
+    .error { color: #fecaca; background: rgba(127,29,29,0.45); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="title" id="title">View Files Dashboard</div>
+      <div class="status" id="status">Waiting for payload</div>
+    </header>
+    <main id="main">
+      <div id="stage">
+        <section class="placeholder">
+          <h1>Ready to display media</h1>
+          <p>Send a file path, base64 payload, data URL, or text to <code>POST /payload</code>. Control playback with <code>/control/start</code>, <code>/control/stop</code>, and <code>/control/loop</code>.</p>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script>
+    const stage = document.getElementById('stage');
+    const titleEl = document.getElementById('title');
+    const statusEl = document.getElementById('status');
+    const appEl = document.getElementById('app');
+    let lastVersion = -1;
+    let lastPlayback = null;
+    let lastLoop = null;
+    let currentMediaEl = null;
+    let currentObjectUrl = null;
+    const textLike = new Set(['text/plain', 'application/json', 'application/xml', 'text/html']);
+    const tableLike = new Set(['text/csv', 'text/tab-separated-values']);
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    }
+    function splitCsvLine(line, delimiter) {
+      const out = [];
+      let cur = '';
+      let q = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+          if (q && line[i + 1] === '"') { cur += '"'; i++; }
+          else q = !q;
+        } else if (ch === delimiter && !q) {
+          out.push(cur); cur = '';
+        } else cur += ch;
+      }
+      out.push(cur);
+      return out;
+    }
+    async function renderTable(url, delimiter) {
+      const txt = await fetch(url).then(r => r.text());
+      const lines = txt.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(Boolean);
+      if (!lines.length) return '<pre></pre>';
+      const rows = lines.slice(0, 1000).map(line => splitCsvLine(line, delimiter));
+      const head = rows.shift() || [];
+      const thead = '<thead><tr>' + head.map(c => `<th>${escapeHtml(c)}</th>`).join('') + '</tr></thead>';
+      const tbody = '<tbody>' + rows.map(row => '<tr>' + row.map(c => `<td>${escapeHtml(c)}</td>`).join('') + '</tr>').join('') + '</tbody>';
+      return `<div style="overflow:auto;max-width:94vw;max-height:calc(92vh - 58px)"><table>${thead}${tbody}</table></div>`;
+    }
+    function cleanupObjectUrl() {
+      if (currentObjectUrl) { URL.revokeObjectURL(currentObjectUrl); currentObjectUrl = null; }
+    }
+    function markdownToHtml(markdown) {
+      // Small self-contained Markdown renderer. It escapes HTML first, then supports
+      // headings, fenced code, inline code, bold, italic, links, blockquotes, lists,
+      // horizontal rules, and paragraphs. This avoids external CDN dependencies.
+      const lines = String(markdown).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+      const html = [];
+      let inCode = false;
+      let codeLang = '';
+      let listType = null;
+      let paragraph = [];
+      function inline(src) {
+        let out = escapeHtml(src);
+        out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+        out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        out = out.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+        out = out.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+        out = out.replace(/_([^_]+)_/g, '<em>$1</em>');
+        out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+|#[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+        return out;
+      }
+      function flushParagraph() {
+        if (paragraph.length) {
+          html.push('<p>' + inline(paragraph.join(' ')) + '</p>');
+          paragraph = [];
+        }
+      }
+      function closeList() {
+        if (listType) {
+          html.push(`</${listType}>`);
+          listType = null;
+        }
+      }
+      for (const raw of lines) {
+        const line = raw;
+        const trimmed = line.trim();
+        const fence = trimmed.match(/^```\s*([^`]*)$/);
+        if (fence) {
+          if (inCode) {
+            html.push('</code></pre>');
+            inCode = false;
+            codeLang = '';
+          } else {
+            flushParagraph(); closeList();
+            codeLang = fence[1] ? ` class="language-${escapeHtml(fence[1])}"` : '';
+            html.push(`<pre><code${codeLang}>`);
+            inCode = true;
+          }
+          continue;
+        }
+        if (inCode) {
+          html.push(escapeHtml(line) + '\n');
+          continue;
+        }
+        if (!trimmed) {
+          flushParagraph(); closeList();
+          continue;
+        }
+        if (/^---+$|^\*\*\*+$|^___+$/.test(trimmed)) {
+          flushParagraph(); closeList(); html.push('<hr>'); continue;
+        }
+        const h = trimmed.match(/^(#{1,6})\s+(.+)$/);
+        if (h) {
+          flushParagraph(); closeList();
+          html.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`);
+          continue;
+        }
+        const bq = trimmed.match(/^>\s?(.+)$/);
+        if (bq) {
+          flushParagraph(); closeList(); html.push(`<blockquote>${inline(bq[1])}</blockquote>`); continue;
+        }
+        const ul = trimmed.match(/^[-*+]\s+(.+)$/);
+        if (ul) {
+          flushParagraph();
+          if (listType !== 'ul') { closeList(); html.push('<ul>'); listType = 'ul'; }
+          html.push(`<li>${inline(ul[1])}</li>`);
+          continue;
+        }
+        const ol = trimmed.match(/^\d+[.)]\s+(.+)$/);
+        if (ol) {
+          flushParagraph();
+          if (listType !== 'ol') { closeList(); html.push('<ol>'); listType = 'ol'; }
+          html.push(`<li>${inline(ol[1])}</li>`);
+          continue;
+        }
+        closeList();
+        paragraph.push(trimmed);
+      }
+      flushParagraph(); closeList();
+      if (inCode) html.push('</code></pre>');
+      return `<article class="markdown-body">${html.join('\n')}</article>`;
+    }
+    async function render(state) {
+      cleanupObjectUrl();
+      currentMediaEl = null;
+      titleEl.textContent = state.title || state.filename || 'View Files Dashboard';
+      statusEl.textContent = state.has_payload ? `${state.mime_type || 'unknown'} • ${state.playback} • loop=${state.loop} • zoom=${state.zoom}` : 'Waiting for payload';
+      appEl.style.background = state.background || '#111111';
+      document.body.style.background = state.background || '#111111';
+      stage.style.transform = `scale(${state.zoom || 1})`;
+      if (!state.has_payload || !state.media_url) {
+        stage.innerHTML = '<section class="placeholder"><h1>Dashboard cleared</h1><p>Send media to <code>POST /payload</code>.</p></section>';
+        return;
+      }
+      const mime = (state.mime_type || '').split(';')[0].toLowerCase();
+      const url = state.media_url;
+      try {
+        if (mime.startsWith('image/')) {
+          stage.innerHTML = `<img src="${url}" alt="${escapeHtml(state.title || state.filename || 'image')}" />`;
+          currentMediaEl = stage.querySelector('img');
+        } else if (mime.startsWith('video/')) {
+          stage.innerHTML = `<video src="${url}" controls playsinline ${state.loop ? 'loop' : ''}></video>`;
+          currentMediaEl = stage.querySelector('video');
+        } else if (mime.startsWith('audio/')) {
+          stage.innerHTML = `<audio src="${url}" controls ${state.loop ? 'loop' : ''}></audio>`;
+          currentMediaEl = stage.querySelector('audio');
+        } else if (mime === 'application/pdf') {
+          stage.innerHTML = `<iframe src="${url}" title="${escapeHtml(state.title || 'PDF')}"></iframe>`;
+        } else if (tableLike.has(mime) || /\.(csv|tsv)$/i.test(state.filename || '')) {
+          stage.innerHTML = await renderTable(url, mime === 'text/tab-separated-values' || /\.tsv$/i.test(state.filename || '') ? '\t' : ',');
+        } else if (mime === 'text/markdown' || /\.(md|markdown)$/i.test(state.filename || '')) {
+          const txt = await fetch(url).then(r => r.text());
+          stage.innerHTML = markdownToHtml(txt);
+        } else if (textLike.has(mime) || mime.startsWith('text/')) {
+          const txt = await fetch(url).then(r => r.text());
+          stage.innerHTML = `<pre>${escapeHtml(txt)}</pre>`;
+        } else {
+          stage.innerHTML = `<embed src="${url}" type="${escapeHtml(mime || 'application/octet-stream')}" />`;
+        }
+        applyPlayback(state);
+      } catch (err) {
+        stage.innerHTML = `<pre class="error">Render error: ${escapeHtml(err.message || err)}</pre>`;
+      }
+    }
+    function applyPlayback(state) {
+      if (!currentMediaEl || !('play' in currentMediaEl)) return;
+      currentMediaEl.loop = !!state.loop;
+      if (state.playback === 'playing') {
+        currentMediaEl.play().catch(() => {});
+      } else {
+        currentMediaEl.pause();
+      }
+    }
+    async function tick() {
+      try {
+        const state = await fetch('/api/state', {cache: 'no-store'}).then(r => r.json());
+        if (state.version !== lastVersion) {
+          lastVersion = state.version;
+          lastPlayback = state.playback;
+          lastLoop = state.loop;
+          await render(state);
+        } else if (state.playback !== lastPlayback || state.loop !== lastLoop) {
+          lastPlayback = state.playback;
+          lastLoop = state.loop;
+          applyPlayback(state);
+          statusEl.textContent = state.has_payload ? `${state.mime_type || 'unknown'} • ${state.playback} • loop=${state.loop} • zoom=${state.zoom}` : 'Waiting for payload';
+        }
+      } catch (err) {
+        statusEl.textContent = `Disconnected: ${err.message || err}`;
+      } finally {
+        setTimeout(tick, 500);
+      }
+    }
+    tick();
+  </script>
+</body>
+</html>

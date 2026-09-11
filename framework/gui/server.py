@@ -94,6 +94,18 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/gui/messages":
                 self._send_json(200, [m.__dict__ for m in self.runtime.messages])
                 return
+            if path == "/api/gui/approvals":
+                include_done = str((parse_qs(parsed.query).get("include_done") or [""])[0]).lower() in {"1", "true", "yes"}
+                self._send_json(200, {"ok": True, "requests": self.runtime.approval_requests_list(include_done=include_done)})
+                return
+            if path.startswith("/api/gui/approvals/"):
+                request_id = path.split("/")[-1]
+                req = self.runtime.get_approval_request(request_id)
+                if req is None:
+                    self._send_json(404, {"ok": False, "error": f"Approval request not found: {request_id}"})
+                else:
+                    self._send_json(200, {"ok": True, "request": req})
+                return
             if path == "/api/gui/events":
                 seq = int((parse_qs(parsed.query).get("since") or ["0"])[0] or 0)
                 self._send_json(200, self.runtime.events_since(seq))
@@ -110,6 +122,19 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"ok": False, "error": "Unauthorized control token"})
                 return
             body = self._read_json()
+            if path == "/api/gui/approvals/request":
+                req = self.runtime.create_approval_request(body)
+                self._send_json(200, {"ok": True, "request": req})
+                return
+            if path.startswith("/api/gui/approvals/") and path.endswith("/decision"):
+                request_id = path.split("/")[-2]
+                try:
+                    req = self.runtime.decide_approval_request(request_id, body)
+                except KeyError:
+                    self._send_json(404, {"ok": False, "error": f"Approval request not found: {request_id}"})
+                    return
+                self._send_json(200, {"ok": True, "request": req})
+                return
             if path == "/api/gui/workspace/open_url":
                 self._send_json(200, {"ok": True, "workspace": self.runtime.open_url(str(body.get("url") or ""))})
                 return
@@ -134,6 +159,15 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/gui/message":
                 self._send_json(200, self.runtime.add_message(str(body.get("content") or ""), body.get("visual_context") or {}))
                 return
+            if path == "/api/gui/chat_scale":
+                self._send_json(200, {"ok": True, **self.runtime.set_chat_scale(scale=body.get("scale"), source=str(body.get("source") or "user"))})
+                return
+            if path == "/api/gui/chat_scale_delta":
+                self._send_json(200, {"ok": True, **self.runtime.adjust_chat_scale(delta=body.get("delta"), source=str(body.get("source") or "user"))})
+                return
+            if path == "/api/gui/chat_scale_reset":
+                self._send_json(200, {"ok": True, **self.runtime.reset_chat_scale(source=str(body.get("source") or "user"))})
+                return
             if path == "/api/gui/dashboards/create":
                 self._send_json(200, {"ok": True, "dashboard": self.runtime.create_dashboard(body)})
                 return
@@ -146,6 +180,21 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/gui/dashboards/open":
                 self._send_json(200, {"ok": True, **self.runtime.open_dashboard(dashboard_id=body.get("dashboard_id"))})
+                return
+            if path == "/api/gui/dashboards/panel_zoom":
+                self._send_json(200, {"ok": True, **self.runtime.set_dashboard_panel_zoom(panel_id=str(body.get("panel_id") or ""), zoom=body.get("zoom"), source=str(body.get("source") or "user"))})
+                return
+            if path == "/api/gui/dashboards/panel_zoom_delta":
+                self._send_json(200, {"ok": True, **self.runtime.adjust_dashboard_panel_zoom(panel_id=str(body.get("panel_id") or ""), delta=body.get("delta"), source=str(body.get("source") or "user"))})
+                return
+            if path == "/api/gui/dashboards/panel_zoom_reset":
+                self._send_json(200, {"ok": True, **self.runtime.reset_dashboard_panel_zoom(panel_id=str(body.get("panel_id") or ""), source=str(body.get("source") or "user"))})
+                return
+            if path == "/api/gui/dashboards/remove_panel":
+                self._send_json(200, {"ok": True, **self.runtime.remove_dashboard_panel(panel_id=str(body.get("panel_id") or ""), source=str(body.get("source") or "user"))})
+                return
+            if path == "/api/gui/dashboards/remove":
+                self._send_json(200, {"ok": True, **self.runtime.remove_dashboard(dashboard_id=body.get("dashboard_id"), source=str(body.get("source") or "user"))})
                 return
             if path == "/api/gui/dashboards/publish":
                 dashboard = self.runtime.create_dashboard(body)
@@ -160,6 +209,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                         "session_id": panel.get("session_id") or body.get("session_id"),
                         "workflow": panel.get("workflow") or body.get("workflow"),
                         "host_status": panel.get("host_status") or body.get("host_status") or "unknown",
+                        "open_after_add": False,
                     }
                     panels.append(self.runtime.add_dashboard_panel(panel_data))
                 opened = self.runtime.open_dashboard(dashboard_id=dashboard.get("id")) if body.get("open", True) else None
@@ -179,6 +229,15 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 if cmd == "annotate":
                     self._send_json(200, {"ok": True, "result": ctl.annotate(**args)})
                     return
+                if cmd == "set_chat_scale":
+                    self._send_json(200, {"ok": True, "result": ctl.set_chat_scale(**args)})
+                    return
+                if cmd == "adjust_chat_scale":
+                    self._send_json(200, {"ok": True, "result": ctl.adjust_chat_scale(**args)})
+                    return
+                if cmd == "reset_chat_scale":
+                    self._send_json(200, {"ok": True, "result": ctl.reset_chat_scale(**args)})
+                    return
                 if cmd == "create_dashboard":
                     self._send_json(200, {"ok": True, "result": ctl.create_dashboard(**args)})
                     return
@@ -190,6 +249,21 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     return
                 if cmd == "open_dashboard":
                     self._send_json(200, {"ok": True, "result": ctl.open_dashboard(**args)})
+                    return
+                if cmd == "set_dashboard_panel_zoom":
+                    self._send_json(200, {"ok": True, "result": ctl.set_dashboard_panel_zoom(**args)})
+                    return
+                if cmd == "adjust_dashboard_panel_zoom":
+                    self._send_json(200, {"ok": True, "result": ctl.adjust_dashboard_panel_zoom(**args)})
+                    return
+                if cmd == "reset_dashboard_panel_zoom":
+                    self._send_json(200, {"ok": True, "result": ctl.reset_dashboard_panel_zoom(**args)})
+                    return
+                if cmd == "remove_dashboard_panel":
+                    self._send_json(200, {"ok": True, "result": ctl.remove_dashboard_panel(**args)})
+                    return
+                if cmd == "remove_dashboard":
+                    self._send_json(200, {"ok": True, "result": ctl.remove_dashboard(**args)})
                     return
                 if cmd == "notify":
                     self._send_json(200, {"ok": True, "result": ctl.notify(**args)})

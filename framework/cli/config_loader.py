@@ -50,7 +50,7 @@ def default_launch_config() -> Dict[str, Any]:
 
     return {
         "mode": "cli",
-        "workflow": "TurnBasedWorkflow",
+        "workflow": "FastTurnBasedWorkflow",
         "resume_session": None,
         "user_name": "user",
         "session": copy.deepcopy(session_params),

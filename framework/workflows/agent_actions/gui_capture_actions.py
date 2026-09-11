@@ -37,9 +37,9 @@ class GuiCaptureUrlAction(AgentAction):
 
 class GuiCaptureWorkspaceAction(AgentAction):
     action: Literal["gui_capture_workspace"] = "gui_capture_workspace"
-    description: Literal["Capture pixel screenshots for selected URL panels from the GUI workspace using the permissioned backend capture service"] = "Capture pixel screenshots for selected URL panels from the GUI workspace using the permissioned backend capture service"
+    description: Literal["Capture pixel screenshots for selected URL panels or rendered GUI workspace regions using an explicit capture_scope. Use capture_scope=annotation_regions for user boxed/selected annotations; use active_dashboard for the whole dashboard. Common aliases like dashboard are normalized, but agents should emit canonical scopes."] = "Capture pixel screenshots for selected URL panels or rendered GUI workspace regions using an explicit capture_scope. Use capture_scope=annotation_regions for user boxed/selected annotations; use active_dashboard for the whole dashboard. Common aliases like dashboard are normalized, but agents should emit canonical scopes."
     payload: GuiCaptureWorkspacePayload
-    payload_schema: str = '{"urls":["https://example.com"],"max_panels":4,"viewport":{"width":1440,"height":900,"device_scale_factor":1},"reason":"why capture is needed"}'
+    payload_schema: str = '{"capture_scope":"annotation_regions","annotation_ids":["ann_id"],"panel_ids":["panel_id"],"visual_context":{"annotation_pixel_box":{"x":0,"y":0,"width":100,"height":100}},"padding_px":24,"max_panels":1,"include_annotations":true,"viewport":{"width":1440,"height":900,"device_scale_factor":1},"reason":"capture selected annotation region"}'
 
     def execute(self, infra: Any = None) -> Dict[str, Any]:
         data = self.payload.model_dump(exclude_none=True)
@@ -67,3 +67,20 @@ class GuiCaptureWorkspaceAction(AgentAction):
         except Exception:
             pass
         return out
+
+
+# GUI capture authoring note:
+# For gui_capture_workspace capture_scope="annotation_regions", agents should pass
+# the full latest gui_get_visual_context result as visual_context whenever possible,
+# especially visual_context.annotation_targets with each target's pixel_box.
+# At minimum, pass visual_context.annotation_pixel_box or visual_context.pixel_box
+# with x/y/width/height so the backend can crop the selected annotation region.
+
+# Canonical capture_scope values for gui_capture_workspace:
+# - "annotation_regions": selected/boxed annotation crops; include annotation_ids
+#   and full visual_context.annotation_targets when possible, or at least
+#   visual_context.annotation_pixel_box / visual_context.pixel_box.
+# - "active_dashboard": whole dashboard/workspace dashboard crop. Do not emit
+#   the alias "dashboard" even though the backend normalizes it.
+# - "active_dashboard_panels" / "selected_panels" / "url_list": URL or panel
+#   source captures rather than rendered GUI crops.

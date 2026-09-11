@@ -72,6 +72,15 @@ async def capture_url_async(
             if request.extra_wait_ms:
                 await page.wait_for_timeout(int(request.extra_wait_ms))
             screenshot_kwargs: Dict[str, Any] = {"path": str(image_path), "full_page": bool(request.full_page), "type": request.format}
+            if request.clip:
+                clip = request.clip or {}
+                screenshot_kwargs["clip"] = {
+                    "x": max(0, int(clip.get("x") or 0)),
+                    "y": max(0, int(clip.get("y") or 0)),
+                    "width": max(1, int(clip.get("width") or width)),
+                    "height": max(1, int(clip.get("height") or height)),
+                }
+                screenshot_kwargs["full_page"] = False
             if request.format == "jpeg":
                 screenshot_kwargs["quality"] = int(request.quality)
             await page.screenshot(**screenshot_kwargs)
@@ -91,7 +100,7 @@ async def capture_url_async(
             height=int(dimensions.get("height") or height),
             format=request.format,
             policy=decision.as_dict(),
-            metadata={"reason": request.reason, "page": dimensions, **(request.metadata or {})},
+            metadata={"reason": request.reason, "page": dimensions, "clip": request.clip, **(request.metadata or {})},
         )
     except Exception as exc:
         status = "timeout" if exc.__class__.__name__.lower().endswith("timeouterror") else "error"

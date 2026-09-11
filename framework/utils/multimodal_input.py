@@ -213,9 +213,47 @@ class MultimodalInputProcessor:
         return parts if parts else [text]
 
     def _resolve_path(self, ref: str) -> Path:
-        p = Path(os.path.expandvars(os.path.expanduser(ref)))
+        expanded_ref = os.path.expandvars(os.path.expanduser(ref))
+        p = Path(expanded_ref)
         if not p.is_absolute() and self.config.root_dir:
             p = Path(self.config.root_dir) / p
+        if p.exists():
+            return p.resolve()
+
+        # Locality bridge: in agent sandboxes, ``~`` may expand to the agent
+        # process home while user files may be mounted under the host user's
+        # home. If direct expansion failed, try explicit host-home env vars and
+        # then existing /Users/* homes before giving up.
+        raw = ref.strip()
+        if raw.startswith("~/"):
+            tail = raw[2:]
+            candidate_homes: list[Path] = []
+            for env_name in ("WOLF_HOST_HOME", "HOST_HOME", "USER_HOME"):
+                env_value = os.environ.get(env_name)
+                if env_value:
+                    candidate_homes.append(Path(os.path.expandvars(os.path.expanduser(env_value))))
+            users_root = Path("/Users")
+            if users_root.exists():
+                try:
+                    candidate_homes.extend(
+                        child for child in users_root.iterdir()
+                        if child.is_dir() and not child.name.startswith(".")
+                    )
+                except OSError:
+                    pass
+            seen: set = set()
+            for home in candidate_homes:
+                try:
+                    key = str(home.resolve())
+                except OSError:
+                    key = str(home)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidate = home / tail
+                if candidate.exists():
+                    return candidate.resolve()
+
         return p.resolve()
 
     def _build_attachment(self, ref: str) -> InputAttachment:

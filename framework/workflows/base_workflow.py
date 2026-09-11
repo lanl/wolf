@@ -1,12 +1,13 @@
 import copy
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from pydantic import TypeAdapter
 import json
 import os
 import glob
 
-from framework.utils.io_tools import console, jsonfy, save_pickle_file, load_pickle_file
+from framework.utils.io_tools import (
+    WOLF_PATH, console, jsonfy, save_pickle_file, load_pickle_file)
 from framework.utils.json_parsing import robust_jsonfy
 from framework.utils.tokenomics import num_tokens_from_string
 # Import the updated workflow models that provide action‑subset capability
@@ -20,6 +21,8 @@ from framework.workflows.workflow_models import (
 from framework.workflows.sessions_data_models import BaseSession
 from framework.infrastructure.base_infrastructure import BaseInfrastructure
 from framework.workflows.enhanced_input import interactive_input_line_wrapped
+from framework.workflows.action_registry import get_default_action_registry
+from framework.workflows.action_validation import ActionValidationError, validate_action_response
 
 
 def normalize_payload(payload: Dict, actor: str) -> Dict:
@@ -69,16 +72,20 @@ class BaseWorkflow:
                  session: BaseSession|str|None      = None,
                  infra: BaseInfrastructure|None      = None, 
                  actions_union: Any                  = FullActions,
-                 wf_rules_file: str|None             ="config/preferences/rules/workflow/basewf.md",
-                 wf_agent_behaviour_file: str|None   ="config/preferences/behaviour/workflow/basewf.md",
-                 wf_agent_sys_prompt_file: str|None  ="config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md",
+                 wf_rules_file: str|None             = str(WOLF_PATH / "config/preferences/rules/workflow/basewf.md"),
+                 wf_agent_behaviour_file: str|None   = str(WOLF_PATH / "config/preferences/behaviour/workflow/basewf.md"),
+                 wf_agent_sys_prompt_file: str|None  = str(WOLF_PATH / "config/preferences/prompts/workflow/basewf_default_assistant_sys_prompt.md"),
                  wf_user:str                         = "user",
                  wf_turn                             = None,
                  WF_TAG                              = "BaseWorkflow",
                  WF_VERBOSE: int                     = 0
                  ):
         self.WF_TAG = WF_TAG
+        infra.WF_TAG = WF_TAG
         self.WF_VERBOSE = WF_VERBOSE
+        self.workflow_events: List[Dict[str, Any]] = []
+        self.workflow_event_listeners: List[Callable[[Dict[str, Any]], Any]] = []
+        self.max_workflow_events = int(os.environ.get("WOLF_MAX_WORKFLOW_EVENTS", "500") or 500)
         if session is None: # Starting a completely new session
             console.print(f"[+] STARTING NEW SESSION")
             self.session = BaseSession(
@@ -99,6 +106,90 @@ class BaseWorkflow:
         # Load Session
         self.load_session_state()
         print(f"[+][{self.WF_TAG}]: Session Loaded OK")
+
+    # -----------------------------------------------------------------
+    # Workflow event streaming / observability
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _redact_event_value(value: Any, key: str = "") -> Any:
+        sensitive = ("api_key", "apikey", "token", "password", "secret", "authorization")
+        if any(s in str(key).lower() for s in sensitive):
+            return "***REDACTED***" if value not in (None, "") else value
+        if isinstance(value, dict):
+            return {str(k): BaseWorkflow._redact_event_value(v, str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [BaseWorkflow._redact_event_value(v, key) for v in value]
+        if isinstance(value, tuple):
+            return [BaseWorkflow._redact_event_value(v, key) for v in value]
+        return value
+
+    def add_event_listener(self, listener: Callable[[Dict[str, Any]], Any]) -> None:
+        """Register a workflow-event listener.
+
+        Listeners receive redacted event dictionaries. The default workflow path
+        does not require listeners; this hook is intended for gateway/GUI/TUI,
+        logs, and benchmark recorders. Listener exceptions are swallowed and
+        recorded as local workflow_event_listener_error entries so event
+        streaming cannot break task execution.
+        """
+        if listener not in self.workflow_event_listeners:
+            self.workflow_event_listeners.append(listener)
+
+    def remove_event_listener(self, listener: Callable[[Dict[str, Any]], Any]) -> None:
+        try:
+            self.workflow_event_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def emit_event(self, event_type: str, status: str | None = None, **metadata: Any) -> Dict[str, Any]:
+        """Emit a workflow lifecycle event without mutating chat history.
+
+        This is intentionally separate from ``update_history``: progress events
+        should improve perceived responsiveness without polluting durable chat
+        context, forcing session snapshots, or changing LLM prompt inputs. That
+        makes workflow-event streaming cache-neutral.
+        """
+        event: Dict[str, Any] = {
+            "type": str(event_type or "workflow_event"),
+            "status": status,
+            "workflow": getattr(self, "WF_TAG", type(self).__name__),
+            "timestamp": datetime.now().isoformat(),
+        }
+        try:
+            event["session_dir"] = getattr(getattr(self, "infra", None), "session_dir", None)
+        except Exception:
+            pass
+        event.update(metadata or {})
+        event = self._redact_event_value(event)
+
+        events = getattr(self, "workflow_events", None)
+        if not isinstance(events, list):
+            events = []
+            self.workflow_events = events
+        events.append(event)
+        max_events = max(1, int(getattr(self, "max_workflow_events", 500) or 500))
+        if len(events) > max_events:
+            self.workflow_events = events[-max_events:]
+
+        for listener in list(getattr(self, "workflow_event_listeners", []) or []):
+            try:
+                listener(event)
+            except Exception as exc:
+                # Do not recursively call emit_event here; keep listener failure
+                # reporting local and side-effect-light.
+                self.workflow_events.append({
+                    "type": "workflow_event_listener_error",
+                    "status": "error",
+                    "workflow": getattr(self, "WF_TAG", type(self).__name__),
+                    "timestamp": datetime.now().isoformat(),
+                    "listener": getattr(listener, "__name__", str(listener)),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+        return event
+
+    def get_recent_workflow_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        events = list(getattr(self, "workflow_events", []) or [])
+        return events[-max(1, int(limit or 50)):]
 
     # -----------------------------------------------------------------
     # Session state management (NEW IMPLEMENTATION)
@@ -260,6 +351,7 @@ class BaseWorkflow:
             # Metadata
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'session_dir': self.infra.session_dir,
+            'workflow_events': self.get_recent_workflow_events(limit=200),
             
             # TODO: Add serializable representations of agent/workers/objects
             # For now, store minimal info to identify them
@@ -341,6 +433,10 @@ class BaseWorkflow:
         
         # Extract infrastructure components
         self.infra = infra
+        if not hasattr(self, "workflow_events"):
+            self.workflow_events = []
+        if not hasattr(self, "workflow_event_listeners"):
+            self.workflow_event_listeners = []
         self.agent = infra.agent
         self.workers = infra.workers
         self.objects = infra.objects
@@ -368,6 +464,7 @@ class BaseWorkflow:
         self.schema_to_use = self.full_schema_string
         self.agent_role_prompt = self.session.agent_role_prompt
         self.action_names_to_use = None
+        self.action_registry = get_default_action_registry()
         # Let infrastructure-level CLI commands inspect/mutate workflow state.
         try:
             self.infra.cli_workflow = self
@@ -457,17 +554,39 @@ class BaseWorkflow:
         self.save_session_state()
 
     def normalize_and_validate_agent_response(self, response, actor:str):
-        try:
-            normalized = normalize_payload(response, actor)
-        except Exception as exc:
-            console.print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to normalize agent_response:\n type(response) = {type(response)} \n response = {response}")
-            return True, f"[payload normalization error] {exc}", None, None
-        try:
-            action_obj = self.action_adapter.validate_python(normalized)
-        except Exception as exc:
-            console.print(f"[!][ERROR][normalize_and_validate_agent_response()] Unable to validate agent_response:\n type(response) = {type(response)} \n response = {response}")
-            return True, f"[Normalized payload validation error] {exc}", None, normalized
-        return False, None, action_obj, normalized
+        """Normalize and validate an agent action response using staged validation.
+
+        Compatibility return shape is preserved:
+            (bad_format, err_msg, action_obj, normalized)
+
+        The old implementation validated against ``self.action_adapter`` which is
+        usually a Pydantic discriminated union. That made runtime validation fail
+        with giant tagged-union errors. The new path validates only the selected
+        action class after envelope validation, registry lookup, and allowed-action
+        checks.
+        """
+        registry = getattr(self, "action_registry", None) or get_default_action_registry()
+        allowed_actions = getattr(self, "action_names_to_use", None)
+        validated = validate_action_response(
+            response,
+            registry=registry,
+            allowed_actions=allowed_actions,
+            actor=actor,
+        )
+        if isinstance(validated, ActionValidationError):
+            console.print(
+                "[!][ERROR][normalize_and_validate_agent_response()] "
+                f"stage={validated.stage} action={validated.action} message={validated.message}"
+            )
+            normalized = response if isinstance(response, dict) else None
+            err_msg = f"[Action validation {validated.stage}] {validated.message}"
+            try:
+                details = validated.model_dump(mode="json")
+                err_msg = f"{err_msg}: {details}"
+            except Exception:
+                pass
+            return True, err_msg, None, normalized
+        return False, None, validated.action_obj, validated.normalized
 
     def format_agent_response(self, prompt, schema, agent, max_trial=5):
         ntrial = 0

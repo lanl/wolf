@@ -11,7 +11,7 @@ import os
 
 # 1. Default Local Engine
 Provider_params = { 'provider_type': "openai",                    # the type of inference engine i.e both 'openai' and 'open ai compatible server' = 'openai'
-                  'host'           : "https://shirty.sandia.gov", # URL of the node hosting the engine
+                  'host'           : "http://localhost",          # URL of the node hosting the engine
                   'port'           : None,                        # Port on whitch it is listening i.e 8000 for vllm
                   'api_key_var'    : "LOCAL_API_KEY",             # The variable holding your API key in your .env file
                   'api_version'    : "api/v1",                    # The version of the API
@@ -258,7 +258,7 @@ def build_json_llm_config(env_vars=None):
                 redacted[key] = "***REDACTED***"
             else:
                 redacted[key] = value
-        print(f"[++] JSON VARS = {redacted}")
+        #print(f"[++] JSON VARS = {redacted}")
 
     # Precedence to LLMS_JSON_FILE 
     llm_json_file = env_vars.get("LLMS_JSON_FILE")

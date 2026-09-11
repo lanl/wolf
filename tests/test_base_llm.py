@@ -14,14 +14,14 @@ print(f"[+] Successfully retrieved class for 'openai': {OpenAIProvider}")
 # 2 Build the specialized provider from the default OpenAI compatible provider params
 ShirtyProvider = OpenAIProvider(
         name="openai",
-        host="https://shirty.sandia.gov",
+        host="http://localhost",
         port=None,
-        api_key_var="SHIRTY_API_KEY",
-        api_version = "api/v1",
+        api_key_var="LOCAL_API_KEY",
+        api_version = "v1",
         endpoints=["/v1/chat/completions"], # Example endpoints
         capabilities=["tools", "vision"]
     )
-print(f"[+] Successfully built 'Sandia/Shirty' Provider: {ShirtyProvider}")
+print(f"[+] Successfully built 'local' Provider: {ShirtyProvider}")
 
 # 3 Build the LLM from the provider
 Gemma4 = Base_LLM(ShirtyProvider, model="google/gemma-4-31B-it" )

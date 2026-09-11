@@ -5,11 +5,18 @@ import pickle
 import subprocess
 import shlex
 import json
+import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
+
+from framework.permissions import PermissionManager, PermissionRequest
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from framework.utils.io_tools import console, jsonfy, expand_dict
+from rich.errors import MarkupError
+from framework.utils.io_tools import WOLF_PATH, console, jsonfy, expand_dict
 from framework.utils.tokenomics import (
     num_tokens_from_string,
     num_tokens_chat_entry,
@@ -43,7 +50,7 @@ class BaseInfrastructure:
         traces_vector_store: Any = None,
         summaries_vector_store: Any = None,
         db_client: Any = None,
-        infra_description_file = "framework/infrastructure/config/base_infra_description.md",
+        infra_description_file = str(WOLF_PATH / "framework/infrastructure/config/base_infra_description.md"),
         input_processor: Any = None,
         input_processor_config: Any = None
     ):
@@ -61,6 +68,9 @@ class BaseInfrastructure:
             self.input_processor = MultimodalInputProcessor(config=input_processor_config)
         self.pending_user_input_bundle = None
         self.pending_agent_content = None
+        self.approval_state = {"run_syscall_approved_for_session": False, "approved_for_session": {}, "decisions": []}
+        self.permission_manager = PermissionManager(approval_state=self.approval_state)
+        self.permission_providers_extra = []
         # Store basic parameters
         self.agent = agent
         self.max_ctx_tokens = max_ctx_tokens
@@ -219,6 +229,7 @@ class BaseInfrastructure:
         self.infra_description_file = infra_description_file
         self.INFRA_DESCRIPTION = ''
         self.update_infra_description(infra_description_file)
+        self.WF_TAG = None
 
     # ------ Helper / utility methods ------
 
@@ -315,8 +326,262 @@ class BaseInfrastructure:
         if log_console:
             self.console_log(ctx)
 
+    # ------ Human approval gates for risky local actions ------
+    @staticmethod
+    def _approval_gui_base_url() -> str:
+        return str(os.environ.get("WOLF_GUI_URL") or "http://127.0.0.1:8765").strip().rstrip("/")
+
+    @staticmethod
+    def _approval_gui_headers() -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        token = os.environ.get("WOLF_GUI_CONTROL_TOKEN", "").strip()
+        if token:
+            headers["X-Wolf-Gui-Token"] = token
+        return headers
+
+    @classmethod
+    def _approval_post_json(cls, endpoint: str, payload: Dict[str, Any], timeout: float = 3.0) -> Dict[str, Any]:
+        url = f"{cls._approval_gui_base_url()}{endpoint}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload or {}).encode("utf-8"),
+            headers=cls._approval_gui_headers(),
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {"ok": True}
+
+    @classmethod
+    def _approval_get_json(cls, endpoint: str, timeout: float = 3.0) -> Dict[str, Any]:
+        url = f"{cls._approval_gui_base_url()}{endpoint}"
+        request = urllib.request.Request(url, headers=cls._approval_gui_headers(), method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {"ok": True}
+
+    def _record_approval_decision(self, decision: Dict[str, Any]) -> None:
+        manager = getattr(self, "permission_manager", None)
+        if manager is None:
+            manager = PermissionManager(approval_state=getattr(self, "approval_state", None))
+            self.permission_manager = manager
+            self.approval_state = manager.approval_state
+        manager.record_decision(decision)
+
+    def _request_syscall_approval_via_gui(self, request_data: Dict[str, Any], wait_timeout: float) -> Optional[Dict[str, Any]]:
+        try:
+            created = self._approval_post_json("/api/gui/approvals/request", request_data, timeout=3.0)
+            req = created.get("request") if isinstance(created, dict) else None
+            request_id = req.get("id") if isinstance(req, dict) else created.get("id") if isinstance(created, dict) else None
+            if not request_id:
+                return None
+            deadline = time.time() + max(1.0, float(wait_timeout))
+            while time.time() < deadline:
+                time.sleep(0.5)
+                current = self._approval_get_json(f"/api/gui/approvals/{request_id}", timeout=3.0)
+                approval = current.get("request") if isinstance(current, dict) else None
+                if not isinstance(approval, dict):
+                    continue
+                if approval.get("status") in {"approved", "denied", "timeout"}:
+                    decision = approval.get("decision") or {}
+                    approved = approval.get("status") == "approved" or bool(decision.get("approved"))
+                    result = {
+                        "approved": approved,
+                        "source": "gui",
+                        "request_id": request_id,
+                        "status": approval.get("status"),
+                        "reason": decision.get("feedback") or decision.get("reason") or approval.get("status"),
+                        "approve_for_session": bool(decision.get("approve_for_session")),
+                    }
+                    self._record_approval_decision(result)
+                    return result
+            timeout_decision = self._approval_post_json(
+                f"/api/gui/approvals/{request_id}/decision",
+                {"approved": False, "feedback": "Approval timed out", "status": "timeout"},
+                timeout=3.0,
+            )
+            approval = timeout_decision.get("request", {}) if isinstance(timeout_decision, dict) else {}
+            result = {
+                "approved": False,
+                "source": "gui",
+                "request_id": request_id,
+                "status": approval.get("status", "timeout"),
+                "reason": "Approval timed out",
+            }
+            self._record_approval_decision(result)
+            return result
+        except Exception:
+            return None
+
+    def _request_syscall_approval_via_terminal(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        if not sys.stdin or not sys.stdin.isatty():
+            return {"approved": False, "source": "terminal", "reason": "No GUI approval response and no interactive terminal available"}
+        details = {
+            "command": request_data.get("command_display"),
+            "shell": request_data.get("shell"),
+            "timeout": request_data.get("timeout"),
+            "cwd": request_data.get("cwd"),
+            "purpose": request_data.get("purpose"),
+            "expectations": request_data.get("expectations"),
+        }
+        console.print("[bold yellow]Agent requested run_syscall approval[/bold yellow]")
+        console.print(self._cli_render(details))
+        answer = input("Approve syscall? [y]es / [n]o / [s]ession approve: ").strip().lower()
+        approved = answer in {"y", "yes", "s", "session"}
+        result = {
+            "approved": approved,
+            "source": "terminal",
+            "reason": "approved by terminal" if approved else "denied by terminal",
+            "approve_for_session": answer in {"s", "session"},
+        }
+        self._record_approval_decision(result)
+        return result
+
+    def set_permission_providers(self, providers: List[Any] | None) -> None:
+        """Install transport-specific permission providers, e.g. gateway websocket."""
+        self.permission_providers_extra = list(providers or [])
+
+    def _permission_manager(self) -> PermissionManager:
+        manager = getattr(self, "permission_manager", None)
+        if manager is None:
+            manager = PermissionManager(approval_state=getattr(self, "approval_state", None))
+            self.permission_manager = manager
+            self.approval_state = manager.approval_state
+        return manager
+
+    def _request_permission_via_gui(self, request: PermissionRequest, wait_timeout: float) -> Optional[Dict[str, Any]]:
+        """Try the local GUI approval API for any permission kind.
+
+        The current GUI may not expose these endpoints in all runtimes; returning
+        None lets the permission manager try the next provider.
+        """
+        try:
+            payload = request.model_dump(mode="json")
+            created = self._approval_post_json("/api/gui/approvals/request", payload, timeout=3.0)
+            req = created.get("request") if isinstance(created, dict) else None
+            request_id = req.get("id") if isinstance(req, dict) else created.get("id") if isinstance(created, dict) else None
+            if not request_id:
+                return None
+            deadline = time.time() + max(1.0, float(wait_timeout))
+            while time.time() < deadline:
+                time.sleep(0.5)
+                current = self._approval_get_json(f"/api/gui/approvals/{request_id}", timeout=3.0)
+                approval = current.get("request") if isinstance(current, dict) else None
+                if not isinstance(approval, dict):
+                    continue
+                if approval.get("status") in {"approved", "denied", "timeout"}:
+                    decision = approval.get("decision") or {}
+                    approved = approval.get("status") == "approved" or bool(decision.get("approved"))
+                    return {
+                        "approved": approved,
+                        "source": "gui",
+                        "request_id": request.id,
+                        "kind": request.kind,
+                        "status": approval.get("status"),
+                        "reason": decision.get("feedback") or decision.get("reason") or approval.get("status"),
+                        "feedback": decision.get("feedback"),
+                        "approve_for_session": bool(decision.get("approve_for_session")),
+                        "metadata": {"gui_request_id": request_id},
+                    }
+            try:
+                self._approval_post_json(
+                    f"/api/gui/approvals/{request_id}/decision",
+                    {"approved": False, "feedback": "Approval timed out", "status": "timeout"},
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
+            return {
+                "approved": False,
+                "source": "gui",
+                "request_id": request.id,
+                "kind": request.kind,
+                "status": "timeout",
+                "reason": "Approval timed out",
+                "metadata": {"gui_request_id": request_id},
+            }
+        except Exception:
+            return None
+
+    def _request_permission_via_terminal(self, request: PermissionRequest) -> Dict[str, Any]:
+        if not sys.stdin or not sys.stdin.isatty():
+            return {
+                "approved": False,
+                "source": "terminal",
+                "request_id": request.id,
+                "kind": request.kind,
+                "status": "unavailable",
+                "reason": "No GUI approval response and no interactive terminal available",
+            }
+        console.print("[bold yellow]Agent requested permission for risky action[/bold yellow]")
+        console.print(self._cli_render(request.display_summary()))
+        answer = input("Approve? [y]es / [n]o / [s]ession approve: ").strip().lower()
+        approved = answer in {"y", "yes", "s", "session"}
+        return {
+            "approved": approved,
+            "source": "terminal",
+            "request_id": request.id,
+            "kind": request.kind,
+            "status": "approved" if approved else "denied",
+            "reason": "approved by terminal" if approved else "denied by terminal",
+            "approve_for_session": answer in {"s", "session"},
+        }
+
+    def request_permission(self, kind: str, request_data: Dict[str, Any] | None = None, wait_timeout: float | None = None) -> Dict[str, Any]:
+        """Generic human approval gate for risky agent actions."""
+        timeout = wait_timeout
+        if timeout is None:
+            try:
+                timeout = float(os.environ.get("WOLF_PERMISSION_APPROVAL_TIMEOUT") or os.environ.get("WOLF_SYSCALL_APPROVAL_TIMEOUT", "300"))
+            except Exception:
+                timeout = 300.0
+
+        enriched = {
+            **(request_data or {}),
+            "id": (request_data or {}).get("id") or f"approval_{int(time.time() * 1000)}",
+            "kind": kind,
+            "action": (request_data or {}).get("action") or kind,
+            "requested_at": time.time(),
+            "session_dir": self.session_dir,
+            "agent": getattr(self.agent, "name", "assistant"),
+            "cwd": (request_data or {}).get("cwd") or os.getcwd(),
+            "metadata": {**((request_data or {}).get("metadata") or {}), "wait_timeout": float(timeout)},
+        }
+        request = PermissionRequest.from_data(enriched, kind=kind, action=enriched.get("action"))
+
+        providers = []
+        providers.extend(list(getattr(self, "permission_providers_extra", []) or []))
+        providers.append(lambda req: self._request_permission_via_gui(req, wait_timeout=float(timeout)))
+        providers.append(self._request_permission_via_terminal)
+
+        decision = self._permission_manager().request_permission(request, providers=providers)
+        self.approval_state = self._permission_manager().approval_state
+        return decision.model_dump(mode="json")
+
+    def request_write_file_approval(self, request_data: Dict[str, Any], wait_timeout: float | None = None) -> Dict[str, Any]:
+        return self.request_permission("write_file", request_data, wait_timeout=wait_timeout)
+
+    def request_syscall_approval(self, request_data: Dict[str, Any], wait_timeout: float | None = None) -> Dict[str, Any]:
+        """Compatibility wrapper for syscall approval using the shared permission manager."""
+        return self.request_permission("run_syscall", request_data, wait_timeout=wait_timeout)
+
+    def _safe_console_print(self, text: Any) -> None:
+        """Print via Rich, falling back to literal text if markup parsing fails.
+
+        Conversation/history text may contain arbitrary bracket sequences that
+        Rich interprets as markup. A malformed or literal closing tag can raise
+        MarkupError and should not be allowed to crash the CLI.
+
+        This helper only prints the already-computed text it receives; it does
+        not build context or update display-head counters.
+        """
+        try:
+            console.print(text)
+        except MarkupError:
+            console.print(str(text), markup=False)
+
     def show_ctx(self):
-        console.print(self.CTX)
+        self._safe_console_print(self.CTX)
 
     def get_partial_ctx(self, idx0: int | None = None, idx1: int | None = None) -> str:
         i0 = 0 if idx0 is None else idx0
@@ -345,13 +610,20 @@ class BaseInfrastructure:
         #    "last_rebuild": self.last_rebuild_timestamp,
         #    "snapshots_available": len(self.context_history)
         #}
-        CTX += f"[CTX({round(ctx_diagnostics['utilization_pct'], 2)}%): {ctx_diagnostics['current_ctx_tokens']}/{ctx_diagnostics['max_ctx_tokens']} tks | Forced rebuild @{100.0*ctx_diagnostics['rebuild_threshold']}%] "
+
+        #CTX += f"[ -({self.WF_TAG})- ]>: [CTX({round(ctx_diagnostics['utilization_pct'], 2)}%): {ctx_diagnostics['current_ctx_tokens']}/{ctx_diagnostics['max_ctx_tokens']} tks | Forced rebuild @{100.0*ctx_diagnostics['rebuild_threshold']}%] "     
+        totalCTX = int(num_tokens_from_string(self.SCHEMA_STRING) + ctx_diagnostics['current_ctx_tokens'])
+        CTX_utilization = (float(totalCTX) / float(ctx_diagnostics['max_ctx_tokens'])) * 100.0
+        CTX += f"[ -({self.WF_TAG})- ]>: [CTX({round(CTX_utilization, 2)}%): {totalCTX}/{ctx_diagnostics['max_ctx_tokens']} tks | Forced rebuild @{100.0*ctx_diagnostics['rebuild_threshold']}%] "
 
         CTX += self.chat_block_divider + self.chat_block_divider[-5:]
         return CTX
 
     def show_partial_ctx(self, idx0: int | None = None, idx1: int | None = None):
-        console.print(self.get_partial_ctx(idx0, idx1))
+        # Compute the partial context exactly once. show_updated_history() owns
+        # CONSOLE_HEAD advancement after this method returns.
+        partial_ctx = self.get_partial_ctx(idx0, idx1)
+        self._safe_console_print(partial_ctx)
 
     def show_updated_history(self, console_head: int | None = None):
         head = self.CONSOLE_HEAD if console_head is None else console_head
@@ -410,6 +682,47 @@ class BaseInfrastructure:
         except Exception:
             return str(value)
 
+    def sync_agent_roster(self) -> Dict[str, Any]:
+        """Synchronize routing/member metadata with live agent objects.
+
+        Resume can restore stale WF_MEMBERS/ROLEs from a snapshot while the live
+        agent objects were rebuilt separately. The live objects are the source
+        of truth for routing; this method rebuilds member metadata so @ routing
+        and workflow state cannot diverge from ``self.agent``/``self.workers``.
+        """
+        main_name = getattr(self.agent, "name", "assistant") or "assistant"
+        normalized_workers: Dict[str, Any] = {}
+        for key, worker in list(getattr(self, "workers", {}).items()):
+            name = getattr(worker, "name", None) or str(key)
+            if name == main_name:
+                continue
+            normalized_workers[name] = worker
+        self.workers = normalized_workers
+        self.workers_names = list(normalized_workers.keys())
+        self.WF_ASSISTANTS = [main_name] + self.workers_names
+        preserved = []
+        for member in getattr(self, "WF_MEMBERS", []):
+            if member in {"system", "sys"} or member in self.WF_ASSISTANTS:
+                continue
+            if self.ROLEs.get(member) == "user" and member not in preserved:
+                preserved.append(member)
+        self.WF_MEMBERS = []
+        for member in ["system"] + self.WF_ASSISTANTS + preserved:
+            if member and member not in self.WF_MEMBERS:
+                self.WF_MEMBERS.append(member)
+        new_roles = {k: v for k, v in getattr(self, "ROLEs", {}).items() if v == "user"}
+        new_roles["system"] = "system"
+        new_roles["sys"] = "system"
+        for name in self.WF_ASSISTANTS:
+            new_roles[name] = "assistant"
+        self.ROLEs = new_roles
+        return {
+            "main_agent": main_name,
+            "worker_agents": list(self.workers_names),
+            "WF_MEMBERS": list(self.WF_MEMBERS),
+            "WF_ASSISTANTS": list(self.WF_ASSISTANTS),
+        }
+
     def _cli_all_agents(self) -> Dict[str, Any]:
         agents = {self.agent.name: self.agent}
         agents.update(self.workers)
@@ -439,6 +752,7 @@ and with '!>' to run terminal commands.
   \> show prompt system|behavior|rules|infra
   \> show actions [limit=N]
   \> show action <action_name>
+  \> show action-verbose
   \> show fast-workflow|hot-actions|action-usage|action-buffer|action-validation-errors
   \> show ctx|context|history|chat
 ----------------------------------------------------------------------------------------------------------
@@ -452,6 +766,7 @@ and with '!>' to run terminal commands.
   \> set prompt rules file=<path>
   \> set prompt infra file=<path>
   \> set fast-workflow hot_action_buffer_max=12 prompt_schema_token_budget=2500
+  \> set action verbose=0..5
   \> reload prompts
   \> reload prompt system|behavior|rules|infra
   \> actions use all|safe|write|dev|action1,action2,...
@@ -530,6 +845,43 @@ and with '!>' to run terminal commands.
         except Exception as exc:
             schema = {"error": str(exc)}
         return f"[system][ACTION {name}]\nDescription: {desc}\nSchema:\n{self._cli_render(schema)}"
+
+    def _cli_show_action_verbose(self) -> str:
+        wf = self._cli_get_workflow()
+        if wf is None:
+            return "[system][ERROR] No active workflow registered."
+        level = getattr(wf, "staged_action_verbose", getattr(wf, "action_verbose", None))
+        data = {
+            "workflow": type(wf).__name__,
+            "staged_action_verbose": level,
+            "levels": {
+                "0": "hide staged status; show streamed heavy content/errors only",
+                "1": "compact staged UX: selected action, heavy stream, completion",
+                "2": "normal stage transitions",
+                "3": "model-call details",
+                "4": "repair/debug progress",
+                "5": "very verbose diagnostics",
+            },
+        }
+        return f"[system][ACTION VERBOSE]\n{self._cli_render(data)}"
+
+    def _cli_set_action_verbose(self, level: Any) -> tuple[bool, str]:
+        wf = self._cli_get_workflow()
+        if wf is None:
+            return True, "[system][ERROR] No active workflow registered."
+        try:
+            ivalue = int(level)
+        except Exception:
+            return True, "[system][ERROR] action verbose must be an integer from 0 to 5."
+        ivalue = max(0, min(5, ivalue))
+        setattr(wf, "staged_action_verbose", ivalue)
+        setattr(wf, "action_verbose", ivalue)
+        if hasattr(wf, "save_session_state"):
+            try:
+                wf.save_session_state()
+            except Exception:
+                pass
+        return False, self._cli_show_action_verbose()
 
     def _cli_show_workflow(self) -> str:
         wf = self._cli_get_workflow()
@@ -729,6 +1081,8 @@ and with '!>' to run terminal commands.
                 return False, self._cli_show_prompt(target), False
             if target in ["actions", "action-space", "action_space"]:
                 return False, self._cli_show_actions(args[1:]), False
+            if target in ["action-verbose", "action_verbose", "action-verbosity", "action_verbosity"]:
+                return False, self._cli_show_action_verbose(), False
             if target == "action":
                 if len(args) < 2:
                     return True, "[system][ERROR] Usage: \\>show action <action_name>", False
@@ -786,6 +1140,37 @@ and with '!>' to run terminal commands.
                     return False, f"[system][PROMPT UPDATED] {which} file={file_path}", False
                 except Exception as exc:
                     return True, f"[system][ERROR] Failed to update prompt: {exc}", False
+            if target in ["action-verbose", "action_verbose", "action-verbosity", "action_verbosity"] or target.startswith("action-verbose=") or target.startswith("action_verbose="):
+                try:
+                    if "=" in target:
+                        level = target.split("=", 1)[1]
+                    elif args:
+                        level = args[1] if len(args) > 1 else None
+                    else:
+                        level = None
+                    if level is None:
+                        return True, r"[system][ERROR] Usage: \>set action-verbose 0..5 OR \>set action-verbose=0..5", False
+                    err, msg = self._cli_set_action_verbose(level)
+                    return err, msg, False
+                except Exception as exc:
+                    return True, f"[system][ERROR] Failed to set action verbosity: {exc}", False
+            if target in ["action", "actions"]:
+                if len(args) < 2:
+                    return True, r"[system][ERROR] Usage: \>set action verbose=0..5 OR \>set action verbose 0..5", False
+                try:
+                    if args[1].startswith("verbose="):
+                        level = args[1].split("=", 1)[1]
+                    elif args[1] in ["verbose", "verbosity"] and len(args) >= 3:
+                        level = args[2]
+                    else:
+                        updates = self._cli_parse_kv_pairs(args[1:])
+                        level = updates.get("verbose", updates.get("verbosity"))
+                    if level is None:
+                        return True, r"[system][ERROR] Usage: \>set action verbose=0..5", False
+                    err, msg = self._cli_set_action_verbose(level)
+                    return err, msg, False
+                except Exception as exc:
+                    return True, f"[system][ERROR] Failed to set action verbosity: {exc}", False
             if target in ["fast-workflow", "fast_workflow", "fast"]:
                 if wf is None:
                     return True, "[system][ERROR] No active workflow registered.", False
@@ -1002,6 +1387,7 @@ and with '!>' to run terminal commands.
             # Metadata
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "infra_description_file": self.infra_description_file,
+            "approval_state": self.approval_state,
         }
         return snapshot_data
 
@@ -1050,10 +1436,16 @@ and with '!>' to run terminal commands.
         if "NON_SYS_ROLES" in snapshot_data:
             self.NON_SYS_ROLES = snapshot_data["NON_SYS_ROLES"]
         
+        if "approval_state" in snapshot_data and isinstance(snapshot_data.get("approval_state"), dict):
+            self.approval_state = snapshot_data["approval_state"]
+            self.permission_manager = PermissionManager(approval_state=self.approval_state)
+
         # Restore metadata
         if "infra_description_file" in snapshot_data:
             self.infra_description_file = snapshot_data["infra_description_file"]
             self.update_infra_description()
+
+        self.sync_agent_roster()
         
         console.print("[INFRASTRUCTURE] State restored from snapshot")
 

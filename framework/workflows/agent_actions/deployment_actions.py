@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import json
@@ -8,7 +9,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import Literal, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 import copy
 
 from framework.workflows.base_agent_action import AgentAction
@@ -18,6 +19,9 @@ from framework.universes.data_models import BaseUniverseModel, BaseUniverseParam
 #from framework.tooling.toolbox import ToolBox
 from framework.universes.base_universe import run_app
 from framework.universes.remote_deployment import RemoteDeploymentManager, RemoteUniverseHandle
+from framework.universes.status_files import apply_status_to_infra, endpoint_from_status, read_status_file
+from framework.universes.deployment_backends.models import UniverseRuntimeSpec, UniverseHandle
+from framework.universes.deployment_backends.registry import get_universe_backend, list_universe_backends
 
 #
 # BaseUniver
@@ -27,6 +31,8 @@ from framework.universes.remote_deployment import RemoteDeploymentManager, Remot
 # Create Universe Action
 # ---------------------------
 class CreateUniverseArgs(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"system": "local", "name": "example_universe", "univ_params": {"kbs": {}, "tbs": {}, "info": {"name": "example_universe", "host": "127.0.0.1", "port": 0, "description": ""}}}]})
+
     system: str = Field(description="System where the universe will be created, e.g., 'local'")
     name: str = Field(description="Name for the new universe")
     #info: dict = Field(
@@ -34,6 +40,8 @@ class CreateUniverseArgs(BaseModel):
     #    description="Optional BaseUniverseModel fields (host, port, name, etc.)",
     #)
     univ_params: BaseUniverseParams = Field(description=f"Parameters of the universe, {BaseUniverseParams.model_fields}")
+    backend: str | None = Field(default=None, description="Deployment backend name; defaults to local_process for local hosts and ssh_process for remote hosts")
+    backend_config: Dict[str, Any] = Field(default_factory=dict, description="Optional backend-specific deployment configuration")
 
 class CreateUniverseAction(AgentAction):
     """Create, configure and launch a new universe in a separate process, then register it.
@@ -123,221 +131,135 @@ class CreateUniverseAction(AgentAction):
                 log_console=True,
             )
             return
+
+        if hasattr(infra, "request_permission"):
+            requested_backend = self.payload.backend or ("ssh_process" if info_instance.is_remote() else "local_process")
+            if requested_backend == "remote":
+                requested_backend = "ssh_process"
+            deployment_type = "remote" if requested_backend == "ssh_process" else ("local" if requested_backend == "local_process" else requested_backend)
+            backend_risk = "starts a Podman container" if requested_backend == "podman" else ("starts a Docker container" if requested_backend == "docker" else ("creates Kubernetes workload resources" if requested_backend == "kubernetes" else ("starts a detached terminal multiplexer session" if requested_backend in {"screen", "tmux"} else ("starts a Ray actor runtime" if requested_backend == "ray" else ("submits a Slurm batch job" if requested_backend == "slurm" else ("starts a local sandbox runtime" if requested_backend in {"sandbox_bubblewrap", "sandbox_nsjail"} else ("starts a VM or microVM runtime" if requested_backend in {"vm_qemu", "microvm_firecracker"} else ("launches a local subprocess" if deployment_type == "local" else "starts a remote process over SSH"))))))))
+            approval_request = {
+                "action": self.action,
+                "payload": self.payload.model_dump(mode="json"),
+                "payload_summary": f"Create {deployment_type} universe '{self.payload.name}'",
+                "operation": "create_universe",
+                "target_path": self.payload.name,
+                "cwd": os.getcwd(),
+                "purpose": self.purpose,
+                "expectations": self.expectations,
+                "risk_hints": [
+                    "starts a new universe/actionbox runtime",
+                    backend_risk,
+                    deployment_type,
+                    f"backend={requested_backend}",
+                ],
+                "metadata": {
+                    "universe": self.payload.name,
+                    "deployment_type": deployment_type,
+                    "backend": requested_backend,
+                    "host": getattr(info_instance, "host", None),
+                    "port": getattr(info_instance, "port", None),
+                },
+            }
+            approval = infra.request_permission("create_universe", approval_request)
+            if not approval.get("approved", False):
+                result = {
+                    "ok": False,
+                    "approved": False,
+                    "action": self.action,
+                    "universe": self.payload.name,
+                    "error": approval.get("reason") or "create_universe was denied by user approval policy",
+                    "approval": approval,
+                }
+                infra.append_chat_history(
+                    actor="system",
+                    content=f"[CreateUniverseAction][denied]: {result}",
+                    action={"action": "create_universe"},
+                    log_console=True,
+                )
+                return result
         
         infra.UNIVs[self.payload.name] = params
 
         # Check if remote deployment
-        if info_instance.is_remote():
-            self._execute_remote_deployment(infra, params, deployments)
-        else:
-            self._execute_local_deployment(infra, params, deployments)
+        backend_name = self.payload.backend or ("ssh_process" if info_instance.is_remote() else "local_process")
+        if backend_name == "remote":
+            backend_name = "ssh_process"
+        self._execute_backend_deployment(infra, params, deployments, backend_name=backend_name)
 
-    def _execute_local_deployment(self, infra, params: BaseUniverseParams, deployments: Dict[str, Dict[str, Any]]) -> None:
-        """Execute local universe deployment."""
-        runtime_dir = Path(tempfile.gettempdir()) / "wolf_universes"
-        runtime_dir.mkdir(parents=True, exist_ok=True)
+    def _execute_backend_deployment(self, infra, params: BaseUniverseParams, deployments: Dict[str, Dict[str, Any]], backend_name: str = "local_process") -> None:
+        """Execute Universe deployment through a registered backend.
 
-        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in self.payload.name)
+        Phase 2 keeps the legacy managed_deployments entry shape while moving
+        local subprocess launch/status behavior into LocalProcessUniverseBackend.
+        """
+        try:
+            backend = get_universe_backend(backend_name)
+        except Exception as e:
+            infra.append_chat_history(
+                actor="system",
+                content=f"Failed to resolve universe backend '{backend_name}' for '{self.payload.name}': {e}",
+                action={"action": "create_universe"},
+                log_console=True,
+            )
+            return
 
-        params_file = runtime_dir / f"{safe_name}_{timestamp}.params.json"
-        status_file = runtime_dir / f"{safe_name}_{timestamp}.status.json"
-        stdout_file = runtime_dir / f"{safe_name}_{timestamp}.stdout.log"
-        stderr_file = runtime_dir / f"{safe_name}_{timestamp}.stderr.log"
-
+        startup_timeout = float(os.environ.get("WOLF_UNIVERSE_STARTUP_TIMEOUT", "60") or 60)
+        if isinstance(getattr(self.payload, "backend_config", None), dict):
+            startup_timeout = float(self.payload.backend_config.get("startup_timeout_s", startup_timeout) or startup_timeout)
+        spec = UniverseRuntimeSpec(
+            name=self.payload.name,
+            params=params,
+            system=self.payload.system,
+            cors=["*"],
+            startup_timeout_s=startup_timeout,
+            metadata={"purpose": self.purpose, "expectations": self.expectations},
+        )
         serializable = params.model_dump(mode="json") if hasattr(params, "model_dump") else params.dict()
 
-        with params_file.open("w", encoding="utf-8") as f:
-            json.dump(serializable, f, indent=2)
-
-        stdout_handle = stdout_file.open("a", encoding="utf-8")
-        stderr_handle = stderr_file.open("a", encoding="utf-8")
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "framework.universes.run_universe",
-            "--params-file",
-            str(params_file),
-            "--status-file",
-            str(status_file),
-            "--cors",
-            "*",
-        ]
-
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                text=True,
-            )
+            handle = backend.launch(spec, config=getattr(self.payload, "backend_config", {}) or {})
         except Exception as e:
-            stdout_handle.close()
-            stderr_handle.close()
             infra.append_chat_history(
                 actor="system",
-                content=f"Failed to launch universe '{self.payload.name}': {e}",
+                content=f"Failed to launch universe '{self.payload.name}' via backend '{backend_name}': {e}",
                 action={"action": "create_universe"},
                 log_console=True,
             )
             return
 
-        # Wait for process to start and poll status file for ready state
-        time.sleep(1.0)
-        return_code = proc.poll()
+        if handle.endpoint and handle.endpoint.usable:
+            infra.UNIVs[self.payload.name].info.host = handle.endpoint.host
+            infra.UNIVs[self.payload.name].info.port = handle.endpoint.port
 
-        if return_code is not None:
-            # Process failed immediately
-            stdout_handle.close()
-            stderr_handle.close()
-            infra.append_chat_history(
-                actor="system",
-                content=(
-                    f"Universe '{self.payload.name}' failed to launch "
-                    f"(PID {proc.pid}, return code {return_code}). "
-                    f"See stderr log: {stderr_file}"
-                ),
-                action={"action": "create_universe"},
-                log_console=True,
-            )
-            return
+        entry = handle.legacy_entry(serializable)
+        deployments[self.payload.name] = entry
+        if entry.get("status_file"):
+            status_data = read_status_file(entry.get("status_file"))
+            apply_status_to_infra(infra, self.payload.name, status_data)
 
-        # Poll status file for ready state with timeout
-        max_wait = 30.0  # 30 seconds timeout
-        poll_interval = 0.5
-        elapsed = 0.0
-        status_data = None
-
-        while elapsed < max_wait:
-            if proc.poll() is not None:
-                # Process died
-                break
-            
-            if status_file.exists():
-                try:
-                    with status_file.open("r", encoding="utf-8") as f:
-                        status_data = json.load(f)
-                    
-                    if status_data.get("status") == "ready":
-                        # Universe is ready
-                        break
-                except (json.JSONDecodeError, IOError):
-                    # File not ready yet, continue polling
-                    pass
-            
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-
-        # Check final state
-        return_code = proc.poll()
-        
-        if return_code is not None:
-            # Process failed during startup
-            stdout_handle.close()
-            stderr_handle.close()
-            infra.append_chat_history(
-                actor="system",
-                content=(
-                    f"Universe '{self.payload.name}' failed during startup "
-                    f"(PID {proc.pid}, return code {return_code}). "
-                    f"See stderr log: {stderr_file}"
-                ),
-                action={"action": "create_universe"},
-                log_console=True,
-            )
-            return
-
-        # Extract port and URL from status file
-        actual_host = None
-        actual_port = None
-        actual_url = None
-        
-        if status_data and status_data.get("status") == "ready":
-            actual_host = status_data.get("host")
-            actual_port = status_data.get("port")
-            actual_url = status_data.get("url")
-
-        # **FIX: Update infra.UNIVs with actual port information**
-        if actual_port is not None:
-            infra.UNIVs[self.payload.name].info.port = actual_port
-        if actual_host is not None:
-            infra.UNIVs[self.payload.name].info.host = actual_host
-
-        # **VERIFICATION STEP: Confirm the update was successful**
-        verification_attempts = 0
-        max_verification_attempts = 3
-        verification_successful = False
-
-        while verification_attempts < max_verification_attempts:
-            stored_port = infra.UNIVs[self.payload.name].info.port
-            stored_host = infra.UNIVs[self.payload.name].info.host
-
-            if stored_port == actual_port and stored_host == actual_host:
-                verification_successful = True
-                break
-
-            # If verification failed, wait a bit and try updating again
-            time.sleep(0.1)
-            if actual_port is not None:
-                infra.UNIVs[self.payload.name].info.port = actual_port
-            if actual_host is not None:
-                infra.UNIVs[self.payload.name].info.host = actual_host
-
-            verification_attempts += 1
-
-        if not verification_successful:
-            infra.append_chat_history(
-                actor="system",
-                content=(
-                    f"WARNING: Universe '{self.payload.name}' launched but port update verification failed. "
-                    f"Expected port: {actual_port}, Stored port: {infra.UNIVs[self.payload.name].info.port}. "
-                    f"Universe may not be accessible via universe_info/universe_health actions."
-                ),
-                action={"action": "create_universe"},
-                log_console=True,
-            )
-
-        meta_data = {
-            "type": "universe",
-            "system": self.payload.system,
-            "status": "running",
-            "created_at": datetime.utcnow().isoformat(),
-            "subprocess_pid": proc.pid,
-            "deployment_type": "local",
-        }
-
-        if actual_host:
-            meta_data["host"] = actual_host
-        if actual_port is not None:
-            meta_data["port"] = actual_port
-        if actual_url:
-            meta_data["url"] = actual_url
-
-        deployments[self.payload.name] = {
-            "handle": proc,
-            "params": serializable,
-            "params_file": str(params_file),
-            "status_file": str(status_file),
-            "stdout_file": str(stdout_file),
-            "stderr_file": str(stderr_file),
-            "meta_data": meta_data,
-        }
-
-        # Build informative message
-        if actual_port is not None:
+        stored_port = getattr(infra.UNIVs[self.payload.name].info, "port", 0)
+        verification_successful = bool(handle.endpoint and handle.endpoint.usable and int(stored_port or 0) == int(handle.endpoint.port))
+        if handle.state == "failed":
             msg = (
-                f"Universe '{self.payload.name}' launched and registered successfully.\n"
-                f"PID: {proc.pid}\n"
-                f"Host: {actual_host or 'unknown'}\n"
-                f"Port: {actual_port}\n"
-                f"URL: {actual_url or 'unknown'}\n"
+                f"Universe '{self.payload.name}' failed to launch via backend '{backend_name}'.\n"
+                f"PID: {getattr(handle.process, 'pid', None)}\n"
+                f"stderr log: {handle.files.get('stderr_file')}"
+            )
+        elif handle.endpoint and handle.endpoint.usable:
+            msg = (
+                f"Universe '{self.payload.name}' launched and registered successfully via backend '{backend_name}'.\n"
+                f"PID: {getattr(handle.process, 'pid', None)}\n"
+                f"Host: {handle.endpoint.host}\n"
+                f"Port: {handle.endpoint.port}\n"
+                f"URL: {handle.endpoint.url}\n"
                 f"Verification: {'successful' if verification_successful else 'FAILED'}"
             )
         else:
             msg = (
-                f"Universe '{self.payload.name}' launched (PID {proc.pid}) but port information not yet available. "
-                f"Status file: {status_file}"
+                f"Universe '{self.payload.name}' launched via backend '{backend_name}' "
+                f"(PID {getattr(handle.process, 'pid', None)}) but port information is not yet available. "
+                f"Status file: {handle.files.get('status_file')}"
             )
 
         infra.append_chat_history(
@@ -347,88 +269,13 @@ class CreateUniverseAction(AgentAction):
             log_console=True,
         )
 
+    def _execute_local_deployment(self, infra, params: BaseUniverseParams, deployments: Dict[str, Dict[str, Any]]) -> None:
+        """Backward-compatible wrapper for the extracted local process backend."""
+        return self._execute_backend_deployment(infra, params, deployments, backend_name="local_process")
+
     def _execute_remote_deployment(self, infra, params: BaseUniverseParams, deployments: Dict[str, Dict[str, Any]]) -> None:
-        """Execute remote universe deployment via SSH."""
-        try:
-            ssh_config = params.info.ssh_config
-            cors = "*"
-            
-            # Deploy remote universe
-            handle = RemoteDeploymentManager.deploy_universe_remote(
-                params=params,
-                ssh_config=ssh_config,
-                cors=cors
-            )
-            
-            # **FIX: Update infra.UNIVs with actual port information for remote deployment**
-            if handle.actual_port is not None:
-                infra.UNIVs[self.payload.name].info.port = handle.actual_port
-            
-            # **VERIFICATION STEP for remote deployment**
-            verification_attempts = 0
-            max_verification_attempts = 3
-            verification_successful = False
-
-            while verification_attempts < max_verification_attempts:
-                stored_port = infra.UNIVs[self.payload.name].info.port
-
-                if stored_port == handle.actual_port:
-                    verification_successful = True
-                    break
-
-                time.sleep(0.1)
-                if handle.actual_port is not None:
-                    infra.UNIVs[self.payload.name].info.port = handle.actual_port
-
-                verification_attempts += 1
-
-            serializable = params.model_dump(mode="json") if hasattr(params, "model_dump") else params.dict()
-
-            meta_data = {
-                "type": "universe",
-                "system": self.payload.system,
-                "status": "running",
-                "created_at": datetime.utcnow().isoformat(),
-                "subprocess_pid": handle.remote_pid,
-                "deployment_type": "remote",
-                "remote_host": handle.remote_host,
-                "remote_user": handle.remote_user,
-                "remote_work_dir": handle.remote_work_dir,
-                "actual_port": handle.actual_port,
-            }
-
-            deployments[self.payload.name] = {
-                "handle": handle,
-                "params": serializable,
-                "params_file": handle.remote_params_file,
-                "status_file": handle.remote_status_file,
-                "stdout_file": handle.local_stdout_file,
-                "stderr_file": handle.local_stderr_file,
-                "meta_data": meta_data,
-            }
-
-            msg = (
-                f"Universe '{self.payload.name}' remotely deployed to "
-                f"{handle.remote_user}@{handle.remote_host} "
-                f"(Remote PID {handle.remote_pid}, Port {handle.actual_port}) "
-                f"and registered.\n"
-                f"Verification: {'successful' if verification_successful else 'FAILED'}"
-            )
-
-            infra.append_chat_history(
-                actor="system",
-                content=msg,
-                action={"action": "create_universe"},
-                log_console=True,
-            )
-
-        except Exception as e:
-            infra.append_chat_history(
-                actor="system",
-                content=f"Failed to deploy remote universe '{self.payload.name}': {e}",
-                action={"action": "create_universe"},
-                log_console=True,
-            )
+        """Backward-compatible wrapper for the extracted SSH process backend."""
+        return self._execute_backend_deployment(infra, params, deployments, backend_name="ssh_process")
 
 
 # ---------------------------
@@ -464,6 +311,11 @@ class ListDeploymentsAction(AgentAction):
                 deployment_type = meta.get("deployment_type", "unknown")
                 extra = [f"deployment_type={deployment_type}"]
 
+                backend_handle = info.get("backend_handle")
+                if isinstance(backend_handle, UniverseHandle):
+                    extra.append(f"backend={backend_handle.backend}")
+                    if backend_handle.endpoint and backend_handle.endpoint.usable:
+                        extra.append(f"url={backend_handle.endpoint.url}")
                 handle = info.get("handle")
                 
                 # Handle local subprocess
@@ -572,8 +424,60 @@ class TerminateDeploymentAction(AgentAction):
         deployment_type = meta.get("deployment_type", "unknown")
         messages = []
 
+        if hasattr(infra, "request_permission"):
+            approval_request = {
+                "action": self.action,
+                "payload": self.payload.model_dump(mode="json"),
+                "payload_summary": f"Terminate deployment '{name}' (force={self.payload.force}, remove_files={self.payload.remove_files})",
+                "operation": "terminate_deployment",
+                "target_path": name,
+                "cwd": os.getcwd(),
+                "purpose": self.purpose,
+                "expectations": self.expectations,
+                "risk_hints": [
+                    "terminates a managed deployment",
+                    "may kill a local or remote process",
+                    "may remove deployment files" if self.payload.remove_files else "keeps deployment files",
+                    "force kill requested" if self.payload.force else "graceful termination requested",
+                ],
+                "metadata": {
+                    "deployment": name,
+                    "deployment_type": deployment_type,
+                    "meta_data": meta,
+                },
+            }
+            approval = infra.request_permission("terminate_deployment", approval_request)
+            if not approval.get("approved", False):
+                result = {
+                    "ok": False,
+                    "approved": False,
+                    "action": self.action,
+                    "deployment": name,
+                    "error": approval.get("reason") or "terminate_deployment was denied by user approval policy",
+                    "approval": approval,
+                }
+                infra.append_chat_history(
+                    actor="system",
+                    content=f"[TerminateDeploymentAction][denied]: {result}",
+                    action={"action": "terminate_deployment"},
+                    log_console=True,
+                )
+                return result
+
+        backend_handle = entry.get("backend_handle")
+        if isinstance(backend_handle, UniverseHandle):
+            try:
+                backend = get_universe_backend(backend_handle.backend)
+                status = backend.terminate(backend_handle, force=self.payload.force, timeout=10.0)
+                meta["status"] = status.state
+                messages.append(
+                    f"Backend '{backend_handle.backend}' deployment '{name}' terminated (force={self.payload.force})."
+                )
+            except Exception as e:
+                messages.append(f"Error terminating backend deployment for '{name}': {e}")
+
         # Handle local subprocess
-        if isinstance(handle, subprocess.Popen):
+        elif isinstance(handle, subprocess.Popen):
             try:
                 if handle.poll() is None:
                     if self.payload.force:
@@ -616,6 +520,15 @@ class TerminateDeploymentAction(AgentAction):
                 )
             except Exception as e:
                 messages.append(f"Error terminating remote universe '{name}': {e}")
+
+        if self.payload.remove_files and isinstance(entry.get("backend_handle"), UniverseHandle):
+            try:
+                cleanup_backend = get_universe_backend(entry["backend_handle"].backend)
+                removed_keys = cleanup_backend.cleanup(entry["backend_handle"])
+                if removed_keys:
+                    messages.append(f"Backend cleanup removed files: {removed_keys}")
+            except Exception as e:
+                messages.append(f"Backend cleanup failed for '{name}': {e}")
 
         if self.payload.remove_files:
             for key in ("params_file", "status_file", "stdout_file", "stderr_file"):

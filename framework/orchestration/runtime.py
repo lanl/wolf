@@ -108,6 +108,7 @@ class AsyncWorkflowRuntime:
                 )
                 logger.info(f"WebSocketServer initialized on {websocket_host}:{websocket_port}")
         
+        self.external_task_executor = None
         self._started = False
 
     async def start(self) -> None:
@@ -143,6 +144,7 @@ class AsyncWorkflowRuntime:
             await self.streaming.stop()
             logger.info("StreamingInterface stopped")
         
+        self.external_task_executor = None
         self._started = False
         logger.info("AsyncWorkflowRuntime stopped")
 
@@ -260,14 +262,108 @@ class AsyncWorkflowRuntime:
         task = await self.repository.get(task_id)
         if task is None:
             raise KeyError(task_id)
-        task.status = TaskStatus.READY
+        task.status = TaskStatus.READY if self.graph.dependencies_satisfied(task.id) else TaskStatus.PENDING
         task.error = None
+        task.result = None
+        task.finished_at = None
+        task.leased_agent_name = None
+        task.waiting_on = []
+        task.waiting_policy = None
         await self._append_thread_entry(task_id, 'system', f'user retried task: {reason}')
         task.retries += 1
         task.touch()
         await self.repository.put(task)
-        await self.event_bus.publish(Event(type='task_retried', task_id=task_id, actor='user', payload={'reason': reason, 'retries': task.retries}))
-        await self.event_bus.publish(Event(type='task_ready', task_id=task_id, actor='runtime', payload={'reason': 'manual_retry'}))
+        await self.event_bus.publish(Event(type='task_retried', task_id=task_id, actor='user', payload={'reason': reason, 'retries': task.retries, 'status': task.status.value}))
+        if task.status == TaskStatus.READY:
+            await self.event_bus.publish(Event(type='task_ready', task_id=task_id, actor='runtime', payload={'reason': 'manual_retry'}))
+        else:
+            await self.event_bus.publish(Event(type='task_pending', task_id=task_id, actor='runtime', payload={'reason': 'manual_retry_dependencies'}))
+
+    def subtree_task_ids(self, task_id: str, *, include_root: bool = True) -> List[str]:
+        if task_id not in self.graph.tasks:
+            raise KeyError(task_id)
+        out: List[str] = []
+        def _walk(current_id: str) -> None:
+            if current_id != task_id or include_root:
+                out.append(current_id)
+            for child_id in self.graph.children.get(current_id, []):
+                _walk(child_id)
+        _walk(task_id)
+        return out
+
+    async def cancel_subtree(self, task_id: str, reason: str = 'cancelled subtree by user', *, include_root: bool = True) -> Dict[str, Any]:
+        ids = self.subtree_task_ids(task_id, include_root=include_root)
+        cancelled: List[str] = []
+        skipped: Dict[str, str] = {}
+        terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        # Cancel descendants before parents so waiting parents do not briefly
+        # resume from child updates while the subtree operation is in progress.
+        for current_id in reversed(ids):
+            task = await self.repository.get(current_id)
+            if task is None:
+                skipped[current_id] = 'missing'
+                continue
+            if task.status in terminal:
+                skipped[current_id] = task.status.value
+                continue
+            await self._append_thread_entry(current_id, 'system', f'user cancelled subtree task: {reason}')
+            task.status = TaskStatus.CANCELLED
+            task.error = reason
+            task.finished_at = task.finished_at or time.time()
+            task.touch()
+            await self.repository.put(task)
+            cancelled.append(current_id)
+            await self.event_bus.publish(Event(type='task_cancelled', task_id=current_id, actor='user', payload={'reason': reason, 'subtree_root_id': task_id, 'subtree': True}))
+        await self.event_bus.publish(Event(type='subtree_cancelled', task_id=task_id, actor='user', payload={'reason': reason, 'task_ids': cancelled, 'skipped': skipped, 'include_root': include_root}))
+        return {'status': 'subtree_cancelled', 'task_id': task_id, 'task_ids': cancelled, 'skipped': skipped, 'include_root': include_root}
+
+    async def retry_subtree(self, task_id: str, reason: str = 'retried subtree by user', *, include_root: bool = True, include_completed: bool = False) -> Dict[str, Any]:
+        ids = self.subtree_task_ids(task_id, include_root=include_root)
+        retried: List[str] = []
+        skipped: Dict[str, str] = {}
+        for current_id in ids:
+            task = await self.repository.get(current_id)
+            if task is None:
+                skipped[current_id] = 'missing'
+                continue
+            if task.status == TaskStatus.RUNNING:
+                skipped[current_id] = 'running'
+                continue
+            if task.status == TaskStatus.COMPLETED and not include_completed:
+                skipped[current_id] = 'completed'
+                continue
+            task.status = TaskStatus.READY if self.graph.dependencies_satisfied(task.id) else TaskStatus.PENDING
+            task.error = None
+            task.result = None
+            task.finished_at = None
+            task.leased_agent_name = None
+            task.waiting_on = []
+            task.waiting_policy = None
+            task.retries += 1
+            await self._append_thread_entry(current_id, 'system', f'user retried subtree task: {reason}')
+            task.touch()
+            await self.repository.put(task)
+            retried.append(current_id)
+            await self.event_bus.publish(Event(type='task_retried', task_id=current_id, actor='user', payload={'reason': reason, 'retries': task.retries, 'subtree_root_id': task_id, 'subtree': True, 'status': task.status.value}))
+            if task.status == TaskStatus.READY:
+                await self.event_bus.publish(Event(type='task_ready', task_id=current_id, actor='runtime', payload={'reason': 'manual_subtree_retry'}))
+            else:
+                await self.event_bus.publish(Event(type='task_pending', task_id=current_id, actor='runtime', payload={'reason': 'manual_subtree_retry_dependencies'}))
+        await self.event_bus.publish(Event(type='subtree_retried', task_id=task_id, actor='user', payload={'reason': reason, 'task_ids': retried, 'skipped': skipped, 'include_root': include_root, 'include_completed': include_completed}))
+        return {'status': 'subtree_retried', 'task_id': task_id, 'task_ids': retried, 'skipped': skipped, 'include_root': include_root, 'include_completed': include_completed}
+
+    async def request_replan(self, task_id: str, reason: str = 'replan requested by user', prompt: Optional[str] = None) -> Dict[str, Any]:
+        task = await self.repository.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        content = prompt or (
+            f'Replan requested for task {task_id}. Reason: {reason}. '
+            'Reassess current child summaries, failures, blockers, and remaining objective. '
+            'Choose whether to create new child tasks, retry failed work, cancel obsolete work, ask the user, or complete with caveats.'
+        )
+        await self.inject_user_message(task_id, content, role='gateway_replan', wake=True)
+        await self.event_bus.publish(Event(type='replan_requested', task_id=task_id, actor='user', payload={'reason': reason, 'content': str(content)[:500]}))
+        return {'status': 'replan_requested', 'task_id': task_id, 'reason': reason}
 
     async def _register_task(self, task: TaskNode) -> None:
         if await self.repository.count() >= self.config.budgets.max_total_tasks:
@@ -347,6 +443,13 @@ class AsyncWorkflowRuntime:
             await self.event_bus.publish(Event(type='agent_released', task_id=task_id, actor=lease.agent_name, payload={}))
 
     async def _execute_task(self, task_id: str, lease: AgentLease) -> None:
+        if self.external_task_executor is not None:
+            task = await self.repository.get(task_id)
+            content = (task.spec.inputs or {}).get('content') if task is not None else ''
+            sender = (task.spec.inputs or {}).get('sender') if task is not None else 'user'
+            visual_context = (task.spec.inputs or {}).get('visual_context') if task is not None else None
+            await self.external_task_executor(task_id=task_id, content=content or (task.spec.objective if task is not None else ''), sender=sender or 'user', visual_context=visual_context, lease=lease)
+            return
         task = await self.repository.get(task_id)
         assert task is not None
         agent = await self.agent_pool.get(lease.agent_name)
@@ -363,11 +466,7 @@ class AsyncWorkflowRuntime:
             action = self._coerce_action(payload)
             await self._apply_action(task, action, infra, policy)
         except Exception as exc:
-            task.error = str(exc)
-            task.status = TaskStatus.FAILED
-            task.touch()
-            await self.repository.put(task)
-            await self.event_bus.publish(Event(type='task_failed', task_id=task.id, actor=lease.agent_name, payload={'error': str(exc)}))
+            await self._record_task_failure(task, str(exc), actor=lease.agent_name, trace=[{'error': str(exc), 'exception_type': type(exc).__name__}])
             if self.config.fail_fast:
                 raise
 
@@ -381,6 +480,14 @@ class AsyncWorkflowRuntime:
         if not isinstance(payload, dict):
             raise TypeError(f'Unsupported action payload type: {type(payload)}')
         action_name = payload.get('action')
+        # GatewayActionWorkflow uses the standard WOLF action envelope:
+        # {action: name, payload: {...}, purpose, expectations, yield_motion_to}.
+        # Native orchestration actions historically used flat payloads. Accept
+        # both shapes so gateway worker clones can emit orchestration actions.
+        if isinstance(payload.get('payload'), dict) and action_name in {'create_subtasks', 'complete_task', 'publish_progress', 'wait_for_tasks', 'request_user_input', 'pause_task', 'fail_task'}:
+            nested = dict(payload.get('payload') or {})
+            payload = {**nested, **{k: v for k, v in payload.items() if k not in {'payload', 'purpose', 'expectations', 'yield_motion_to', 'description', 'payload_schema'}}}
+            payload['action'] = action_name
         if action_name == 'create_subtasks':
             subtasks = [TaskSpec(**spec) if isinstance(spec, dict) else spec for spec in payload.get('subtasks', [])]
             return CreateSubtasksAction(subtasks=subtasks, wait_policy=WaitPolicy(payload.get('wait_policy', 'all')), summary=payload.get('summary', 'Delegating work to subtasks'), rationale=payload.get('rationale', ''))
@@ -402,17 +509,22 @@ class AsyncWorkflowRuntime:
         raise ValueError(f'Unknown action payload: {payload}')
 
     async def _apply_action(self, task: TaskNode, action: Any, infra: TaskInfrastructure, policy: WorkflowPolicy) -> None:
+        if task.status == TaskStatus.CANCELLED:
+            await self._append_thread_entry(task.id, 'system', 'ignored action because task is cancelled')
+            await self.event_bus.publish(Event(type='task_action_ignored', task_id=task.id, actor=task.owner_agent_name or 'agent', payload={'reason': 'task_cancelled', 'action': getattr(action, 'action', str(action))}))
+            return
         await self.memory.add_local_message(task.id, 'agent', getattr(action, 'action', str(action)))
         if hasattr(action, 'execute') and not isinstance(action, OrchestrationAction):
             outcome = await self.legacy_executor.execute(action, infra)
             for entry in outcome.history_delta:
                 await self.memory.add_local_message(task.id, entry.get('actor', 'tool'), entry.get('content'))
             if not outcome.ok:
-                task.error = outcome.error
-                task.status = TaskStatus.FAILED
-                task.touch()
-                await self.repository.put(task)
-                await self.event_bus.publish(Event(type='task_failed', task_id=task.id, actor=task.owner_agent_name or 'agent', payload={'error': outcome.error}))
+                await self._record_task_failure(
+                    task,
+                    outcome.error or 'legacy action failed',
+                    actor=task.owner_agent_name or 'agent',
+                    trace=[{'source': 'legacy_action', 'error': outcome.error}],
+                )
                 return
             if outcome.result is not None:
                 result_payload = self.artifacts.inline_or_ref(task.id, outcome.result, name_hint=action.__class__.__name__)
@@ -457,13 +569,12 @@ class AsyncWorkflowRuntime:
             await self.event_bus.publish(Event(type='task_paused', task_id=task.id, actor=task.owner_agent_name or 'agent', payload={'reason': action.reason}))
             return
         if isinstance(action, FailTaskAction):
-            task.status = TaskStatus.FAILED
-            task.error = action.error
-            task.touch()
-            await self.repository.put(task)
-            await self._append_thread_entry(task.id, 'assistant', f'task failed: {action.error}')
-            await self.event_bus.publish(Event(type='task_failed', task_id=task.id, actor=task.owner_agent_name or 'agent', payload={'error': action.error}))
-            await self._notify_parent(task, policy)
+            await self._record_task_failure(
+                task,
+                action.error,
+                actor=task.owner_agent_name or 'agent',
+                trace=[{'action': 'fail_task', 'error': action.error}],
+            )
             return
         if isinstance(action, CreateSubtasksAction):
             self.guard.validate_new_child(task, len(action.subtasks))
@@ -528,6 +639,71 @@ class AsyncWorkflowRuntime:
             return
         raise TypeError(f'Unsupported action instance: {action}')
 
+    async def _record_task_failure(
+        self,
+        task: TaskNode,
+        error: str,
+        *,
+        actor: str | None = None,
+        trace: Optional[list[dict[str, Any]]] = None,
+        notify_parent: bool = True,
+    ) -> None:
+        """Record a structured failed-task result and wake/brief the parent.
+
+        A failed child should still produce a SummaryCapsule so the parent can
+        reassess with explicit failure context instead of merely observing that a
+        dependency is no longer pending.  This centralizes failure status,
+        TaskResult/SummaryCapsule creation, memory propagation, and event output
+        for native runtime failures, legacy action failures, explicit fail_task
+        actions, and gateway-adapter failures that delegate here.
+        """
+        error_text = str(error or 'unknown error')
+        actor = actor or task.owner_agent_name or 'agent'
+        trace = list(trace or [])
+        outcome = f"Task failed: {error_text}"
+        try:
+            local_digest = await self._compress_local_context(task.id)
+        except Exception:
+            local_digest = 'failure context unavailable'
+        try:
+            child_digest = await self._compress_child_summaries(task.id)
+        except Exception:
+            child_digest = 'child summary context unavailable'
+        capsule = SummaryCapsule(
+            task_id=task.id,
+            objective=task.spec.objective,
+            outcome=outcome,
+            important_findings=[],
+            blockers=[error_text],
+            confidence=0.0,
+            artifact_refs=[],
+            local_context_digest=local_digest,
+            child_summary_digest=child_digest,
+            next_steps=['parent should reassess, retry, replan, continue without this child, ask the user, or fail upward'],
+        )
+        task.result = TaskResult(
+            summary=outcome,
+            artifacts={},
+            facts=[{'type': 'task_failure', 'error': error_text}],
+            trace=trace,
+            summary_capsule=capsule,
+        )
+        task.status = TaskStatus.FAILED
+        task.error = error_text
+        task.finished_at = time.time()
+        task.touch()
+        await self.repository.put(task)
+        await self.memory.put_summary(task.id, capsule)
+        await self._append_thread_entry(task.id, 'assistant', outcome)
+        await self.event_bus.publish(Event(
+            type='task_failed',
+            task_id=task.id,
+            actor=actor,
+            payload={'error': error_text, 'summary': outcome, 'blockers': [error_text]},
+        ))
+        if notify_parent:
+            await self._notify_parent(task, self.policy_for(task.spec.workflow_type))
+
     async def _materialize_artifacts(self, task_id: str, artifacts: Dict[str, Any], summary: str, trace: list[dict[str, Any]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         if summary:
@@ -591,15 +767,63 @@ class AsyncWorkflowRuntime:
 
     async def snapshot(self) -> Dict[str, Any]:
         tasks = list(await self.repository.list())
+        task_graph = {
+            'nodes': [
+                {
+                    'id': t.id,
+                    'name': t.spec.name,
+                    'status': t.status.value,
+                    'parent_id': t.spec.parent_id,
+                    'dependencies': list(t.spec.dependencies),
+                    'depth': t.depth,
+                    'lineage': list(t.lineage),
+                    'waiting_on': list(t.waiting_on),
+                    'waiting_policy': t.waiting_policy.value if t.waiting_policy else None,
+                }
+                for t in tasks
+            ],
+            'edges': [
+                *[
+                    {'from': t.spec.parent_id, 'to': t.id, 'kind': 'parent_child'}
+                    for t in tasks
+                    if t.spec.parent_id
+                ],
+                *[
+                    {'from': dep, 'to': t.id, 'kind': 'dependency'}
+                    for t in tasks
+                    for dep in t.spec.dependencies
+                ],
+                *[
+                    {'from': t.id, 'to': child_id, 'kind': 'waiting_on'}
+                    for t in tasks
+                    for child_id in t.waiting_on
+                    if child_id
+                ],
+            ],
+            'roots': [t.id for t in tasks if not t.spec.parent_id],
+        }
         snapshot = {
             'tasks': [{
                 'id': t.id,
                 'status': t.status.value,
-                'spec': {'name': t.spec.name, 'objective': t.spec.objective},
+                'spec': {
+                    'name': t.spec.name,
+                    'objective': t.spec.objective,
+                    'workflow_type': t.spec.workflow_type,
+                    'parent_id': t.spec.parent_id,
+                    'dependencies': list(t.spec.dependencies),
+                    'priority': t.spec.priority,
+                    'tags': list(t.spec.tags),
+                },
+                'waiting_on': list(t.waiting_on),
+                'waiting_policy': t.waiting_policy.value if t.waiting_policy else None,
+                'depth': t.depth,
+                'lineage': list(t.lineage),
                 'owner_agent': t.owner_agent_name,
                 'created_at': t.created_at,
                 'updated_at': t.updated_at,
             } for t in tasks],
+            'task_graph': task_graph,
             'agent_pool': await self.agent_pool.stats(),
             'artifacts': {task.id: [{'artifact_id': r.artifact_id, 'task_id': r.task_id, 'path': r.path, 'kind': r.kind, 'created_at': r.created_at, 'metadata': r.metadata} for r in self.artifacts.list_task_artifacts(task.id)] for task in tasks},
         }

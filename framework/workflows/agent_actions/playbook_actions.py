@@ -1,6 +1,7 @@
 from typing import Literal, Dict, Optional 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from framework.workflows.base_agent_action import AgentAction
+from framework.workflows.agent_actions.formatting_utils import coerce_int, resolve_text_source
 from framework.universes.universe_tools import build_params_from_info, get_base_universe_params
 import uuid
 
@@ -9,18 +10,38 @@ import uuid
 # ---------------------------
 class PlaybookDeploymentInfo(BaseModel):
     type: str = Field(description="Type of playbook deployment: 'by_id', 'raw_text', 'file'")
-    playbook: str = Field(description="""Reference of playbook: type='by_id' -> playbook='id of playbook',
+    playbook: Optional[str] = Field(default=None, description="""Reference of playbook: type='by_id' -> playbook='id of playbook',
                                                                 type='raw_text' -> playbook='literal content of playbook',
                                                                 type='file' ->  playbook='path to file containing the playbook' 
                                                                 """)
+    playbook_lines: Optional[list[str]] = Field(default=None, description="Safer raw_text playbook transport; joined with newline characters")
+    playbook_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 raw playbook content")
+
+    @model_validator(mode="after")
+    def normalize_playbook_transport(self):
+        self.playbook = resolve_text_source(text=self.playbook, lines=self.playbook_lines, base64_text=self.playbook_base64, field_label="playbook", required=True)
+        self.playbook_lines = None
+        self.playbook_base64 = None
+        return self
 
 class PlaybookDeploymentArg(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"name": "Deployment", "id": "dep1", "context_lines": ["Scenario line 1"], "var": {}, "info": {"type": "raw_text", "playbook_lines": ["Step 1"]}}]})
+
     name: str = Field(description="Chose a name for the deployment")
     id: str = Field(description="Chose a unique ID for the deployment")
     parent_id: Optional[str] = Field(default=None, description="ID of parent playbook deployment (happens with nested playbook deployments)")
-    context: str = Field(description="Scenario to which the playbook is being applied to, or background context/information about the scenario the playbook is being applied to")
+    context: Optional[str] = Field(default=None, description="Scenario to which the playbook is being applied to, or background context/information about the scenario the playbook is being applied to")
+    context_lines: Optional[list[str]] = Field(default=None, description="Safer context transport; joined with newline characters")
+    context_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 context")
     var: Dict = Field(description="Dictionaty with any playbook variables and respective values as key-value pair")
     info: PlaybookDeploymentInfo = Field(description="Information about the playbook to deploy")
+
+    @model_validator(mode="after")
+    def normalize_context_transport(self):
+        self.context = resolve_text_source(text=self.context, lines=self.context_lines, base64_text=self.context_base64, field_label="context", required=True)
+        self.context_lines = None
+        self.context_base64 = None
+        return self
 
 
 # Helper constants
@@ -99,9 +120,20 @@ def _simulate_validation(infra, deployment_id, workplan):
 
 
 class ValidateWorkplanArg(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"deployment_id": "dep1", "workplan_lines": ["1. Do work", "2. Report"], "purpose": "format-safe workplan"}]})
+
     deployment_id: str = Field(description="The ID of the deployment to validate")
-    workplan: str = Field(description="The workplan to validate")
+    workplan: Optional[str] = Field(default=None, description="The workplan to validate")
+    workplan_lines: Optional[list[str]] = Field(default=None, description="Safer workplan transport; joined with newline characters")
+    workplan_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 workplan")
     purpose: Optional[str] = Field(default=None, description="Short description of the intent of the action")
+
+    @model_validator(mode="after")
+    def normalize_workplan_transport(self):
+        self.workplan = resolve_text_source(text=self.workplan, lines=self.workplan_lines, base64_text=self.workplan_base64, field_label="workplan", required=True)
+        self.workplan_lines = None
+        self.workplan_base64 = None
+        return self
 
 
 class ValidateWorkplan(AgentAction):
@@ -110,7 +142,7 @@ class ValidateWorkplan(AgentAction):
     payload: ValidateWorkplanArg
     payload_schema: str = """
     {"deployment_id": <string>: "The ID of the deployment to validate",
-     "workplan": <string>: "The workplan to validate",
+     "workplan" OR "workplan_lines" OR "workplan_base64": "The workplan to validate",
      "purpose": <Optional<string>>: "Short description of the intent of the action"
     }
     """
@@ -146,9 +178,20 @@ class ValidateWorkplan(AgentAction):
 
 
 class ItemizeWorkplanArg(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"deployment_id": "dep1", "workplan_lines": ["1. Do work", "2. Report"], "purpose": "format-safe workplan"}]})
+
     deployment_id: str = Field(description="The ID of the deployment to itemize")
-    workplan: str = Field(description="The workplan to itemize")
+    workplan: Optional[str] = Field(default=None, description="The workplan to itemize")
+    workplan_lines: Optional[list[str]] = Field(default=None, description="Safer workplan transport; joined with newline characters")
+    workplan_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 workplan")
     purpose: Optional[str] = Field(default=None, description="Short description of the intent of the action")
+
+    @model_validator(mode="after")
+    def normalize_workplan_transport(self):
+        self.workplan = resolve_text_source(text=self.workplan, lines=self.workplan_lines, base64_text=self.workplan_base64, field_label="workplan", required=True)
+        self.workplan_lines = None
+        self.workplan_base64 = None
+        return self
 
 
 class ItemizeWorkplan(AgentAction):
@@ -157,7 +200,7 @@ class ItemizeWorkplan(AgentAction):
     payload: ItemizeWorkplanArg
     payload_schema: str = """
     {"deployment_id": <string>: "The ID of the deployment to itemize",
-     "workplan": <string>: "The workplan to itemize",
+     "workplan" OR "workplan_lines" OR "workplan_base64": "The workplan to itemize",
      "purpose": <Optional<string>>: "Short description of the intent of the action"
     }
     """
@@ -346,10 +389,29 @@ class ModifyTask(AgentAction):
 
 
 class RunTaskArg(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"deployment_id": "dep1", "tId": 1, "context_lines": ["Task context"], "purpose": "run the next task"}]})
+
     deployment_id: str = Field(description="The ID of the deployment")
     tId: int = Field(description="The ID of the task to run")
     context: Optional[str] = Field(default=None, description="Context/background info for the task execution")
+    context_lines: Optional[list[str]] = Field(default=None, description="Safer context transport; joined with newline characters")
+    context_base64: Optional[str] = Field(default=None, description="Base64 encoded UTF-8 context")
     purpose: Optional[str] = Field(default=None, description="Short description of the intent of the action")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_scalars(cls, data):
+        if isinstance(data, dict) and "tId" in data:
+            data = dict(data)
+            data["tId"] = coerce_int(data["tId"])
+        return data
+
+    @model_validator(mode="after")
+    def normalize_context_transport(self):
+        self.context = resolve_text_source(text=self.context, lines=self.context_lines, base64_text=self.context_base64, field_label="context", required=False)
+        self.context_lines = None
+        self.context_base64 = None
+        return self
 
 
 class RunTask(AgentAction):
@@ -359,7 +421,7 @@ class RunTask(AgentAction):
     payload_schema: str = """
     {"deployment_id": <string>: "The ID of the deployment",
      "tId": <int>: "The ID of the task to run",
-     "context": <Optional<string>>: "Context/background info for the task execution",
+     "context" OR "context_lines" OR "context_base64": "Context/background info for the task execution",
      "purpose": <Optional<string>>: "Short description of the intent of the action"
     }
     """
@@ -750,10 +812,10 @@ class RunPlayBook(AgentAction):
     {"name": <string>: "Chose a name for the deployment",
      "id": <string>: "Chose a unique ID for the deployment",
      "parent_id": <Optional[str]>: ID of parent playbook deployment (happens with nested playbook deployments),
-     "context": <string>: "Scenario to which the playbook is being applied to, or background context/information about the scenario the playbook is being applied to",
+     "context" OR "context_lines" OR "context_base64": "Scenario to which the playbook is being applied to, or background context/information about the scenario the playbook is being applied to",
      "var": <Dict>: "Dictionaty with any playbook variables and respective values as key-value pair",
      "info": <Dict>: {"type":"by_id", "playbook":"ID of the playbook"} or
-                     {"type":"raw_text", "playbook":"Content of playbook"} or
+                     {"type":"raw_text", "playbook_lines":["Content of playbook"]} or
                      {"type":"file", "playbook":"/path/to playbook/file"} 
     }
     """
