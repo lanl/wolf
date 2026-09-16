@@ -23,7 +23,7 @@ from framework.knowledgebase.data_models import MultimodalKnowledgeBaseParams
 
 # PDF parsing imports
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
     PYMUPDF_AVAILABLE = True
 except ImportError:
     PYMUPDF_AVAILABLE = False

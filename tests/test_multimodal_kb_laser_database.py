@@ -34,7 +34,7 @@ def extract_images_from_pdf(pdf_path: Path, out_dir: Path) -> list[dict]:
     """Extract every image object from *pdf_path* into *out_dir*.
     Returns a list of dicts: {"page": int, "image_path": str}.
     """
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
     out_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(str(pdf_path))
     manifest = []
@@ -62,7 +62,7 @@ def extract_tables_from_pdf(pdf_path: Path) -> list[dict]:
     is represented as CSV text. If the PDF/fitz version does not support
     ``find_tables`` an empty list is returned.
     """
-    import fitz
+    import pymupdf as fitz
     doc = fitz.open(str(pdf_path))
     tables = []
     for page_num in range(len(doc)):

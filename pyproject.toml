@@ -26,6 +26,7 @@ dependencies = [
     "playwright>=1.61.0",
     "prompt-toolkit>=3.0.52",
     "pytest>=9.1.1",
+    "pymupdf>=1.28.2",
     "python-dotenv>=1.2.2",
     "rank-bm25>=0.2.2",
     "requests>=2.34.2",
