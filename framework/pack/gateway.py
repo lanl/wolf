@@ -1814,6 +1814,101 @@ class WolfGateway:
             pairs.append((key, value))
         return urlencode(pairs, doseq=True)
 
+    async def _auto_continue_after_gui_command_result(
+        self,
+        session_id: str,
+        *,
+        action: Any,
+        command_id: Any,
+        ok: Any,
+        previous_task: Any = None,
+    ) -> None:
+        """Start a follow-up agent turn after browser-deferred GUI context/capture results.
+
+        Deferred GUI commands complete after the workflow step that requested them.
+        Without this continuation, the command result is stored in history but the
+        agent never gets another turn to consume it, leaving the user with a silent
+        "GUI command completed" notice and no assistant response.
+        """
+        runtime = self.manager.get_runtime(session_id)
+        if not runtime:
+            await self.manager.send_message_to_session(
+                {
+                    "type": "workflow_error",
+                    "status": "error",
+                    "content": "GUI command result arrived, but no runtime exists to continue the agent turn.",
+                    "error": "No runtime configured for GUI command auto-continuation.",
+                    "timestamp": datetime.now().isoformat(),
+                    "session_id": session_id,
+                },
+                session_id,
+            )
+            return
+
+        try:
+            current = asyncio.current_task()
+            if previous_task is not None and previous_task is not current and not previous_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(previous_task), timeout=15)
+                except asyncio.TimeoutError:
+                    await self.manager.send_message_to_session(
+                        {
+                            "type": "workflow_status",
+                            "status": "waiting",
+                            "content": "GUI command result is ready; waiting for the current agent step lock before continuing.",
+                            "timestamp": datetime.now().isoformat(),
+                            "session_id": session_id,
+                        },
+                        session_id,
+                    )
+                except Exception:
+                    # The previous task may have failed; still attempt to continue so
+                    # the agent can explain the GUI command result or failure. 
+                    pass
+
+            control = self._run_control_for(runtime)
+            control["status"] = "running"
+            control["run_id"] = f"run_{uuid.uuid4().hex[:12]}"
+            control["pause_requested"] = False
+            control["stop_requested"] = False
+            control["reassess_requested"] = False
+            control["updated_at"] = datetime.now().isoformat()
+            await self._broadcast_run_control(session_id, control, content=f"GUI command result received; continuing agent response for {action}.")
+            await self.manager.send_message_to_session(
+                {
+                    "type": "workflow_status",
+                    "status": "continuing",
+                    "content": f"GUI command result received; asking agent to answer using {action} result.",
+                    "action": action,
+                    "command_id": command_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "session_id": session_id,
+                },
+                session_id,
+            )
+
+            prompt = self._gui_command_continuation_prompt(action, command_id, ok)
+            await self._handle_chat_message(prompt, session_id, sender="system_gui_continuation", visual_context=None)
+        except Exception as exc:
+            try:
+                await self.manager.send_message_to_session(
+                    {
+                        "type": "workflow_error",
+                        "status": "error",
+                        "content": f"GUI command auto-continuation failed: {type(exc).__name__}: {exc}",
+                        "error": str(exc),
+                        "timestamp": datetime.now().isoformat(),
+                        "session_id": session_id,
+                    },
+                    session_id,
+                )
+            except Exception:
+                pass
+        finally:
+            runtime = self.manager.get_runtime(session_id)
+            if runtime and runtime.get("gui_auto_continue_task") is asyncio.current_task():
+                runtime.pop("gui_auto_continue_task", None)
+
     async def _broadcast_infrastructure_snapshot(self, session_id: str, account_id: str, *, reason: str = "infrastructure_update") -> Optional[Dict[str, Any]]:
         """Best-effort broadcast of the current infrastructure snapshot to connected Gateway clients."""
         try:
