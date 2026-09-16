@@ -37,8 +37,21 @@ def extract_json_block(text: str) -> Optional[str]:
         return None
 
     depth = 0
+    in_string = False
+    escape = False
     for i, char in enumerate(text[start_idx:], start_idx):
-        if char == '{':
+        if in_string:
+            if escape:
+                escape = False
+            elif char == '\\':
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == '{':
             depth += 1
         elif char == '}':
             depth -= 1

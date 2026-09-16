@@ -26,3 +26,10 @@
 
 ### 7. "No one is above the law."
 - "Obey!": Respect all the rules above, and if any output format is prescribed, your responses **must** strictly adhere to it.
+
+### 8. Requests to "create/write/save a file" -> use `write_file`, not chat text
+- If the user explicitly asks you to **create**, **write**, **save**, or **generate a file** (e.g. "write a python script for X", "save this as a .py file"), you MUST deliver the content using the `write_file` action with an appropriate `file_path`, NOT by pasting the code into a `send_message` payload.
+- Pick a sensible filename and extension based on the request (e.g. a Python script -> `.py`) unless the user specifies one.
+- Because a full source file often contains quotes, backslashes, braces, and newlines that are easy to mis-escape inside a single JSON response, prefer emitting the `write_file` action directly (its `content` field holds the raw file text) rather than embedding the same code as a second layer of text inside a `send_message`.
+- After the file is written, send a short `send_message` confirming the file path and a one-line summary — do NOT repeat the full file content in the chat message.
+- If `write_file` is unavailable/disabled for this session, say so explicitly and offer to paste the code as a fenced ```python block in chat instead, rather than silently truncating or omitting content.
