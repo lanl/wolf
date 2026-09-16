@@ -13,6 +13,7 @@ from framework.cli.discovery import get_actions, get_workflows
 from framework.cli.launchers import launch_api, launch_cli, launch_gateway, launch_gui, launch_tui, launch_join_session
 from framework.cli.session_commands import inspect_session, list_sessions
 from framework.utils.frame_dashboard import add_frame_parser
+from framework.utils.io_tools import WOLF_PATH
 
 
 MODES = {"cli", "tui", "gui", "api", "gateway"}
@@ -476,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_launch_args(p_gateway)
     p_gateway.add_argument("--gateway-host", "--host", default="127.0.0.1", help="Gateway bind host (default: 127.0.0.1)")
     p_gateway.add_argument("--gateway-port", "--port", dest="gateway_port", type=int, default=8000, help="Gateway bind port (default: 8000)")
-    p_gateway.add_argument("--static-dir", default="./framework/pack/webapp", help="Static web UI directory for gateway root/static routes")
+    p_gateway.add_argument("--static-dir", default=f"{WOLF_PATH}/framework/pack/webapp", help="Static web UI directory for gateway root/static routes")
     p_gateway.add_argument("--model", help="Default gateway agent model")
     p_gateway.add_argument("--host-address", help="Default inference provider base URL")
     p_gateway.add_argument("--host-port", type=int, help="Default inference provider port")
