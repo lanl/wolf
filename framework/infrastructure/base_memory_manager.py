@@ -401,6 +401,15 @@ class MemoryManager:
         full_query = query + (f" {category}" if category else "")
         try:
             results = vs.query(query=full_query, n_results=n_results)
+            # vs.query is async; resolve it here so callers get a list, not a coroutine.
+            if asyncio.iscoroutine(results):
+                try:
+                    asyncio.get_running_loop()
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        results = executor.submit(asyncio.run, results).result()
+                except RuntimeError:
+                    results = asyncio.run(results)
             return results
         except Exception as e:
             console.print(f"[MEMORY] Semantic recall ({source}) failed: {e}")
