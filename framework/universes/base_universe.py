@@ -95,6 +95,7 @@ class BaseUniverse:
             "kb_add_url",
             "kb_add_urls",
             "kb_add_document",
+            "kb_add_pdf",
             "kb_stats",
             "kb_sources",
             "kb_purge",
@@ -241,6 +242,55 @@ class BaseUniverse:
             raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
         # MultimodalKnowledgeBase.add_document is sync but uses _run_async_in_thread internally
         return kb.add_document(content, metadata=metadata, modality=modality)
+
+    def kb_add_pdf(
+        self,
+        name: str,
+        pdf_content: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        extract_images: bool = True,
+        extract_tables: bool = True,
+        persist_extracted_images: Optional[bool] = None,
+        extracted_image_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add a PDF document to a multimodal knowledge base, extracting text, images, and tables."""
+        kb = self.get_kb(name)
+        if not isinstance(kb, MultimodalKnowledgeBase):
+            raise TypeError(f"KB '{name}' is not a multimodal knowledge base")
+
+        effective_metadata = dict(metadata or {})
+        if persist_extracted_images is not None:
+            effective_metadata["persist_extracted_images"] = persist_extracted_images
+        if extracted_image_dir is not None:
+            effective_metadata["extracted_image_dir"] = extracted_image_dir
+
+        return kb.add_pdf_document(
+            pdf_content,
+            metadata=effective_metadata,
+            extract_images=extract_images,
+            extract_tables=extract_tables,
+        )
+
+    async def akb_add_pdf(
+        self,
+        name: str,
+        pdf_content: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        extract_images: bool = True,
+        extract_tables: bool = True,
+        persist_extracted_images: Optional[bool] = None,
+        extracted_image_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add a PDF document to a multimodal knowledge base, extracting text, images, and tables (async)."""
+        return self.kb_add_pdf(
+            name,
+            pdf_content,
+            metadata=metadata,
+            extract_images=extract_images,
+            extract_tables=extract_tables,
+            persist_extracted_images=persist_extracted_images,
+            extracted_image_dir=extracted_image_dir,
+        )
 
     def kb_stats(self, name: str) -> Dict[str, int]:
         return self.get_kb(name).get_stats()
@@ -870,6 +920,16 @@ class AddDocumentRequest(BaseModel):
     modality: str = Field("text", description="Modality type: 'text', 'image', 'audio', 'video', 'table', 'binary'")
 
 
+class AddPDFRequest(BaseModel):
+    pdf_path: Optional[str] = Field(None, description="Path to PDF file on server")
+    pdf_content: Optional[str] = Field(None, description="Base64-encoded PDF content")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata for the PDF")
+    extract_images: bool = Field(True, description="Whether to extract images from PDF")
+    extract_tables: bool = Field(True, description="Whether to extract tables from PDF")
+    persist_extracted_images: Optional[bool] = Field(None, description="Override KB default for whether extracted PDF images are physically saved to disk")
+    extracted_image_dir: Optional[str] = Field(None, description="Optional directory where extracted PDF images should be persisted")
+
+
 class ExecuteRequest(BaseModel):
     tool_name: str
     args: Optional[List[str]] = None
@@ -1249,6 +1309,90 @@ def create_app(universe: BaseUniverse, cors_origins: Optional[List[str]] = None)
             raise HTTPException(
                 status_code=500,
                 detail=f"Error adding document to KB '{name}': {str(e)}"
+            )
+
+    @app.post("/kbs/{name}/add_pdf")
+    async def kb_add_pdf_endpoint(name: str, req: AddPDFRequest):
+        """Add a PDF document to a multimodal knowledge base, extracting all elements."""
+        import base64
+        import traceback
+        
+        try:
+            kb = universe.get_kb(name)
+            if not isinstance(kb, MultimodalKnowledgeBase):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"KB '{name}' is not a multimodal knowledge base. PDF ingestion requires a multimodal KB."
+                )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="KB not found")
+
+        if req.pdf_path and req.pdf_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either 'pdf_path' or 'pdf_content', not both"
+            )
+        if not req.pdf_path and not req.pdf_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Must provide either 'pdf_path' or 'pdf_content'"
+            )
+
+        try:
+            if req.pdf_path:
+                pdf_path = os.path.expanduser(req.pdf_path)
+                if not os.path.exists(pdf_path):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"PDF file '{req.pdf_path}' does not exist on universe host {universe.info.host if universe.info else 'unknown'}:{universe.info.port if universe.info else 'unknown'}"
+                    )
+                if not os.path.isfile(pdf_path):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Path '{req.pdf_path}' is not a file"
+                    )
+                pdf_content = pdf_path
+            else:
+                try:
+                    pdf_content = base64.b64decode(req.pdf_content)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid base64-encoded PDF content: {str(e)}"
+                    )
+
+            summary = await universe.akb_add_pdf(
+                name,
+                pdf_content,
+                metadata=req.metadata,
+                extract_images=req.extract_images,
+                extract_tables=req.extract_tables,
+                persist_extracted_images=req.persist_extracted_images,
+                extracted_image_dir=req.extracted_image_dir,
+            )
+
+            return {
+                "ok": True,
+                "kb_name": name,
+                "summary": summary,
+                "message": f"Successfully ingested PDF into KB '{name}'"
+            }
+
+        except ImportError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"PDF parsing library not available: {str(e)}"
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e)
+            )
+        except Exception as e:
+            tb = traceback.format_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error processing PDF for KB '{name}': {str(e)}\nTRACEBACK:\n{tb}"
             )
 
     @app.post("/kbs/{name}/purge")
