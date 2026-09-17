@@ -187,7 +187,7 @@ class PersistentBM25:
         self._dirty = False
 
     def _rebuild(self):
-        if rank_bm25 is not None and hasattr(rank_bm25, "BM25Okapi"):
+        if rank_bm25 is not None and hasattr(rank_bm25, "BM25Okapi") and self.corpus_tokens:
             self._bm25 = rank_bm25.BM25Okapi(self.corpus_tokens)
         else:
             self._bm25 = _BasicBM25(self.corpus_tokens)
