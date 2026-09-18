@@ -367,13 +367,26 @@ class MemoryManager:
         if self._summaries_vector_store:
             self._index_summary_to_store(summary, verbose)
 
+    @staticmethod
+    def _resolve_coroutine(result: Any) -> Any:
+        """Resolve coroutine if necessary."""
+        if not asyncio.iscoroutine(result):
+            return result
+        try:
+            asyncio.get_running_loop()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(asyncio.run, result).result()
+        except RuntimeError:
+            return asyncio.run(result)
+
     def _index_summary_to_store(self, summary: str, verbose: int = 0) -> None:
         """Add a summary document to the summaries vector store (if attached)."""
         try:
             idx = len(self.summaries) - 1
             doc_id = f"summary_{idx}"
             # The vector‑store API expects a list of documents
-            self._summaries_vector_store.add_documents([summary], pbar=None)
+            self._resolve_coroutine(self._summaries_vector_store.add_documents([summary], pbar=None))
             if verbose > 0:
                 console.print(f"[MEMORY] Indexed summary #{idx} to vector store.")
         except Exception as e:
@@ -400,7 +413,7 @@ class MemoryManager:
             return []
         full_query = query + (f" {category}" if category else "")
         try:
-            results = vs.query(query=full_query, n_results=n_results)
+            results = self._resolve_coroutine(vs.query(query=full_query, n_results=n_results))
             return results
         except Exception as e:
             console.print(f"[MEMORY] Semantic recall ({source}) failed: {e}")
